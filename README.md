@@ -115,7 +115,7 @@ docker compose up -d redis postgres
 uv run python scripts/bootstrap.py
 uv run python scripts/universe_loader.py --sample
 
-# Run in paper mode (work in progress — expect issues)
+# Run in paper mode (work in progress — expect partial functionality)
 uv run python -m yukti --mode paper
 ```
 

@@ -143,7 +143,156 @@ async def _run_paper_or_live(mode: str) -> None:
     # ── 9. Main signal loop ────────────────────────────────────
     universe = await _load_universe()
     log.info("Universe: %d symbols", len(universe))
-    await _signal_loop(universe, mode)
+    if mode == "paper":
+        # For paper mode, run a single scan cycle instead of continuous loop
+        await _single_scan_cycle(universe)
+    else:
+        await _signal_loop(universe, mode)
+
+
+async def _single_scan_cycle(universe: dict[str, str]) -> None:
+    """
+    Run a single scan cycle for paper mode testing.
+    """
+    from yukti.data.state import is_halted, get_performance_state
+    from yukti.execution.dhan_client import dhan
+    from yukti.signals.context import build_context
+    from yukti.signals.indicators import compute
+    from yukti.agents.arjun import arjun
+    from yukti.risk import calculate_levels, calculate_position, run_gates
+    from yukti.execution.order_sm import open_trade
+    from yukti.metrics import record_skip, record_trade_opened
+    from yukti.telegram.bot import alert_trade_opened
+
+    log.info("Starting single scan cycle for paper mode")
+
+    # Get Nifty context
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+        nifty_raw = await dhan.get_candles("13", settings.candle_interval, start, today)
+        if not nifty_raw or len(nifty_raw) < 20:
+            log.warning("No Nifty data, using defaults")
+            nifty_chg = 0.0
+            nifty_trend = "SIDEWAYS"
+        else:
+            nifty_df = pd.DataFrame(
+                nifty_raw,
+                columns=["time", "open", "high", "low", "close", "volume"],
+            ).astype({"close": float, "open": float})
+            nifty_chg = float(
+                (nifty_df["close"].iloc[-1] - nifty_df["close"].iloc[-2])
+                / nifty_df["close"].iloc[-2] * 100
+            )
+            nifty_trend = "UP" if nifty_df["close"].iloc[-1] > nifty_df["close"].iloc[-10] else "DOWN"
+    except Exception as exc:
+        log.warning("Nifty fetch failed: %s, using defaults", exc)
+        nifty_chg = 0.0
+        nifty_trend = "SIDEWAYS"
+
+    perf = await get_performance_state()
+
+    # Scan all symbols sequentially for simplicity
+    for symbol, security_id in universe.items():
+        if await is_halted():
+            log.info("Halted, stopping scan")
+            break
+
+        log.info(f"Scanning {symbol} ({security_id})")
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            start = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+            raw = await dhan.get_candles(security_id, settings.candle_interval, start, today)
+            if not raw or len(raw) < 60:
+                log.warning(f"No sufficient candle data for {symbol}")
+                continue
+
+            df = pd.DataFrame(raw, columns=["time","open","high","low","close","volume"])
+            df = df.astype({c: float for c in ["open","high","low","close","volume"]})
+            snap = compute(df)
+            log.debug(f"Computed indicators for {symbol}")
+
+            # Skip pattern pre-filter for now
+            past_journal = await retrieve_similar(symbol, "unknown", "LONG")
+            log.debug(f"Retrieved past journal for {symbol}")
+
+            context = build_context(
+                symbol, snap, nifty_chg, nifty_trend,
+                "No breaking news", perf, past_journal,
+            )
+
+            decision = await arjun.safe_decide(context)
+            log.info(f"AI decision for {symbol}: {decision.action} (conviction {decision.conviction})")
+
+            if decision.action == "SKIP":
+                record_skip(decision.skip_reason or "claude_skip")
+                continue
+
+            # Fill missing levels
+            if not decision.stop_loss or not decision.target_1:
+                levels = calculate_levels(
+                    decision.direction or "LONG",
+                    decision.entry_price or snap.close,
+                    snap.atr, snap.nearest_swing_low, snap.nearest_swing_high,
+                )
+                decision.stop_loss = decision.stop_loss or levels.stop_loss
+                decision.target_1 = decision.target_1 or levels.target_1
+                decision.target_2 = decision.target_2 or levels.target_2
+                decision.risk_reward = decision.risk_reward or levels.risk_reward
+                log.debug(f"Fallback levels calculated for {symbol}")
+
+            position = calculate_position(
+                decision.entry_price or snap.close,
+                decision.stop_loss,
+                decision.direction or "LONG",
+                decision.conviction,
+            )
+            log.debug(f"Position calculated for {symbol}: qty {position.quantity}")
+
+            gate = await run_gates(
+                symbol, decision.direction or "LONG",
+                decision.risk_reward or 0.0, position,
+            )
+            if not gate.passed:
+                record_skip(gate.reason or "gate_blocked")
+                log.info(f"Risk gate failed for {symbol}: {gate.reason}")
+                continue
+
+            log.info(f"Opening trade for {symbol}")
+            pos = await open_trade(symbol, security_id, decision, position)
+            if pos:
+                record_trade_opened(
+                    decision.direction or "LONG",
+                    decision.setup_type or "unknown",
+                )
+                await alert_trade_opened(pos)
+                # Basic journaling
+                try:
+                    from yukti.agents.journal import write_journal_entry
+                    await write_journal_entry(
+                        trade={
+                            "symbol": symbol,
+                            "direction": decision.direction,
+                            "setup_type": decision.setup_type,
+                            "entry_price": decision.entry_price,
+                            "stop_loss": decision.stop_loss,
+                            "target_1": decision.target_1,
+                            "exit_price": None,
+                            "exit_reason": None,
+                            "pnl_pct": None,
+                            "conviction": decision.conviction,
+                            "reasoning": decision.reasoning,
+                        },
+                        original_reasoning=decision.reasoning,
+                    )
+                    log.info(f"Journaled trade for {symbol}")
+                except Exception as exc:
+                    log.warning("Basic journaling failed: %s", exc)
+
+        except Exception as exc:
+            log.error("Scan error %s: %s", symbol, exc, exc_info=True)
+
+    log.info("Single scan cycle complete")
 
 
 async def _signal_loop(universe: dict[str, str], mode: str) -> None:

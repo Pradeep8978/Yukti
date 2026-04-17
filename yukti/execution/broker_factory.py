@@ -161,6 +161,64 @@ class ShadowBroker:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  FakeDhanClient — for testing without real DhanHQ keys
+# ═══════════════════════════════════════════════════════════════
+
+class FakeDhanClient:
+    """Fake DhanHQ client that returns synthetic market data for testing."""
+
+    def __init__(self) -> None:
+        self.fake_prices = {
+            "RELIANCE": 2500.0,
+            "HDFCBANK": 1600.0,
+            "INFY":     1400.0,
+            "TCS":      3200.0,
+            "ICICIBANK": 900.0,
+        }
+
+    async def get_candles(self, security_id: str, interval: str = "5", from_date: str = "", to_date: str = "") -> list[dict]:
+        """Return fake OHLCV data."""
+        import random
+        base_price = self.fake_prices.get(security_id, 1000.0)
+        candles = []
+        for i in range(60):
+            price = base_price + random.uniform(-50, 50)
+            candles.append({
+                "time": f"2024-01-01 09:{15 + i:02d}:00",
+                "open": price,
+                "high": price * 1.01,
+                "low": price * 0.99,
+                "close": price,
+                "volume": random.randint(10000, 100000),
+            })
+        return candles
+
+    async def get_positions(self) -> list[dict]:
+        return []
+
+    async def get_order_list(self) -> list[dict]:
+        return []
+
+    async def place_order(self, **kwargs) -> dict:
+        return {"orderId": "FAKE-123", "status": "TRADED", "filledQty": kwargs.get("quantity", 0), "averagePrice": 1000.0}
+
+    async def place_gtt(self, **kwargs) -> dict:
+        return {"gttOrderId": "FAKE-GTT-123"}
+
+    async def cancel_order(self, order_id: str) -> dict:
+        return {"status": "CANCELLED"}
+
+    async def cancel_gtt(self, gtt_id: str) -> dict:
+        return {"status": "CANCELLED"}
+
+    async def get_order_status(self, order_id: str) -> dict:
+        return {"orderStatus": "TRADED", "filledQty": 100, "averagePrice": 1000.0}
+
+    async def market_exit(self, security_id: str, direction: str, quantity: int, product_type: str) -> dict:
+        return {"orderId": "FAKE-EXIT-123", "status": "TRADED"}
+
+
+# ═══════════════════════════════════════════════════════════════
 #  PaperBrokerWrapper — real data reads, simulated order writes
 # ═══════════════════════════════════════════════════════════════
 
@@ -232,10 +290,13 @@ def get_broker():
     elif mode == "paper":
         from yukti.execution.dhan_client import DhanClient
         from yukti.backtest import PaperBroker
-        real = DhanClient()
+        if settings.dhan_client_id and settings.dhan_access_token:
+            real = DhanClient()
+        else:
+            real = FakeDhanClient()
         paper = PaperBroker(settings.account_value)
         _broker_instance = PaperBrokerWrapper(real, paper)
-        log.info("PAPER MODE — real market data, simulated fills, no real orders")
+        log.info("PAPER MODE — %s market data, simulated fills, no real orders", "real" if isinstance(real, DhanClient) else "fake")
 
     elif mode == "shadow":
         from yukti.execution.dhan_client import DhanClient
