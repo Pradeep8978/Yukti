@@ -270,16 +270,19 @@ async def _scan_symbol(
 
     async with sem:
         signals_scanned.inc()
+        log.info(f"Scanning {symbol} ({security_id})")
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             start = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
             raw = await dhan.get_candles(security_id, settings.candle_interval, start, today)
             if not raw or len(raw) < 60:
+                log.warning(f"No sufficient candle data for {symbol}")
                 return
 
             df   = pd.DataFrame(raw, columns=["time","open","high","low","close","volume"])
             df   = df.astype({c: float for c in ["open","high","low","close","volume"]})
             snap = compute(df)
+            log.debug(f"Computed indicators for {symbol}")
 
             # Cheap pre-filter
             # if best_pattern(snap) is None:
@@ -287,6 +290,7 @@ async def _scan_symbol(
             #     return
 
             past_journal = await retrieve_similar(symbol, "unknown", "LONG")
+            log.debug(f"Retrieved past journal for {symbol}")
 
             context = build_context(
                 symbol, snap, nifty_chg, nifty_trend,
@@ -294,6 +298,7 @@ async def _scan_symbol(
             )
 
             decision = await arjun.safe_decide(context)
+            log.info(f"AI decision for {symbol}: {decision.action} (conviction {decision.conviction})")
 
             if decision.action == "SKIP":
                 record_skip(decision.skip_reason or "claude_skip")
@@ -310,6 +315,7 @@ async def _scan_symbol(
                 decision.target_1    = decision.target_1    or levels.target_1
                 decision.target_2    = decision.target_2    or levels.target_2
                 decision.risk_reward = decision.risk_reward or levels.risk_reward
+                log.debug(f"Fallback levels calculated for {symbol}")
 
             position = calculate_position(
                 decision.entry_price or snap.close,
@@ -317,6 +323,7 @@ async def _scan_symbol(
                 decision.direction or "LONG",
                 decision.conviction,
             )
+            log.debug(f"Position calculated for {symbol}: qty {position.quantity}")
 
             gate = await run_gates(
                 symbol, decision.direction or "LONG",
@@ -324,8 +331,10 @@ async def _scan_symbol(
             )
             if not gate.passed:
                 record_skip(gate.reason or "gate_blocked")
+                log.info(f"Risk gate failed for {symbol}: {gate.reason}")
                 return
 
+            log.info(f"Opening trade for {symbol}")
             pos = await open_trade(symbol, security_id, decision, position)
             if pos:
                 record_trade_opened(
@@ -352,6 +361,7 @@ async def _scan_symbol(
                         },
                         original_reasoning=decision.reasoning,
                     )
+                    log.info(f"Journaled trade for {symbol}")
                 except Exception as exc:
                     log.warning("Basic journaling failed: %s", exc)
 

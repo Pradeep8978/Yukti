@@ -2,7 +2,7 @@
 
 > *Sanskrit: strategy, skill, clever reasoning*
 
-A production-hardened, AI-powered trading agent for the Indian stock market (NSE/BSE).
+A production-ready, AI-powered trading agent for the Indian stock market (NSE/BSE).
 Reasons like a human trader, executes with DhanHQ, learns from its own trades.
 
 **Status:** Early Alpha — Minimal Viable Paper Loop in progress. Not ready for live trading.
@@ -100,7 +100,7 @@ Web Portal (React 18, real-time WebSocket)
 
 ```bash
 # Clone + install
-git clone https://github.com/YOUR_USERNAME/yukti.git
+git clone https://github.com/pradeeprlck/Yukti.git
 cd yukti
 uv sync
 
@@ -115,7 +115,7 @@ docker compose up -d redis postgres
 uv run python scripts/bootstrap.py
 uv run python scripts/universe_loader.py --sample
 
-# Run in paper mode (work in progress — may have issues)
+# Run in paper mode (work in progress — expect issues)
 uv run python -m yukti --mode paper
 ```
 
