@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+
+  ::-webkit-scrollbar         { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track   { background: transparent; }
+  ::-webkit-scrollbar-thumb   { background: #2a353d; border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3a4a54; }
+
+  ::selection { background: #16a34a44; }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface-2 border border-surface-border rounded-xl;
+  }
+
+  .card-sm {
+    @apply bg-surface-2 border border-surface-border rounded-lg;
+  }
+
+  .stat-value {
+    @apply font-display text-2xl font-bold tracking-tight;
+  }
+
+  .stat-label {
+    @apply text-xs font-mono uppercase tracking-widest text-white/40;
+  }
+
+  .badge-up   { @apply text-up   bg-up/10   border border-up/20   text-xs font-mono px-2 py-0.5 rounded-full; }
+  .badge-down { @apply text-down bg-down/10 border border-down/20 text-xs font-mono px-2 py-0.5 rounded-full; }
+  .badge-warn { @apply text-warn bg-warn/10 border border-warn/20 text-xs font-mono px-2 py-0.5 rounded-full; }
+  .badge-info { @apply text-info bg-info/10 border border-info/20 text-xs font-mono px-2 py-0.5 rounded-full; }
+
+  .btn-danger {
+    @apply bg-down/10 hover:bg-down/20 border border-down/30 hover:border-down/50
+           text-down font-medium text-sm px-4 py-2 rounded-lg transition-all;
+  }
+
+  .btn-primary {
+    @apply bg-brand-600 hover:bg-brand-500 text-white font-medium text-sm
+           px-4 py-2 rounded-lg transition-all;
+  }
+
+  .btn-ghost {
+    @apply bg-transparent hover:bg-surface-3 border border-surface-border
+           text-white/60 hover:text-white font-medium text-sm px-3 py-1.5 rounded-lg transition-all;
+  }
+}
+
+/* Recharts overrides to match dark theme */
+.recharts-cartesian-axis-tick-value { fill: rgba(255,255,255,0.35) !important; font-size: 11px; }
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical   line { stroke: rgba(255,255,255,0.06) !important; }
+.recharts-tooltip-wrapper { outline: none !important; }

@@ -1,0 +1,76 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# VS Code / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Logs
+logs/
+*.log
+
+# Data
+*.csv
+*.db
+universe.json
+backtest_trades.csv
+
+# Node (webapp build artifacts)
+webapp/node_modules/
+webapp/dist/
+webapp/.env.local
+
+# Docker
+.dockerignore
+
+# Secrets — NEVER commit these
+.env*
+secrets*.json
+doppler.json
+
+# IDE
+.env.example is OK to commit — use for template
+
+# Temp
+.tmp/
+.cache/
