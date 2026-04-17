@@ -72,7 +72,12 @@ async def job_eod_squareoff() -> None:
             log.error("EOD squareoff failed %s: %s", symbol, exc)
 
 
-async def job_daily_journal() -> None:
+async def job_daily_reset() -> None:
+    log.info("=== daily reset ===")
+    from yukti.data.state import reset_daily_pnl, reset_trades_today
+    await reset_daily_pnl()
+    await reset_trades_today()
+    log.info("Daily counters reset")
     log.info("=== daily journal ===")
     from datetime import date as dt_date
     from yukti.data.database import get_db

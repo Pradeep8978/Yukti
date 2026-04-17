@@ -84,8 +84,8 @@ class Settings(BaseSettings):
     candle_interval: str = "5"
     candle_history: int = 100
 
-    # ── Watchlist ─────────────────────────────────────
-    watchlist: list[str] = Field(default_factory=list)
+    # ── API settings ───────────────────────────────────
+    cors_allow_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
 
     # ── Scheduler times (IST) ─────────────────────────
     market_open:    str = "09:15"

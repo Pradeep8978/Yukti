@@ -18,8 +18,11 @@ from datetime import timedelta
 from typing import Any
 
 import redis.asyncio as aioredis
+from sqlalchemy import select, func
 
 from yukti.config import settings
+from yukti.data.database import get_db
+from yukti.data.models import Position
 
 # ── Singleton async Redis client ──────────────────────────────────────────────
 _redis: aioredis.Redis | None = None
@@ -54,38 +57,114 @@ async def set_halt(halted: bool) -> None:
 # ── Open positions ────────────────────────────────────────────────────────────
 
 async def save_position(symbol: str, data: dict[str, Any]) -> None:
+    # Save to Postgres (authoritative)
+    async with get_db() as db:
+        result = await db.execute(select(Position).where(Position.symbol == symbol))
+        existing = result.scalar_one_or_none()
+        if existing:
+            # Update
+            for k, v in data.items():
+                if hasattr(existing, k):
+                    setattr(existing, k, v)
+        else:
+            # Insert
+            pos = Position(symbol=symbol, **data)
+            db.add(pos)
+        await db.commit()
+
+    # Save to Redis (cache)
     r = await get_redis()
     await r.set(f"yukti:positions:{symbol}", json.dumps(data))
 
 
 async def get_position(symbol: str) -> dict[str, Any] | None:
+    # Check Postgres first (authoritative)
+    async with get_db() as db:
+        result = await db.execute(select(Position).where(Position.symbol == symbol))
+        pos = result.scalar_one_or_none()
+        if pos:
+            return {
+                "id": pos.id,
+                "symbol": pos.symbol,
+                "security_id": pos.security_id,
+                "direction": pos.direction,
+                "setup_type": pos.setup_type,
+                "holding_period": pos.holding_period,
+                "entry_price": pos.entry_price,
+                "fill_price": pos.fill_price,
+                "stop_loss": pos.stop_loss,
+                "target_1": pos.target_1,
+                "target_2": pos.target_2,
+                "quantity": pos.quantity,
+                "conviction": pos.conviction,
+                "risk_reward": pos.risk_reward,
+                "intent_id": pos.intent_id,
+                "entry_order_id": pos.entry_order_id,
+                "sl_gtt_id": pos.sl_gtt_id,
+                "target_gtt_id": pos.target_gtt_id,
+                "status": pos.status,
+                "reasoning": pos.reasoning,
+                "opened_at": pos.opened_at.isoformat(),
+                "filled_at": pos.filled_at.isoformat() if pos.filled_at else None,
+            }
+
+    # Fallback to Redis (cache)
     r = await get_redis()
     raw = await r.get(f"yukti:positions:{symbol}")
     return json.loads(raw) if raw else None
 
 
 async def delete_position(symbol: str) -> None:
+    # Delete from Postgres
+    async with get_db() as db:
+        result = await db.execute(select(Position).where(Position.symbol == symbol))
+        pos = result.scalar_one_or_none()
+        if pos:
+            await db.delete(pos)
+            await db.commit()
+
+    # Delete from Redis
     r = await get_redis()
     await r.delete(f"yukti:positions:{symbol}")
 
 
 async def get_all_positions() -> dict[str, dict[str, Any]]:
-    r = await get_redis()
-    keys = await r.keys("yukti:positions:*")
-    if not keys:
-        return {}
-    values = await r.mget(*keys)
-    return {
-        k.split(":")[-1]: json.loads(v)
-        for k, v in zip(keys, values)
-        if v is not None
-    }
+    # Get from Postgres (authoritative)
+    async with get_db() as db:
+        positions = {}
+        result = await db.execute(select(Position))
+        for pos in result.scalars():
+            positions[pos.symbol] = {
+                "id": pos.id,
+                "symbol": pos.symbol,
+                "security_id": pos.security_id,
+                "direction": pos.direction,
+                "setup_type": pos.setup_type,
+                "holding_period": pos.holding_period,
+                "entry_price": pos.entry_price,
+                "fill_price": pos.fill_price,
+                "stop_loss": pos.stop_loss,
+                "target_1": pos.target_1,
+                "target_2": pos.target_2,
+                "quantity": pos.quantity,
+                "conviction": pos.conviction,
+                "risk_reward": pos.risk_reward,
+                "intent_id": pos.intent_id,
+                "entry_order_id": pos.entry_order_id,
+                "sl_gtt_id": pos.sl_gtt_id,
+                "target_gtt_id": pos.target_gtt_id,
+                "status": pos.status,
+                "reasoning": pos.reasoning,
+                "opened_at": pos.opened_at.isoformat(),
+                "filled_at": pos.filled_at.isoformat() if pos.filled_at else None,
+            }
+        return positions
 
 
 async def count_open_positions() -> int:
-    r = await get_redis()
-    keys = await r.keys("yukti:positions:*")
-    return len(keys)
+    async with get_db() as db:
+        result = await db.execute(select(func.count()).select_from(Position))
+        return result.scalar() or 0
 
 
 # ── Cooldown registry ─────────────────────────────────────────────────────────

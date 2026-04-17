@@ -31,25 +31,31 @@ log = logging.getLogger(__name__)
 
 class ConnectionManager:
     def __init__(self) -> None:
-        self._active: list[WebSocket] = []
+        self._active: set[WebSocket] = set()
+        self._lock = asyncio.Lock()
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
-        self._active.append(ws)
+        async with self._lock:
+            self._active.add(ws)
         log.info("WS client connected (total=%d)", len(self._active))
 
-    def disconnect(self, ws: WebSocket) -> None:
-        self._active.remove(ws)
+    async def disconnect(self, ws: WebSocket) -> None:
+        async with self._lock:
+            self._active.discard(ws)  # Safe, no error if not present
+        log.info("WS client disconnected (total=%d)", len(self._active))
 
     async def broadcast(self, data: dict[str, Any]) -> None:
         dead: list[WebSocket] = []
-        for ws in self._active:
+        async with self._lock:
+            active_copy = list(self._active)
+        for ws in active_copy:
             try:
                 await ws.send_json(data)
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            self._active.remove(ws)
+            await self.disconnect(ws)
 
 
 manager = ConnectionManager()
@@ -80,9 +86,17 @@ async def _push_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(_push_loop())
+    # Start background task
+    push_task = asyncio.create_task(_push_loop())
+    app.state.push_task = push_task  # Store in app state
     log.info("Yukti API ready")
     yield
+    # Cancel background task on shutdown
+    push_task.cancel()
+    try:
+        await push_task
+    except asyncio.CancelledError:
+        log.info("Push task cancelled on shutdown")
     log.info("Yukti API shutdown")
 
 
@@ -96,11 +110,17 @@ def create_app() -> FastAPI:
         lifespan    = lifespan,
     )
 
+    # CORS: strict allowlist, fail closed in live mode
+    if settings.mode == "live":
+        allow_origins = []  # No CORS in live mode for security
+    else:
+        allow_origins = settings.cors_allow_origins
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins  = ["*"],
-        allow_methods  = ["*"],
-        allow_headers  = ["*"],
+        allow_origins  = allow_origins,
+        allow_methods  = ["GET", "POST", "PUT", "DELETE"],
+        allow_headers  = ["Content-Type", "Authorization"],
     )
 
     # ── Routers ────────────────────────────────────────────────────────────────
