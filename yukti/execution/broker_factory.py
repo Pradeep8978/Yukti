@@ -161,6 +161,52 @@ class ShadowBroker:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  PaperBrokerWrapper — real data reads, simulated order writes
+# ═══════════════════════════════════════════════════════════════
+
+class PaperBrokerWrapper:
+    """
+    Wraps real DhanClient for market data reads, PaperBroker for order writes.
+    Perfect for paper trading: decisions based on real market conditions, but no real orders placed.
+    """
+
+    def __init__(self, real_dhan_client, paper_broker) -> None:
+        self._real = real_dhan_client
+        self._paper = paper_broker
+
+    # ── PASS-THROUGH: market data reads from real DhanHQ ─────────────────────
+
+    async def get_candles(self, *args, **kwargs):
+        return await self._real.get_candles(*args, **kwargs)
+
+    async def get_positions(self):
+        return await self._real.get_positions()
+
+    async def get_order_list(self):
+        return await self._real.get_order_list()
+
+    # ── SIMULATED: order writes via PaperBroker ──────────────────────────────
+
+    async def place_order(self, *args, **kwargs):
+        return await self._paper.place_order(*args, **kwargs)
+
+    async def place_gtt(self, *args, **kwargs):
+        return await self._paper.place_gtt(*args, **kwargs)
+
+    async def cancel_order(self, *args, **kwargs):
+        return await self._paper.cancel_order(*args, **kwargs)
+
+    async def cancel_gtt(self, *args, **kwargs):
+        return await self._paper.cancel_gtt(*args, **kwargs)
+
+    async def get_order_status(self, *args, **kwargs):
+        return await self._paper.get_order_status(*args, **kwargs)
+
+    async def market_exit(self, *args, **kwargs):
+        return await self._paper.market_exit(*args, **kwargs)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Factory — returns the right broker for the current mode
 # ═══════════════════════════════════════════════════════════════
 
@@ -184,9 +230,12 @@ def get_broker():
         log.warning("⚠ LIVE MODE — real orders will be placed on DhanHQ")
 
     elif mode == "paper":
-        from yukti.backtest.paper_broker import PaperBroker
-        _broker_instance = PaperBroker(settings.account_value)
-        log.info("PAPER MODE — simulated fills, no real orders")
+        from yukti.execution.dhan_client import DhanClient
+        from yukti.backtest import PaperBroker
+        real = DhanClient()
+        paper = PaperBroker(settings.account_value)
+        _broker_instance = PaperBrokerWrapper(real, paper)
+        log.info("PAPER MODE — real market data, simulated fills, no real orders")
 
     elif mode == "shadow":
         from yukti.execution.dhan_client import DhanClient

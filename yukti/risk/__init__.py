@@ -219,6 +219,8 @@ async def run_gates(
     if position.capital_deployed > max_cap:
         # Trim quantity instead of rejecting
         trim_qty = int(max_cap / (position.capital_deployed / position.quantity))
+        if trim_qty <= 0:
+            return GateResult(False, f"concentration_trim_zero_qty: max_cap={max_cap}, deployed={position.capital_deployed}")
         log.warning(
             "Trimming %s qty %d→%d due to concentration limit",
             symbol, position.quantity, trim_qty

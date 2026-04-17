@@ -208,6 +208,35 @@ class BaseProvider(ABC):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  MOCK PROVIDER (for testing without API keys)
+# ═══════════════════════════════════════════════════════════════
+
+class MockProvider(BaseProvider):
+    """
+    Returns SKIP decisions for testing without API calls.
+    """
+
+    async def call(self, context: str) -> tuple[TradeDecision, CallMeta]:
+        import time
+        t0 = time.monotonic()
+        decision = TradeDecision(
+            action="SKIP",
+            reasoning="Mock provider: no API keys configured",
+            skip_reason="mock_no_keys",
+            conviction=1,
+        )
+        meta = CallMeta(
+            provider="mock",
+            model="none",
+            latency_ms=(time.monotonic() - t0) * 1000,
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=0,
+        )
+        return decision, meta
+
+
+# ═══════════════════════════════════════════════════════════════
 #  CLAUDE PROVIDER
 # ═══════════════════════════════════════════════════════════════
 
@@ -527,8 +556,14 @@ class ABTestProvider(BaseProvider):
 
 def _build_provider(name: str) -> BaseProvider:
     if name == "claude":
+        if not settings.anthropic_api_key:
+            log.warning("ANTHROPIC_API_KEY not set, using mock provider")
+            return MockProvider()
         return ClaudeProvider()
     elif name == "gemini":
+        if not settings.gemini_api_key:
+            log.warning("GEMINI_API_KEY not set, using mock provider")
+            return MockProvider()
         return GeminiProvider()
     raise ValueError(f"Unknown provider: {name}")
 

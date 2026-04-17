@@ -333,6 +333,27 @@ async def _scan_symbol(
                     decision.setup_type or "unknown",
                 )
                 await alert_trade_opened(pos)
+                # Basic journaling
+                try:
+                    from yukti.agents.journal import write_journal_entry
+                    await write_journal_entry(
+                        trade={
+                            "symbol": symbol,
+                            "direction": decision.direction,
+                            "setup_type": decision.setup_type,
+                            "entry_price": decision.entry_price,
+                            "stop_loss": decision.stop_loss,
+                            "target_1": decision.target_1,
+                            "exit_price": None,
+                            "exit_reason": None,
+                            "pnl_pct": None,
+                            "conviction": decision.conviction,
+                            "reasoning": decision.reasoning,
+                        },
+                        original_reasoning=decision.reasoning,
+                    )
+                except Exception as exc:
+                    log.warning("Basic journaling failed: %s", exc)
 
         except Exception as exc:
             log.error("Scan error %s: %s", symbol, exc, exc_info=True)

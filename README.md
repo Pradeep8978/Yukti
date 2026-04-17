@@ -5,7 +5,42 @@
 A production-hardened, AI-powered trading agent for the Indian stock market (NSE/BSE).
 Reasons like a human trader, executes with DhanHQ, learns from its own trades.
 
-**Status:** v0.2 — Ready for paper trading validation before live capital.
+**Status:** Early Alpha — Minimal Viable Paper Loop in progress. Not ready for live trading.
+
+---
+
+## 🎯 Current Status (Honest Assessment)
+
+This project is in **early alpha stage**. The README previously claimed v0.2 and readiness for paper trading, but many core modules are incomplete, contain stubs, or have TODOs. We're actively working to bridge the gap.
+
+### Feature Status
+
+#### Core Agent
+- **Multi-AI support** — [In Progress] Claude Sonnet 4.6, Gemini 2.0 Flash, A/B test mode (basic structure exists, needs full implementation)
+- **Order management** — [In Progress] Crash-safe state machine with GTTs and partial fill handling (OrderIntent model exists, execution layer needs completion)
+- **Risk sizing** — [In Progress] Conviction-based position sizing with 7 hard gates (basic structure, gates need full enforcement)
+- **Signal filtering** — [In Progress] 7 technical patterns, pre-filters (indicators and patterns implemented, integration needs work)
+- **Learning memory** — [TODO] Voyage AI embeddings, pgvector similarity search, past trades as context (journal and memory modules have stubs)
+
+#### Operations
+- **Crash recovery** — [In Progress] Auto-detects and re-arms stuck positions on startup (reconcile module exists, needs testing)
+- **Dead man's switch** — [Completed] Watchdog detects if signal loop stops (deadlock detection)
+- **Observability** — [In Progress] Prometheus metrics, structured logging (metrics.py exists, needs full integration)
+- **Web portal** — [TODO] React 18, real-time WebSocket (webapp/ exists, needs functionality)
+- **Telegram alerts** — [In Progress] Kill switch and alerts (bot.py exists, needs wiring)
+
+#### Infrastructure
+- **Database** — [Completed] PostgreSQL + TimescaleDB + pgvector, Redis
+- **Async architecture** — [Completed] 100% async-first with asyncio
+- **Docker** — [In Progress] docker-compose.yml exists, needs validation
+- **Testing** — [In Progress] Unit tests for some modules, integration tests needed
+- **Deployment** — [TODO] Supervisor, Grafana dashboards (deploy/ exists, needs completion)
+
+#### Modes
+- **Paper trading** — [In Progress] Simulated fills (PaperBroker exists, needs full loop)
+- **Shadow mode** — [In Progress] Real market data, logged orders (ShadowBroker exists)
+- **Live trading** — [TODO] Real DhanHQ orders
+- **Backtest** — [In Progress] Historical replay (BacktestEngine exists, needs fidelity)
 
 ---
 
@@ -78,11 +113,11 @@ docker compose up -d redis postgres
 uv run python scripts/bootstrap.py
 uv run python scripts/universe_loader.py --sample
 
-# Run in paper mode (2-4 weeks of validation)
+# Run in paper mode (validation in progress)
 uv run python -m yukti --mode paper
 ```
 
-**Web portal:** http://localhost:8000 (live stats, positions, trades, journal, kill switch)
+**Web portal:** http://localhost:8000 (live stats, positions, trades, journal, kill switch) — [TODO]
 
 ---
 
