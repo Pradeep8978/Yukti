@@ -5,7 +5,7 @@
 A production-ready, AI-powered trading agent for the Indian stock market (NSE/BSE).
 Reasons like a human trader, executes with DhanHQ, learns from its own trades.
 
-**Status:** Beta — Core paper/shadow loop is stable and ready for validation. Not yet recommended for unsupervised live trading.
+**Status:** Beta — Architecture stable. Currently in validation hardening phase (cost accounting, slippage modeling, walk-forward backtests, closed-loop agent learning). Live trading gated on 90-day shadow Sharpe > 1.0 with calibration error < 15%. See [Roadmap](#-roadmap).
 
 ---
 
@@ -189,7 +189,7 @@ MODE=backtest uv run python -m yukti --bt-start 2023-01-01
 - **Wait more than you act** — conviction scores 5-10, skip marginal setups
 - **Risk first** — every trade has a hard stop loss at a swing level
 - **Conviction-based sizing** — 9-10 → 1.5×, 7-8 → 1.0×, 5-6 → 0.5× position size
-- **Learn from history** — past 3 similar setups injected as context
+- **Learn from history** — outcome-filtered, recency-weighted retrieval; weekly conviction recalibration injected into prompt; meta-reflection every 7 days (see Agent Learning tiers in [Roadmap](#-roadmap))
 
 **Output:** Deterministic JSON schema validated before any order placed.
 
@@ -314,14 +314,75 @@ This is a tool, not financial advice. Use it responsibly.
 
 ## 🛣️ Roadmap
 
-- [ ] Trailing SL to breakeven after T1 hit + partial position exit at T1
-- [ ] Multi-timeframe scanning (1m + 5m + 15m confluence)
-- [ ] Opening Range Breakout (ORB) pattern (9:15–9:30 IST)
-- [ ] Slippage tracking (fill price vs entry price per trade)
-- [ ] F&O (futures and options) support
-- [ ] Tax-aware reporting (India ITR-3 format)
-- [ ] Automated weekly decision-quality alerts (conviction vs outcomes)
-- [ ] Portfolio backtester (risk-adjusted returns)
+> **Validation gate:** No live capital until 90 days of shadow trading shows net Sharpe > 1.0 with conviction calibration error < 15%.
+
+### ✅ Phase 0 — Signal Quality Upgrade (shipped Apr 2026)
+- [x] Dynamic universe scanner (50+ symbols vs static 5)
+- [x] Multi-timeframe (5m + daily) with ADX & daily S/R
+- [x] Opening Range Breakout (ORB) pattern (9:15–9:30 IST, valid till 11:00)
+- [x] VWAP Bounce pattern
+- [x] Two-layer context (macro → daily → intraday alignment) in Arjun prompt
+
+### 🚧 Phase 1 — Validation Infrastructure (BLOCKER for live)
+- [ ] **1.1 Cost-aware P&L** — `yukti/execution/costs.py` (STT, exchange txn, SEBI, stamp, GST, brokerage); migration `004_trade_costs.py` adds `gross_pnl` / `charges` / `net_pnl` to Trade; `quality.py` reports **net** expectancy
+- [ ] **1.2 Slippage modeling** — `yukti/execution/slippage.py` with formula `bps = base + (order_value/turnover) * impact`; calibrated per liquidity bucket (large 5bps / mid 15bps / small 30bps); paper broker applies, live broker records `expected_price` vs `fill_price`; Prometheus histogram
+- [ ] **1.3 Walk-forward backtest** — `yukti/backtest/walk_forward.py`; rolling 60-day train / 20-day test, step 20; outputs per-window Sharpe, max DD, equity curve to `reports/wf_<ts>/`
+- [ ] **1.4 Decision quality v2** — extend `agents/quality.py` with calibration plot, Brier score, edge-decay (rolling 20-trade Sharpe), A/B Claude-vs-Gemini report; weekly cron → Telegram
+- [ ] **1.5 Agent Learning Tier 1 — Smarter retrieval** — `agents/memory.py`: filter by outcome (winners for entries, losers for skips), recency weighting (exp decay, 30-day half-life), regime-match filter, prune journals > 6 months OR negative conviction-outcome correlation
+- [ ] **1.6 Agent Learning Tier 2 — Closed-loop conviction calibration** — new `agents/calibration.py` maintains `(setup_type, conviction) → empirical_win_rate` table refreshed weekly; injected into Arjun prompt (e.g., *"Your conviction-7 ORB historically won 38%, not 60%"*); auto-raises risk-gate floor for setups with negative net expectancy
+- [ ] **1.7 Agent Learning Tier 5 — Weekly meta-reflection** — new `agents/meta_journal.py`; Claude reads last 7 days of journals + quality report, writes meta-reflection stored in `meta_journals` table; latest entry injected into Arjun system prompt (human-readable, auditable, reversible)
+
+### Phase 2 — Execution Quality
+- [ ] **2.1 Trailing SL + partial T1 exit** — extend `execution/order_sm.py` with `PARTIAL_EXITED_T1`, `TRAILING` states; T1 hit → market sell 50% + move SL to breakeven on remainder; trail to last swing low per 5m candle; migration `005_position_milestones.py`
+- [ ] **2.2 Correlation gate (9th risk gate)** — new `risk/correlation.py`; reject if same-sector open positions ≥ 2 OR 60-day correlation with basket > 0.8; configs `MAX_SECTOR_CONCURRENT`, `MAX_CORRELATION`
+- [ ] **2.3 Regime detector** — new `signals/regime.py`; daily nifty_adx + atr_pct + vix + breadth → `TRENDING_UP/DOWN/CHOPPY/VOLATILE`; cached in Redis `regime:current`; wired into Arjun prompt + risk gates (disable mean-reversion in trends; tighten conviction floor in choppy)
+- [ ] **2.4 Agent Learning Tier 3 — Pattern weights** — track per-pattern rolling 60-trade net expectancy; auto-disable patterns with Wilson lower bound < 0 (30-day cooldown); Prometheus alert on edge decay; manual re-enable via control plane endpoint
+
+### Phase 3 — Observability & Reporting
+- [ ] **3.1 Live equity curve** — `GET /api/equity-curve?days=N`; web portal panel with rolling Sharpe + max DD; daily JSON snapshot to `reports/equity/YYYY-MM-DD.json` (transparent track record)
+- [ ] **3.2 Tax-aware reporting** — `yukti/reports/tax.py`; categorizes intraday (speculative) vs delivery (STCG/LTCG); ITR-3 compatible CSV; CLI `uv run python -m yukti.reports.tax --fy 2026-27`
+- [ ] **3.3 Per-decision AI cost ledger** — `ai_calls` table for monthly cost transparency
+
+### Phase 4 — Strategic (post-validation only)
+- [ ] **4.1 F&O support** — broker abstraction for options chains; patterns `iv_crush_short_strangle`, `directional_long_call/put`; risk gates for max margin & max delta exposure (DO NOT START until Phase 1 proves equity edge)
+- [ ] **4.2 Stop-loss types** — ATR-based SL (currently swing-only); time-stop (exit if not at T1 within N candles)
+- [ ] **4.3 News-event awareness** — catalyst calendar (earnings / RBI / FOMC); block entries 1hr before/after; wire into `services/macro_context_service.py`
+- [ ] **4.4 Agent Learning Tier 4 — Fine-tuning** — collect 1000+ labeled `(context, decision, R_multiple)` triples; fine-tune Gemini Flash or Llama 3.1 8B; replaces prompt-engineered Arjun with a model that has actually learned (only after 6+ months of clean data)
+
+### Phase 5 — Honest README Refresh (after Phase 1 results)
+- [ ] Replace `Expected performance` section with **measured** Sharpe + max DD from shadow data
+- [ ] Publish equity curve in repo (transparent track record)
+- [ ] Add caveat: "Results from N days paper/shadow. Live performance will differ."
+
+### Suggested sequencing (12 weeks)
+
+| Week | Work |
+|---|---|
+| 1-2 | 1.1 + 1.2 (costs + slippage) |
+| 3 | 1.3 (walk-forward) |
+| 4 | 1.4 + 1.5 (quality v2 + smarter retrieval) |
+| 5 | 1.6 + 1.7 (calibration + meta-reflection) |
+| 6 | 2.2 (correlation gate) |
+| 7 | 2.3 (regime detector) |
+| 8-9 | 2.1 (trailing/partial T1) |
+| 10 | 2.4 (pattern weights) |
+| 11 | 3.x (observability + tax) |
+| 12+ | 90-day shadow validation → Phase 4 only if numbers justify |
+
+### Agent Learning — 5-tier model at a glance
+
+| Tier | What | Phase | Effort |
+|---|---|---|---|
+| 1 | Outcome-filtered, recency-weighted, regime-matched memory retrieval | 1.5 | S |
+| 2 | Closed-loop conviction calibration injected into prompt | 1.6 | M |
+| 3 | Auto-disable patterns with negative net expectancy (Wilson bound) | 2.4 | M |
+| 4 | Fine-tune small model on labeled decision corpus | 4.4 | XL |
+| 5 | Weekly meta-reflection becomes part of system prompt | 1.7 | S |
+
+### Open design questions
+1. **Pattern cooldown threshold (Tier 3)** — Wilson lower bound at 95% or 90% confidence?
+2. **Meta-journal model (Tier 5)** — Claude (better reasoning, ~₹2/week) or Gemini (free, less nuanced)?
+3. **Calibration table scope (Tier 2)** — global, per-setup, or per-(setup, regime)? Last is most powerful but needs more data.
 
 ---
 
