@@ -154,6 +154,48 @@ class Candle(Base):
     close:    Mapped[float] = mapped_column(Float)
     volume:   Mapped[float] = mapped_column(Float)
 
+
+# ─────────────────────────────────────────────────────────────
+# Position
+# ─────────────────────────────────────────────────────────────
+
+class Position(Base):
+    """Authoritative in-memory position record for open positions.
+
+    Stored in Postgres and cached in Redis by `yukti.data.state`.
+    """
+
+    __tablename__ = "positions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20), index=True)
+    security_id: Mapped[str] = mapped_column(String(20))
+    intent_id: Mapped[Optional[int]] = mapped_column(ForeignKey("order_intents.id"), nullable=True)
+
+    direction: Mapped[str] = mapped_column(String(5))
+    setup_type: Mapped[str] = mapped_column(String(30))
+    holding_period: Mapped[str] = mapped_column(String(10))
+
+    entry_price: Mapped[float] = mapped_column(Float)
+    fill_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    stop_loss: Mapped[float] = mapped_column(Float)
+    target_1: Mapped[float] = mapped_column(Float)
+    target_2: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    quantity: Mapped[int] = mapped_column(Integer)
+    conviction: Mapped[int] = mapped_column(Integer)
+    risk_reward: Mapped[float] = mapped_column(Float)
+
+    entry_order_id: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    sl_gtt_id: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    target_gtt_id: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(15), default="OPEN", index=True)
+    reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    opened_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    filled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
 # Register OrderIntent model with Base.metadata
 from yukti.execution.order_intent import OrderIntent  # noqa: F401
 

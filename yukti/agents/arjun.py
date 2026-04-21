@@ -114,6 +114,15 @@ Step 1 — Market Bias (from Nifty)
 - Nifty flat/choppy = NEUTRAL (selective trades only)
 - Major news/event day = AVOID (volatility too high)
 
+Step 1.5 — DAILY TIMEFRAME CHECK:
+- If daily trend is STRONG (ADX > 25): only trade WITH the trend unless conviction ≥ 9
+- If daily is at major resistance: don't go LONG unless breakout confirmed on daily close
+- If daily is at major support: don't go SHORT unless breakdown confirmed
+- If daily RSI > 75: stock is extended, reduce conviction by 1
+- If daily RSI < 25: stock is washed out, reduce conviction by 1
+- ALIGNED setups: +1 conviction bonus
+- COUNTER-TREND setups: -2 conviction penalty (must still meet minimum)
+
 Step 2 — Stock Analysis
 - **Trend**: Higher highs/lows = uptrend (long). Lower highs/lows = downtrend (short).
 - **Momentum**: RSI >65 = overbought (bearish). RSI <35 = oversold (bullish).
@@ -151,6 +160,19 @@ Step 6 — Holding Period
 INTRADAY: Close by 15:10 IST. No overnight equity shorts.
 SWING: 2-5 days. Only LONG in delivery.
 
+━━━ ORB RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ORB only valid 09:30–11:00 IST. After 11:00, ignore opening range entirely.
+- Narrow opening range (< 1× ATR) breakouts are higher probability.
+- If ORB fails (reverses back into range), it becomes a TRAP — do not re-enter same direction.
+- ORB entry: breakout candle close. Stop: OR_Mid (tight) or opposite end of range (wider).
+- Target 1: 1× opening range width from breakout. Target 2: 2× range width.
+
+━━━ VWAP BOUNCE RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- VWAP Bounce only valid 09:45–14:40 IST.
+- VWAP is where institutions trade. Bounces off VWAP in a trending stock are high-probability.
+- If VWAP breaks and holds on other side for 2+ candles, trend may be reversing — avoid.
+- Stop: VWAP minus 0.5× ATR (for long). Target: nearest swing high/low or 2× stop distance.
+
 ━━━ PERFORMANCE CONTEXT (injected each cycle — obey strictly) ━━━
 - consecutive_losses >= 3: conviction >=9 only, halve position size
 - daily_pnl_pct <= -2.0%: output SKIP, skip_reason = "daily_loss_limit_hit"
@@ -163,7 +185,7 @@ Return ONLY valid JSON matching this exact schema. No prose, no markdown fences.
   "action":         "TRADE" | "SKIP",
   "direction":      "LONG" | "SHORT" | null,
   "market_bias":    "BULLISH" | "BEARISH" | "NEUTRAL" | "AVOID",
-  "setup_type":     "trend_follow" | "breakout" | "breakdown" | "reversal_long" | "reversal_short" | "momentum" | null,
+  "setup_type":     "trend_follow" | "breakout" | "breakdown" | "reversal_long" | "reversal_short" | "momentum" | "orb_breakout" | "vwap_bounce" | null,
   "reasoning":      "3-4 sentence NSE-specific analysis with technical levels",
   "entry_price":    float | null,
   "entry_type":     "LIMIT" | "MARKET" | "BREAKOUT",

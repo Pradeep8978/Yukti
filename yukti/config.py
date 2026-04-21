@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     # ── API settings ───────────────────────────────────
     cors_allow_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
 
+    # ── Universe scanner ─────────────────────────────
+    scanner_pick_count: int = Field(default=15, ge=5, le=50)
+    min_turnover_cr: float = Field(default=10, gt=0)
+    volume_surge_threshold: float = Field(default=2.0, gt=0)
+    price_move_threshold: float = Field(default=1.5, gt=0)
+    intraday_refresh_times: list[str] = Field(default_factory=lambda: ["10:00", "12:00"])
+
+    # ── Daily candle (multi-timeframe) ────────────────
+    daily_candle_history: int = Field(default=60, ge=20, le=200)
+    daily_cache_ttl: int = Field(default=3600 * 8, ge=3600)
+
     # ── Scheduler times (IST) ─────────────────────────
     market_open:    str = "09:15"
     morning_prep:   str = "09:00"

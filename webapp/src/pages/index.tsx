@@ -3,8 +3,15 @@ import { format } from "date-fns";
 import type { LiveState } from "../hooks/useLive";
 import {
   DirectionBadge, ConvictionDots, EmptyState,
-  SectionHead, Table, Td,
+  SectionHead, Table, Td, PnlChip, Spinner
 } from "../components/ui";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// src/pages/Trades.tsx
+// ─────────────────────────────────────────────────────────────────────────────
+import { api } from "../lib/api";
+import { useQuery } from "../hooks/useQuery";
+
 
 export function Positions({ live }: { live: LiveState }) {
   const positions = Object.values(live.positions);
@@ -86,12 +93,6 @@ export function Positions({ live }: { live: LiveState }) {
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// src/pages/Trades.tsx
-// ─────────────────────────────────────────────────────────────────────────────
-import { api } from "../lib/api";
-import { useQuery } from "../hooks/useQuery";
-import { PnlChip, Spinner, EmptyState, SectionHead, Table, Td } from "../components/ui";
 
 export function Trades() {
   const { data, status } = useQuery(() => api.trades(100), [], 30_000);

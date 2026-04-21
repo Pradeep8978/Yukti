@@ -30,6 +30,16 @@ The end-to-end paper trading loop is **complete and stable**. All critical bugs 
 - **Web portal** — ✅ React 18 SPA, real-time WebSocket, kill switch, journal browser
 - **Telegram alerts** — ✅ Trade notifications, crash alerts, daily summary, `/halt` command
 
+#### Scheduler & Control Plane
+
+- The control plane (`ControlPlaneService`) now starts the application's cron-style scheduler. When the control plane is started it calls `build_scheduler()` (from `yukti/scheduler/jobs.py`) and starts it; on shutdown the service calls `scheduler.shutdown(wait=False)` to stop jobs cleanly.
+- Key scheduler jobs are defined in `yukti/scheduler/jobs.py`: `job_morning_prep`, `job_eod_squareoff`, `job_daily_reset`, and `job_daily_report`. These perform tasks such as end-of-day square-off, daily counter resets, and journal writing.
+- Files changed: `yukti/services/control_plane_service.py` (starts/shuts down scheduler), `yukti/scheduler/jobs.py` (job definitions). See those files for exact behavior and cron timings.
+- Notes:
+    - The scheduler is started automatically when the `ControlPlaneService` runs (used in live/shadow modes). In `paper` mode the agent runs a single scan and the control plane (and scheduler) is not started by default.
+    - To disable scheduled jobs for testing/CI, run with `MODE=paper` or avoid starting the `ControlPlaneService`.
+    - Ensure the database migration that creates the `positions` table (e.g., `yukti/data/migrations/versions/003_positions.py`) is applied before running the control plane.
+
 #### Infrastructure
 - **Database** — ✅ PostgreSQL 16 + TimescaleDB + pgvector, Redis 7
 - **Async architecture** — ✅ 100% async-first with asyncio, graceful shutdown

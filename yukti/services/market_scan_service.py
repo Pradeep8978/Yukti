@@ -5,6 +5,7 @@ Handles market scanning and signal processing.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict
@@ -109,12 +110,50 @@ class MarketScanService:
 
         return await fetch_macro_context(nifty_chg, nifty_trend)
 
+    async def _get_daily_candles(self, symbol: str, security_id: str) -> pd.DataFrame | None:
+        """
+        Fetch 60-day daily candles, cached in Redis for one trading session.
+        Returns DataFrame or None on failure.
+        """
+        from yukti.data.state import get_redis
+        cache_key = f"yukti:daily_candles:{symbol}"
+        r = await get_redis()
+
+        # Check cache
+        cached = await r.get(cache_key)
+        if cached:
+            data = json.loads(cached)
+            df = pd.DataFrame(data)
+            if len(df) >= 20:
+                return df
+
+        # Fetch from DhanHQ
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            start = (datetime.now() - timedelta(days=settings.daily_candle_history + 10)).strftime("%Y-%m-%d")
+            raw = await dhan.get_candles(security_id, "1", start, today)
+            if not raw or len(raw) < 20:
+                return None
+
+            df = pd.DataFrame(
+                raw, columns=["time", "open", "high", "low", "close", "volume"]
+            ).astype({c: float for c in ["open", "high", "low", "close", "volume"]})
+
+            # Cache with session TTL
+            await r.set(cache_key, json.dumps(df.to_dict("records")), ex=settings.daily_cache_ttl)
+            log.debug("Cached daily candles for %s (%d rows)", symbol, len(df))
+            return df
+        except Exception as exc:
+            log.warning("Failed to fetch daily candles for %s: %s", symbol, exc)
+            return None
+
     async def _scan_symbol(self, symbol: str, security_id: str, macro: MacroContext, perf: dict) -> None:
-        """Scan one symbol."""
+        """Scan one symbol with daily + 5-min multi-timeframe analysis."""
         async with self.sem:
             signals_scanned.inc()
             log.info("MarketScanService: scanning %s", symbol)
             try:
+                # ── 5-min candles (existing) ──────────────────────────
                 today = datetime.now().strftime("%Y-%m-%d")
                 start = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
                 raw = await dhan.get_candles(security_id, 5, start, today)
@@ -122,16 +161,40 @@ class MarketScanService:
                     return
 
                 df = pd.DataFrame(raw, columns=["time","open","high","low","close","volume"]).astype({c: float for c in ["open","high","low","close","volume"]})
-                snap = compute(df)
+                snap = compute(df, timeframe="5m")
 
-                # Use the best detected pattern as the setup hint for memory retrieval.
-                # Direction defaults to Nifty-aligned bias before Claude decides.
-                pattern = best_pattern(snap)
-                memory_setup = pattern.name if pattern else "unknown"
+                # ── Daily candles (new — multi-timeframe) ─────────────
+                snap_daily = None
+                daily_df = await self._get_daily_candles(symbol, security_id)
+                if daily_df is not None and len(daily_df) >= 20:
+                    snap_daily = compute(daily_df, timeframe="daily")
+
+                # ── Current time for time-gating ──────────────────────
+                current_time = datetime.now().time()
+
+                # ── ORB levels (from first 3 candles of today) ────────
+                or_high, or_low = None, None
+                if len(df) >= 3:
+                    or_candles = df.iloc[:3]
+                    or_high = float(or_candles["high"].max())
+                    or_low = float(or_candles["low"].min())
+
+                # ── Pattern detection (updated with multi-timeframe) ──
+                pattern = best_pattern(snap, candles=df, indicators_daily=snap_daily, current_time=current_time)
+
+                # ── Memory retrieval ──────────────────────────────────
+                memory_setup = pattern.pattern_type if pattern else "unknown"
                 memory_dir   = "LONG" if macro.nifty_trend == "UP" else "SHORT" if macro.nifty_trend == "DOWN" else "LONG"
                 past_journal = await retrieve_similar(symbol, memory_setup, memory_dir)
                 symbol_headlines = filter_headlines_for_symbol(symbol, macro.headlines)
-                context = build_context(symbol, snap, macro, perf, past_journal, symbol_headlines)
+
+                # ── Context (updated with daily + ORB/VWAP) ──────────
+                context = build_context(
+                    symbol, snap, macro, perf, past_journal, symbol_headlines,
+                    indicators_daily=snap_daily,
+                    or_high=or_high,
+                    or_low=or_low,
+                )
 
                 decision = await arjun.safe_decide(context)
                 log.info("MarketScanService: AI decision for %s: %s (conviction %d)", symbol, decision.action, decision.conviction)

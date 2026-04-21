@@ -55,6 +55,11 @@ class IndicatorSnapshot:
     prev_close:     float
     candle_change_pct: float
 
+    # Daily-only (None when timeframe="5m")
+    adx:              float | None = None
+    daily_support:    float | None = None
+    daily_resistance: float | None = None
+
     def above_vwap(self)   -> bool: return self.close > self.vwap
     def above_ema20(self)  -> bool: return self.close > self.ema20
     def above_ema50(self)  -> bool: return self.close > self.ema50
@@ -62,7 +67,7 @@ class IndicatorSnapshot:
     def rsi_oversold(self)   -> bool: return self.rsi < 30
 
 
-def compute(df: pd.DataFrame, swing_lookback: int = 20) -> IndicatorSnapshot:
+def compute(df: pd.DataFrame, swing_lookback: int = 20, timeframe: str = "5m") -> IndicatorSnapshot:
     """
     Compute all indicators on a OHLCV dataframe and return the latest snapshot.
 
@@ -124,6 +129,21 @@ def compute(df: pd.DataFrame, swing_lookback: int = 20) -> IndicatorSnapshot:
     # ── Volume SMA ───────────────────────────────────────────────────
     df["vol_sma20"] = df["volume"].rolling(20).mean()
 
+    # ── ADX (daily timeframe only — noisy on 5-min) ──────────────────
+    adx_value = None
+    daily_support_val = None
+    daily_resistance_val = None
+    if timeframe == "daily":
+        adx_series = ta.adx(df["high"], df["low"], df["close"], length=14)
+        if adx_series is not None and "ADX_14" in adx_series.columns:
+            adx_val = adx_series["ADX_14"].iloc[-1]
+            adx_value = float(adx_val) if pd.notna(adx_val) else 0.0
+
+        # Daily S/R — swing highs/lows from last 20 sessions
+        sr_window = df.tail(20)
+        daily_resistance_val = float(sr_window["high"].nlargest(3).mean())
+        daily_support_val = float(sr_window["low"].nsmallest(3).mean())
+
     # ── Fill NaN with forward fill then zero ────────────────────────
     df.ffill(inplace=True)
     df.fillna(0, inplace=True)
@@ -176,4 +196,7 @@ def compute(df: pd.DataFrame, swing_lookback: int = 20) -> IndicatorSnapshot:
         nearest_swing_low  = nearest_swing_low,
         prev_close         = float(prev["close"]),
         candle_change_pct  = (float(r["close"]) - float(prev["close"])) / float(prev["close"]) * 100,
+        adx              = adx_value,
+        daily_support    = daily_support_val,
+        daily_resistance = daily_resistance_val,
     )
