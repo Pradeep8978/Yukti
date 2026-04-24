@@ -17,6 +17,9 @@ dependencies = [
     "anthropic>=0.40",
     "google-genai>=1.0",            # Gemini 2.0 Flash provider
     "voyageai>=0.2",
+    "langchain>=0.0.300",
+    # Optional: add OpenAI SDK if you plan to use OpenAI provider
+    "openai>=0.28"
 
     # ── Signals ──────────────────────────────────────
     "pandas>=2.2",

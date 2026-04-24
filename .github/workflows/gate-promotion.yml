@@ -1,0 +1,47 @@
+name: CI — Gate Promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_name:
+        description: 'Artifact name to download (artifact from retrain job)'
+        required: true
+        default: 'ci-artifacts'
+      metrics_path:
+        description: 'Relative path inside artifact to compare_metrics.json'
+        required: true
+        default: 'artifacts/eval/compare_metrics.json'
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.inputs.artifact_name }}
+          path: ci-artifacts
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Run promotion gate
+        run: |
+          set -e
+          METRICS=ci-artifacts/${{ github.event.inputs.metrics_path }}
+          echo "Checking metrics at $METRICS"
+          if [ ! -f "$METRICS" ]; then
+            echo "Metrics file not found: $METRICS"
+            exit 2
+          fi
+          python scripts/check_promotion_gate.py --metrics "$METRICS"

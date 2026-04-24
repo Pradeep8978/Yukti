@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select, desc
 
@@ -143,6 +143,14 @@ class HaltRequest(BaseModel):
     reason: str = "manual"
 
 
+class CanaryRatio(BaseModel):
+    ratio: float
+
+
+class SetCanaryRequest(BaseModel):
+    path: str
+
+
 @control_router.get("/status")
 async def agent_status() -> dict[str, Any]:
     halted = await is_halted()
@@ -185,3 +193,87 @@ async def squareoff_all() -> dict[str, Any]:
             results.append({"symbol": symbol, "ok": False, "error": str(exc)})
 
     return {"halted": True, "results": results}
+
+
+@control_router.get("/canary")
+async def canary_status() -> dict[str, Any]:
+    try:
+        from yukti.agents import canary as canary_mod
+        active = await canary_mod.get_active_canary()
+        prev = await canary_mod.get_previous_active()
+        ratio = await canary_mod.get_canary_ratio()
+        return {"active": active, "previous": prev, "ratio": ratio}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@control_router.post("/canary/ratio")
+async def set_canary_ratio(req: CanaryRatio) -> dict[str, Any]:
+    try:
+        from yukti.agents import canary as canary_mod
+        await canary_mod.set_canary_ratio(float(req.ratio))
+        return {"ratio": float(req.ratio)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@control_router.post("/canary/set")
+async def set_canary(req: SetCanaryRequest) -> dict[str, Any]:
+    try:
+        from yukti.agents import canary as canary_mod
+        await canary_mod.set_active_canary(req.path)
+        return {"active": req.path}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@control_router.post("/canary/rollback")
+async def canary_rollback() -> dict[str, Any]:
+    try:
+        from yukti.agents import canary as canary_mod
+        prev = await canary_mod.get_previous_active()
+        if not prev:
+            raise HTTPException(status_code=404, detail="No previous canary")
+        await canary_mod.set_active_canary(prev)
+        return {"rolled_back_to": prev}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@control_router.post("/alert")
+async def alert_webhook(request: Request) -> dict[str, Any]:
+    """Receive Alertmanager webhook payloads and trigger automated actions.
+    Expects Alertmanager JSON with `alerts` array.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    alerts = payload.get("alerts") if isinstance(payload, dict) else None
+    if not alerts:
+        return {"handled": 0, "detail": "no alerts"}
+
+    handled = 0
+    for a in alerts:
+        labels = a.get("labels", {}) or {}
+        name = labels.get("alertname")
+        if name in ("YuktiCanaryUnhealthy", "YuktiCanaryRegressed", "YuktiCanaryFailureRate"):
+            try:
+                from yukti.agents import canary as canary_mod
+                prev = await canary_mod.get_previous_active()
+                if prev:
+                    await canary_mod.set_active_canary(prev)
+                    handled += 1
+                    try:
+                        from yukti.telegram.bot import alert as tg_alert
+                        import asyncio as _asyncio
+                        _asyncio.create_task(tg_alert(f"⚠️ Canary rollback triggered by Alertmanager: restored {prev}"))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    return {"handled": handled}

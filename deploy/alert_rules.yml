@@ -1,0 +1,29 @@
+groups:
+  - name: yukti.rules
+    rules:
+      - alert: YuktiCanaryUnhealthy
+        expr: yukti_canary_failures_total > 5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yukti canary failures high"
+          description: "Canary failures exceeded threshold — consider rollback."
+
+      - alert: YuktiSelfLearningFailed
+        expr: yukti_self_learning_failures_total > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Self-learning loop failure"
+          description: "Self-learning loop reported failures — investigate." 
+
+      - alert: YuktiCanaryFailureRate
+        expr: rate(yukti_canary_failures_total[5m]) > 0.2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High canary failure rate"
+          description: "Canary failure rate is high over the last 5 minutes." 

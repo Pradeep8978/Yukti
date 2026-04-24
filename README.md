@@ -95,6 +95,53 @@ Web Portal (React 18, real-time WebSocket)
 
 ---
 
+## 🏢 Business & Architecture Overview
+
+**Goal:** Build a safe, auditable, and incremental self-learning trading agent that can progress from paper → shadow → live with governance, monitoring, and rollback.
+
+**Primary stakeholders:** retail trader (owner), quant developers, SRE/ops, compliance/legal.
+
+**Key capabilities:**
+- **Safe execution:** deterministic risk gates, kill-switch, crash recovery.
+- **Observability & governance:** Prometheus metrics, Alertmanager webhook, artifact signing, CI gating.
+- **Reproducibility:** artifact packaging with sha256 and optional HMAC signatures; stored metadata and versioning.
+- **Data lineage:** decision logs, trade journals, embeddings (pgvector) and full audit trail in Postgres.
+- **Incremental promotion:** artifact-driven CI → staging canary → production promotion with automated gates.
+- **Model governance:** holdout evaluation, compare_metrics tooling, and rollback on regressions.
+
+**Architecture notes (brief):**
+- **Control plane:** FastAPI admin endpoints for canary control, alert webhook, and operational actions; scheduler runs async jobs from `yukti/scheduler/jobs.py`.
+- **Storage:** PostgreSQL + TimescaleDB + pgvector for time-series and vector search; Redis for locks and cache.
+- **Artifacts & registry:** `yukti/artifacts.py` packages adapters, computes sha256, signs with HMAC when configured, and optionally uploads to S3.
+- **CI/CD:** GitHub Actions gate workflow downloads artifacts and runs `scripts/check_promotion_gate.py` to enforce promotion thresholds before manual/automatic promotion.
+- **Canary policy:** router sends configured ratio of calls to a local canary adapter; monitor job evaluates canary performance and triggers rollback if alerts fire.
+
+**Operational runbook (summary):**
+- Promote: create artifact → CI gate runs → `POST /control/canary/set` to stage → monitor for `canary_monitor_duration_seconds` → promote or rollback.
+- On alert: Alertmanager webhook calls `/control/alert` → control plane triggers rollback to previous canary and notifies ops.
+- Nightly backups: schedule `pg_dump` + WAL archiving; keep 30-day retention by default.
+
+**SLA & monitoring (suggested):**
+- Target availability: 99.5% for control plane and scheduler.
+- Alerts: high canary failure rate, high self-learning failures, decision throughput drop.
+- Pager: set `ONCALL_CONTACT` and integrate Alertmanager with phone/SMS or Opsgenie.
+
+**Security & secrets (short):**
+- Use Doppler or a secret manager for API keys and HMAC signing key; never commit secrets.
+- Limit DB/Redis access with network policies and private subnets.
+
+**Data retention & privacy:** Trade logs and journal embeddings default to 365 days; archive older data.
+
+**Costs & scaling notes:** Majority costs are model API usage and managed DB; reduce calls via signal pre-filtering and prefer Gemini free tier when suitable.
+
+**Production checklist (recommended):**
+- Managed Postgres + automated backups and monitoring.
+- Doppler (or similar) for secrets and artifact signing key in place.
+- 4-week paper/shadow validation and CI gating passing.
+- Alerting + on-call tested with failure drills.
+
+---
+
 ## 🚀 Quick start
 
 ### Prerequisites

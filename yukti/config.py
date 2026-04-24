@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     artifact_registry_s3_region: str = ""
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
+    # Optional HMAC signing key for published artifacts (keep secret)
+    artifact_registry_signing_key: str = ""
 
     # ── Broker ────────────────────────────────────────
     dhan_client_id: str = ""
@@ -54,6 +56,12 @@ class Settings(BaseSettings):
     # Gemini
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
+
+    # OpenAI
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
+    openai_max_tokens: int = 1000
+    openai_temperature: float = 0.1
 
     # Shared AI settings
     ai_max_retries: int = 2

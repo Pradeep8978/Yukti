@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from yukti.config import settings
+import hmac
 
 
 def _sha256_file(path: str) -> str:
@@ -110,4 +111,16 @@ def package_and_publish(model_dir: str, out_dir: Optional[str] = None) -> dict:
     }
     meta_path = save_metadata_local(meta, out_dir=os.path.join("models", "registry"))
     meta["meta_path"] = meta_path
+    # Optional HMAC signing for artifact provenance
+    signing_key = getattr(settings, "artifact_registry_signing_key", "")
+    if signing_key:
+        try:
+            sig = hmac.new(signing_key.encode("utf-8"), sha.encode("utf-8"), digestmod=hashlib.sha256).hexdigest()
+            sig_path = meta_path + ".sig"
+            with open(sig_path, "w") as sf:
+                sf.write(sig)
+            meta["signature"] = sig
+            meta["signature_path"] = sig_path
+        except Exception:
+            pass
     return meta

@@ -694,6 +694,17 @@ def _build_provider(name: str) -> BaseProvider:
             log.warning("GEMINI_API_KEY not set, using mock provider")
             return MockProvider()
         return GeminiProvider()
+    elif name == "openai":
+        # Lazy-import provider module so missing SDK doesn't break module import
+        try:
+            from yukti.agents.openai_provider import OpenAIProvider
+        except Exception:
+            log.warning("OpenAI provider not available (missing package?), using mock provider")
+            return MockProvider()
+        if not settings.openai_api_key:
+            log.warning("OPENAI_API_KEY not set, using mock provider")
+            return MockProvider()
+        return OpenAIProvider()
     raise ValueError(f"Unknown provider: {name}")
 
 
