@@ -59,7 +59,7 @@ async def backfill_symbol(
         log.info("  %s: fetching %s → %s", symbol, start_str, end_str)
 
         try:
-            raw = await dhan.get_candles(security_id, interval, start_str, end_str)
+            raw = await dhan.get_candles(security_id, interval, start_str, end_str, symbol=symbol)
         except Exception as exc:
             log.warning("  %s: fetch failed for %s: %s", symbol, start_str, exc)
             cur = chunk_end

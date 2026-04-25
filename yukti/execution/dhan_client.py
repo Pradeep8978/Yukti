@@ -11,7 +11,9 @@ import time
 from functools import wraps
 from typing import Any, Callable
 
-from dhanhq import dhanhq
+from dhanhq import dhanhq, DhanContext
+import yfinance as yf
+import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from yukti.config import settings
@@ -61,10 +63,23 @@ class DhanClient:
     """
 
     def __init__(self) -> None:
-        self._dhan = dhanhq(
-            client_id    = settings.dhan_client_id,
-            access_token = settings.dhan_access_token,
-        )
+        if settings.dhan_use_sandbox:
+            cid = settings.dhan_sandbox_client_id
+            tok = settings.dhan_sandbox_access_token
+            base = settings.dhan_sandbox_base_url
+            log.info("DhanClient: Using SANDBOX environment")
+        else:
+            cid = settings.dhan_client_id
+            tok = settings.dhan_access_token
+            base = settings.dhan_base_url
+            log.info("DhanClient: Using PRODUCTION environment")
+
+        ctx = DhanContext(client_id=cid, access_token=tok)
+        if base:
+            ctx.dhan_http.base_url = base.rstrip("/")
+            if "sandbox" in ctx.dhan_http.base_url and not ctx.dhan_http.base_url.endswith("/v2"):
+                 ctx.dhan_http.base_url += "/v2"
+        self._dhan = dhanhq(ctx)
         self._loop = asyncio.get_event_loop()
 
     async def _call(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:
@@ -159,18 +174,52 @@ class DhanClient:
         interval:     str = "5",
         from_date:    str = "",
         to_date:      str = "",
+        symbol:       str = "",
     ) -> list[dict[str, Any]]:
-        """Fetch historical candles. Returns list of OHLCV dicts."""
+        """Fetch historical candles. Falls back to yfinance if Dhan fails or is unavailable."""
         result = await self._call(
-            self._dhan.intraday_daily_minute_charts,
+            self._dhan.intraday_minute_data,
             security_id      = security_id,
-            exchange_segment = "NSE_EQ",
-            instrument_type  = "EQUITY",
+            exchange_segment = "NSE_EQ" if security_id != "13" else "IDX_I",
+            instrument_type  = "EQUITY" if security_id != "13" else "INDEX",
             interval         = interval,
             from_date        = from_date,
             to_date          = to_date,
         )
-        return result.get("data", []) if isinstance(result, dict) else []
+        
+        data = result.get("data", []) if isinstance(result, dict) else []
+        
+        # ── Fallback to yfinance ──────────────────────────────────────────
+        # If Dhan returns no data or fails (common if not subscribed to Data API)
+        if not data and symbol:
+            log.info("DhanClient: No data for %s, trying yfinance fallback...", symbol)
+            try:
+                s_int = str(interval)
+                yf_interval = f"{s_int}m" if s_int.isdigit() else "1d" if s_int == "1" else "5m"
+                ticker_sym = f"{symbol}.NS" if security_id != "13" else "^NSEI"
+                
+                # yfinance uses start/end dates
+                # Optimization: yfinance is much faster for recent data
+                ticker = yf.Ticker(ticker_sym)
+                df = ticker.history(start=from_date, end=to_date, interval=yf_interval)
+                
+                if not df.empty:
+                    # Convert to Dhan format: list of dicts with 'time', 'open', 'high', 'low', 'close', 'volume'
+                    data = []
+                    for ts, row in df.iterrows():
+                        data.append({
+                            "time": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                            "open": float(row["Open"]),
+                            "high": float(row["High"]),
+                            "low": float(row["Low"]),
+                            "close": float(row["Close"]),
+                            "volume": int(row["Volume"]),
+                        })
+                    log.info("DhanClient: Successfully fetched %d candles from yfinance for %s", len(data), symbol)
+            except Exception as e:
+                log.warning("DhanClient: yfinance fallback failed for %s: %s", symbol, e)
+
+        return data
 
     # ── Market order (square off) ─────────────────────────────────────────────
 

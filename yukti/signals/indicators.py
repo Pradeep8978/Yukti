@@ -8,9 +8,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import logging
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -120,9 +123,25 @@ def compute(df: pd.DataFrame, swing_lookback: int = 20, timeframe: str = "5m") -
     # ── Bollinger Bands ──────────────────────────────────────────────
     bb = ta.bbands(df["close"], length=20, std=2.0)
     if bb is not None:
-        df["bb_upper"] = bb["BBU_20_2.0"]
-        df["bb_mid"]   = bb["BBM_20_2.0"]
-        df["bb_lower"] = bb["BBL_20_2.0"]
+        # Some versions/platforms might use different column names
+        upper_col = "BBU_20_2.0"
+        mid_col   = "BBM_20_2.0"
+        lower_col = "BBL_20_2.0"
+        
+        if upper_col in bb.columns:
+            df["bb_upper"] = bb[upper_col]
+            df["bb_mid"]   = bb[mid_col]
+            df["bb_lower"] = bb[lower_col]
+        else:
+            # Try finding by prefix
+            cols = {c.split("_")[0]: c for c in bb.columns}
+            if "BBU" in cols:
+                df["bb_upper"] = bb[cols["BBU"]]
+                df["bb_mid"]   = bb[cols["BBM"]]
+                df["bb_lower"] = bb[cols["BBL"]]
+            else:
+                log.warning("Indicators: BBands columns not found. Available: %s", bb.columns.tolist())
+                df["bb_upper"] = df["bb_mid"] = df["bb_lower"] = df["close"]
     else:
         df["bb_upper"] = df["bb_mid"] = df["bb_lower"] = df["close"]
 

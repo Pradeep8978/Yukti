@@ -24,6 +24,7 @@ from yukti.api.routes.positions import (
 )
 from yukti.metrics import metrics_response, agent_halted, signal_loop_last_run
 from yukti.data.state import is_halted, get_performance_state, get_all_positions
+from yukti.config import settings
 
 log = logging.getLogger(__name__)
 

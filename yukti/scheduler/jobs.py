@@ -175,17 +175,16 @@ def build_scheduler() -> AsyncIOScheduler:
 
 # ── Self-learning loop: continuous ingestion, retrain, eval, promote ──────────
 
-import logging
-from datetime import datetime, timedelta
-import os
-import torch
-import asyncio
 import json
 
 import redis.asyncio as aioredis
 
 async def job_self_learning_loop() -> None:
     """Self-learning loop: export new data, retrain if enough, evaluate, promote if pass."""
+    import torch
+    import os
+    from datetime import datetime, timedelta
+    import asyncio
     log = logging.getLogger("self_learning_loop")
     from yukti.config import settings
     # Locking: try Redis, fallback to file lock
@@ -442,6 +441,8 @@ async def job_self_learning_loop() -> None:
                                     _asyncio.create_task(tg_alert(f"⚠️ Canary rollback triggered after monitoring: win={mon_win:.2%} pf={mon_pf:.2f}"))
                                 except Exception:
                                     pass
+                        except Exception:
+                            pass
                 except Exception as exc:
                     log.warning(f"Canary monitor failed (non-fatal): {exc}")
 
