@@ -1,10 +1,5 @@
-// src/components/ui.tsx
-// Shared UI primitives used across all pages.
-
 import { clsx } from "clsx";
 import type { ReactNode } from "react";
-
-// ── Icons ────────────────────────────────────────────────────────────────────
 
 export const Icons = {
   TrendingUp: (props: any) => (
@@ -37,8 +32,6 @@ export const Icons = {
     </svg>
   ),
 };
-
-// ── StatCard ──────────────────────────────────────────────────────────────────
 
 interface StatCardProps {
   label:    string;
@@ -80,8 +73,6 @@ export function StatCard({ label, value, sub, accent = "default", animate, icon 
   );
 }
 
-// ── PnlChip ───────────────────────────────────────────────────────────────────
-
 export function PnlChip({ value }: { value: number | null }) {
   if (value == null) return <span className="text-white/30 font-mono text-sm">—</span>;
   const isUp = value > 0;
@@ -97,15 +88,11 @@ export function PnlChip({ value }: { value: number | null }) {
   );
 }
 
-// ── DirectionBadge ────────────────────────────────────────────────────────────
-
 export function DirectionBadge({ dir }: { dir: "LONG" | "SHORT" }) {
   return dir === "LONG"
     ? <span className="badge-up">LONG</span>
     : <span className="badge-down">SHORT</span>;
 }
-
-// ── ConvictionDots ────────────────────────────────────────────────────────────
 
 export function ConvictionDots({ score }: { score: number }) {
   return (
@@ -126,8 +113,6 @@ export function ConvictionDots({ score }: { score: number }) {
   );
 }
 
-// ── Spinner ───────────────────────────────────────────────────────────────────
-
 export function Spinner({ size = 20 }: { size?: number }) {
   return (
     <svg
@@ -141,8 +126,6 @@ export function Spinner({ size = 20 }: { size?: number }) {
   );
 }
 
-// ── EmptyState ────────────────────────────────────────────────────────────────
-
 export function EmptyState({ message }: { message: string }) {
   return (
     <div className="flex flex-col items-center justify-center py-16 text-white/20">
@@ -154,8 +137,6 @@ export function EmptyState({ message }: { message: string }) {
   );
 }
 
-// ── Section heading ───────────────────────────────────────────────────────────
-
 export function SectionHead({ title, sub }: { title: string; sub?: string }) {
   return (
     <div className="mb-6">
@@ -164,8 +145,6 @@ export function SectionHead({ title, sub }: { title: string; sub?: string }) {
     </div>
   );
 }
-
-// ── Live dot ──────────────────────────────────────────────────────────────────
 
 export function LiveDot({ connected }: { connected: boolean }) {
   return (
@@ -180,8 +159,6 @@ export function LiveDot({ connected }: { connected: boolean }) {
     </span>
   );
 }
-
-// ── Table ─────────────────────────────────────────────────────────────────────
 
 export function Table({ headers, children }: { headers: string[]; children: ReactNode }) {
   return (

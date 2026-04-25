@@ -19,16 +19,18 @@ export function Dashboard({ live }: Props) {
   const { data: history } = useQuery(() => api.pnlHistory(14), [], 60_000);
   const { data: trades }  = useQuery(() => api.trades(5),      [], 30_000);
 
-  const chartData = useMemo(() =>
-    (history?.history ?? [])
+  const chartData = useMemo(() => {
+    const raw = history?.history ?? [];
+    if (!raw.length) return [];
+    return raw
       .slice()
       .reverse()
       .map(d => ({
-        date:   format(new Date(d.date), "dd MMM"),
-        pnl:    +d.gross_pnl.toFixed(0),
-        wr:     +(d.win_rate * 100).toFixed(1),
-      })),
-  [history]);
+        date:   d.date ? format(new Date(d.date), "dd MMM") : "—",
+        pnl:    +(d.gross_pnl || 0).toFixed(0),
+        wr:     +((d.win_rate || 0) * 100).toFixed(1),
+      }));
+  }, [history]);
 
   const positions   = Object.values(live.positions);
   const perf        = live.perf;

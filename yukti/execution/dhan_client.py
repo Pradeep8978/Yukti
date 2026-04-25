@@ -87,6 +87,16 @@ class DhanClient:
         await _bucket.acquire()
         return await self._loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 
+    # ── Paper-mode safety guard ────────────────────────────────────────────────
+
+    def _assert_not_paper(self, operation: str) -> None:
+        """Raise if we're in paper mode — prevents accidental real orders."""
+        if settings.mode == "paper":
+            raise RuntimeError(
+                f"DhanClient.{operation}() blocked: agent is in PAPER mode. "
+                f"Real orders are disabled. Use PaperBrokerWrapper instead."
+            )
+
     # ── Orders ────────────────────────────────────────────────────────────────
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=5), reraise=True)
@@ -101,6 +111,7 @@ class DhanClient:
         trigger_price:    float = 0.0,
         tag:              str   = "yukti",
     ) -> dict[str, Any]:
+        self._assert_not_paper("place_order")
         result = await self._call(
             self._dhan.place_order,
             security_id      = security_id,
@@ -119,6 +130,7 @@ class DhanClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=5), reraise=True)
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
+        self._assert_not_paper("cancel_order")
         result = await self._call(self._dhan.cancel_order, order_id=order_id)
         log.info("cancel_order %s → %s", order_id, result)
         return result
@@ -139,6 +151,7 @@ class DhanClient:
         product_type:     str,
         price:            float = 0.0,
     ) -> dict[str, Any]:
+        self._assert_not_paper("place_gtt")
         result = await self._call(
             self._dhan.place_gtt_order,
             security_id      = security_id,
@@ -154,6 +167,7 @@ class DhanClient:
         return result
 
     async def cancel_gtt(self, gtt_id: str) -> dict[str, Any]:
+        self._assert_not_paper("cancel_gtt")
         return await self._call(self._dhan.cancel_gtt_order, order_id=gtt_id)
 
     # ── Positions ─────────────────────────────────────────────────────────────
@@ -231,6 +245,7 @@ class DhanClient:
         product_type:     str,
     ) -> dict[str, Any]:
         """Immediately exit a position at market price."""
+        self._assert_not_paper("market_exit")
         exit_side = "SELL" if direction == "LONG" else "BUY"
         return await self.place_order(
             security_id      = security_id,
