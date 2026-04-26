@@ -166,6 +166,11 @@ rag_quality_score_avg = Gauge(
     "Average journal reflection quality score for retrievals",
 )
 
+rag_retrieved_wins = Counter(
+    "yukti_rag_retrieved_wins_total",
+    "Number of retrieved journal entries that were winning trades",
+)
+
 
 # ── FastAPI endpoint helper ───────────────────────────────────────────────────
 

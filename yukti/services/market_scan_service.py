@@ -13,7 +13,7 @@ from typing import Dict
 import pandas as pd
 
 from yukti.agents.arjun import arjun
-from yukti.agents.memory import retrieve_similar_hybrid, format_retrieved_journals_for_context
+from yukti.agents.memory import retrieve_similar_trades, format_retrieved_journals_for_context
 from yukti.config import settings
 from yukti.data.state import (
     is_halted,
@@ -209,8 +209,8 @@ class MarketScanService:
                 market_regime = regime_map.get(macro.nifty_trend, "NEUTRAL")
                 
                 # Use hybrid retrieval with metadata filters
-                retrieved_journals = await retrieve_similar_hybrid(
-                    symbol, memory_setup, memory_dir, market_regime=market_regime
+                retrieved_journals = await retrieve_similar_trades(
+                    symbol, memory_setup, memory_dir, market_regime=market_regime, top_k=settings.rag_max_retrieved
                 )
                 past_journal = format_retrieved_journals_for_context(
                     retrieved_journals, 

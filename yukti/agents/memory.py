@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Optional
 
 import voyageai
+import json
 from sqlalchemy import text as sa_text
 
 from yukti.config import settings
@@ -29,6 +30,7 @@ from yukti.metrics import (
     rag_avg_similarity,
     rag_quality_score_avg,
 )
+from yukti.metrics import rag_retrieved_wins
 
 log = logging.getLogger(__name__)
 # Use central metrics exported from yukti.metrics for observability
@@ -540,6 +542,26 @@ async def retrieve_similar_hybrid(
             if any(r.quality_score for r in results):
                 avg_qual = sum(r.quality_score for r in results if r.quality_score) / len(results)
                 rag_quality_score_avg.set(avg_qual)
+            # Count retrieved wins and emit metric
+            wins = sum(1 for r in results if (r.outcome or '').upper() == 'WIN' or (r.pnl_pct or 0) > 0)
+            try:
+                rag_retrieved_wins.inc(wins)
+            except Exception:
+                pass
+            # Structured log for observability
+            try:
+                log.info(json.dumps({
+                    "event": "rag_retrieval",
+                    "symbol": symbol,
+                    "setup_type": setup_type,
+                    "retrieved_count": len(results),
+                    "avg_similarity": sum(r.similarity for r in results) / len(results),
+                    "avg_quality": avg_qual if any(r.quality_score for r in results) else None,
+                    "wins": wins,
+                    "top_match": results[0].trade_id if results else None,
+                }))
+            except Exception:
+                pass
         else:
             rag_retrieval_count.inc()
             
@@ -552,6 +574,44 @@ async def retrieve_similar_hybrid(
         except Exception:
             pass
         return []
+
+
+async def retrieve_similar_trades(
+    symbol: str,
+    setup_type: str,
+    direction: str,
+    market_regime: Optional[str] = None,
+    top_k: int = 4,
+) -> list[RetrievedJournal]:
+    """
+    Public wrapper for hybrid retrieval: returns top-k `RetrievedJournal` entries
+    with full metadata, metrics, and structured logs.
+    """
+    results = await retrieve_similar_hybrid(symbol, setup_type, direction, market_regime=market_regime, top_k=top_k)
+    # Ensure we only return up to top_k
+    if results and len(results) > top_k:
+        results = results[:top_k]
+
+    # Emit a retrieval count metric (already set inside hybrid, but be explicit)
+    try:
+        rag_retrieval_count.inc()
+    except Exception:
+        pass
+
+    # Additional structured logging
+    try:
+        log.info(json.dumps({
+            "event": "retrieve_similar_trades",
+            "symbol": symbol,
+            "setup_type": setup_type,
+            "direction": direction,
+            "returned": len(results),
+            "top_sim": results[0].similarity if results else None,
+        }))
+    except Exception:
+        pass
+
+    return results
 
 
 def format_retrieved_journals_for_context(
@@ -567,16 +627,16 @@ def format_retrieved_journals_for_context(
     lines = ["=== Past Similar Trades for Learning ==="]
 
     for i, j in enumerate(journals, 1):
-        setup_info = f"{j.symbol} {j.direction} {j.setup_type} | {j.outcome} ({j.pnl_pct:+.2f}%)"
+        setup_info = f"{j.symbol} {j.direction} {j.setup_type}"
         lesson = j.one_actionable_lesson or j.reason or "See full entry"
 
         lines.append(f"{i}. {setup_info}")
-        lines.append(f"   Similarity: {j.similarity:.2f} | {j.why_selected}")
-        lines.append(f"   Lesson: {lesson}")
-
         if j.setup_summary:
-            lines.append(f"   Setup: {j.setup_summary[:200]}")
-
+            lines.append(f"   - Setup       : {j.setup_summary[:200]}")
+        lines.append(f"   - Outcome     : {j.outcome} ({j.pnl_pct:+.2f}%)")
+        lines.append(f"   - Key lesson  : {lesson}")
+        lines.append(f"   - Similarity  : {j.similarity:.2f}")
+        lines.append(f"   - Why relevant: {j.why_selected}")
         lines.append("")
 
     if lines and lines[-1] == "":

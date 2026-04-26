@@ -32,6 +32,40 @@ mkdir -p "$OUTDIR"
 echo "Exporting journals to $DATA_OUT (since=$SINCE)"
 python3 scripts/export_training_data.py --out "$DATA_OUT" ${SINCE:+--since $SINCE}
 
+# Quick sanity check: count high-quality journals
+echo "Checking exported quality (min_journals=${MIN_JOURNALS}, min_quality=${MIN_QUALITY})"
+QUALITY_COUNT=$(env MIN_QUALITY="$MIN_QUALITY" python3 - <<'PY'
+import json,os
+min_q=float(os.environ.get('MIN_QUALITY', '6'))
+cnt=0
+path='data/training/journal_export.jsonl'
+try:
+  with open(path, 'r', encoding='utf-8') as fh:
+    for ln in fh:
+      try:
+        j=json.loads(ln)
+      except Exception:
+        continue
+      q=j.get('quality_score')
+      if q is None:
+        # support nested structures for legacy exports
+        q=j.get('structured_data', {}) and j.get('structured_data', {}).get('quality_score')
+      try:
+        if q is not None and float(q) >= min_q:
+          cnt+=1
+      except Exception:
+        continue
+except Exception:
+  pass
+print(cnt)
+PY
+)
+echo "High-quality journal rows: $QUALITY_COUNT"
+if [ "$QUALITY_COUNT" -lt "$MIN_JOURNALS" ]; then
+  echo "ERROR: Not enough high-quality journals for training (have=$QUALITY_COUNT, need=$MIN_JOURNALS). Aborting." >&2
+  exit 2
+fi
+
 # 2) Package code + trainer into tarball for upload
 PKG="$OUTDIR/yukti_trainer_package.tar.gz"
 rm -f "$PKG"
@@ -80,6 +114,14 @@ PY
 # Convert to GGUF for Ollama / local deployment using recommended converters.
 # Example: use the 'gguf' converter from the llama.cpp or guidance projects (install separately)
 # The exact tool depends on base model family — follow its converter README.
+
+# Example GGUF conversion steps (model-family specific):
+# 1) Ensure merged HF model is saved to models/merged (see merge step above)
+# 2) For LLaMA-family models, use llama.cpp converter:
+#    git clone https://github.com/ggerganov/llama.cpp && cd llama.cpp
+#    make
+#    python3 llama.cpp/python/convert.py --model_type llama --input_dir ../models/merged --output ../models/merged.gguf
+# 3) For other families, follow their recommended GGUF conversion toolchain.
 
 EOF
 

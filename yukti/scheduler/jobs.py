@@ -11,6 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 log = logging.getLogger(__name__)
 from yukti.config import settings
+from yukti.jobs.meta_lessons import generate_meta_lessons
 
 # ── NSE holidays (update annually from NSE circular) ─────────────────────────
 NSE_HOLIDAYS: set[date] = {
@@ -184,6 +185,15 @@ def build_scheduler() -> AsyncIOScheduler:
     # Self-learning loop: runs at 3am if enabled
     if getattr(settings, "enable_self_learning", True):
         sched.add_job(job_self_learning_loop, "cron", hour=3, minute=0)
+    # Meta-lessons: daily summary generation (config gated)
+    if getattr(settings, "enable_meta_lessons", False):
+        # Prefer explicit summary time, fallback to daily_journal + 5 minutes
+        tj = getattr(settings, "daily_journal_summary_time", None) or getattr(settings, "daily_journal", "16:00")
+        try:
+            hh, mm = [int(p) for p in str(tj).split(":")]
+        except Exception:
+            hh, mm = 16, 5
+        sched.add_job(generate_meta_lessons, "cron", hour=hh, minute=mm)
     return sched
 
 
