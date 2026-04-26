@@ -98,15 +98,29 @@ async def job_daily_reset() -> None:
 
     for t in rows:
         try:
-            text = await write_journal_entry(
+            # Get market bias from trade reasoning or default to NEUTRAL
+            market_bias = "NEUTRAL"
+            if t.reasoning:
+                if "BULLISH" in t.reasoning.upper():
+                    market_bias = "BULLISH"
+                elif "BEARISH" in t.reasoning.upper():
+                    market_bias = "BEARISH"
+            
+            text, structured = await write_journal_entry(
                 symbol=t.symbol, direction=t.direction, setup_type=t.setup_type,
                 entry=t.entry_price, stop_loss=t.stop_loss, target=t.target_1,
                 exit_price=t.exit_price or t.entry_price,
                 exit_reason=t.exit_reason or "", pnl_pct=t.pnl_pct or 0.0,
                 conviction=t.conviction, reasoning=t.reasoning,
+                market_bias=market_bias,
             )
-            await store_journal(t.id, t.symbol, t.setup_type, t.direction,
-                                t.pnl_pct or 0.0, text)
+            await store_journal(
+                t.id, t.symbol, t.setup_type, t.direction,
+                t.pnl_pct or 0.0, text, 
+                structured_data=structured,
+                market_bias=market_bias,
+                conviction=t.conviction,
+            )
         except Exception as exc:
             log.error("Journal failed trade %d: %s", t.id, exc)
 

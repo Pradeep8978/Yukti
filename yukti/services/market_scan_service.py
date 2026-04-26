@@ -13,7 +13,8 @@ from typing import Dict
 import pandas as pd
 
 from yukti.agents.arjun import arjun
-from yukti.agents.memory import retrieve_similar
+from yukti.agents.memory import retrieve_similar_hybrid, format_retrieved_journals_for_context
+from yukti.config import settings
 from yukti.data.state import (
     is_halted,
     get_performance_state,
@@ -200,10 +201,21 @@ class MarketScanService:
                 # ── Pattern detection (updated with multi-timeframe) ──
                 pattern = best_pattern(snap, candles=df, indicators_daily=snap_daily, current_time=current_time)
 
-                # ── Memory retrieval ──────────────────────────────────
+                # ── Memory retrieval (hybrid) ───────────────────────────
                 memory_setup = pattern.pattern_type if pattern else "unknown"
                 memory_dir   = "LONG" if macro.nifty_trend == "UP" else "SHORT" if macro.nifty_trend == "DOWN" else "LONG"
-                past_journal = await retrieve_similar(symbol, memory_setup, memory_dir)
+                # Map macro trend to market regime
+                regime_map = {"UP": "BULLISH", "DOWN": "BEARISH", "SIDEWAYS": "NEUTRAL"}
+                market_regime = regime_map.get(macro.nifty_trend, "NEUTRAL")
+                
+                # Use hybrid retrieval with metadata filters
+                retrieved_journals = await retrieve_similar_hybrid(
+                    symbol, memory_setup, memory_dir, market_regime=market_regime
+                )
+                past_journal = format_retrieved_journals_for_context(
+                    retrieved_journals, 
+                    include_meta_lessons=settings.rag_include_meta_lessons
+                )
                 symbol_headlines = filter_headlines_for_symbol(symbol, macro.headlines)
 
                 # ── Context (updated with daily + ORB/VWAP) ──────────

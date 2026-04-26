@@ -75,7 +75,10 @@ class Trade(Base):
 # ─────────────────────────────────────────────────────────────
 
 class JournalEntry(Base):
-    """Post-trade reflection written by Claude. Stored with vector embedding for memory retrieval."""
+    """Post-trade reflection written by Claude. Stored with vector embedding for memory retrieval.
+    
+    Enhanced schema includes structured fields for hybrid retrieval and quality scoring.
+    """
 
     __tablename__ = "journal_entries"
 
@@ -87,16 +90,22 @@ class JournalEntry(Base):
     pnl_pct:    Mapped[float] = mapped_column(Float)
     entry_text: Mapped[str]  = mapped_column(Text)
 
+    # Enhanced structured fields for hybrid retrieval
+    setup_summary:      Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    outcome:            Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # WIN | LOSS | BREAKEVEN
+    reason:             Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    quality_score:      Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 0-10 self-score
+    market_regime:      Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # BULLISH | BEARISH | NEUTRAL | VOLATILE
+    is_high_conviction: Mapped[bool] = mapped_column(default=False)  # conviction >= 8
+    
+    # Legacy/Refinement fields
+    key_lesson:         Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    outcome_reason:     Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    one_actionable_lesson: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    discarded:          Mapped[bool] = mapped_column(Boolean, default=False)
+
     # 1024-dim Voyage AI embedding
     embedding:  Mapped[Optional[list[float]]] = mapped_column(Vector(1024), nullable=True)
-
-    # New structured reflection fields (quality, lessons, metadata)
-    quality_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    key_lesson: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
-    market_regime: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    outcome_reason: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
-    one_actionable_lesson: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
-    discarded: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

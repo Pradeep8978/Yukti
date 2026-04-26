@@ -14,7 +14,7 @@ import asyncio
 import logging
 import math
 from datetime import datetime, timedelta
-from typing import Any, List
+from typing import Any, List, Optional
 
 import voyageai
 from sqlalchemy import text as sa_text
@@ -28,6 +28,46 @@ from yukti.metrics import (
 )
 
 log = logging.getLogger(__name__)
+
+# Prometheus metrics for RAG observability
+try:
+    from prometheus_client import Counter, Histogram
+    
+    RAG_RETRIEVALS_TOTAL = Counter(
+        "rag_retrievals_total",
+        "Total number of RAG retrieval attempts",
+        ["status"],  # success, failure, fallback
+    )
+    RAG_AVG_SIMILARITY = Histogram(
+        "rag_avg_similarity",
+        "Average similarity score of retrieved journals",
+        buckets=[0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0],
+    )
+    RAG_AVG_QUALITY = Histogram(
+        "rag_avg_quality_score",
+        "Average quality score of retrieved journals",
+        buckets=[0, 2, 4, 6, 8, 10],
+    )
+    RAG_RETRIEVAL_LATENCY = Histogram(
+        "rag_retrieval_latency_seconds",
+        "Time taken for RAG retrieval",
+        buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
+    )
+except ImportError:
+    # Prometheus not available — create no-op metrics
+    class _NoOpCounter:
+        def labels(self, **kwargs): return self
+        def inc(self, n=1): pass
+    
+    class _NoOpHistogram:
+        def labels(self, **kwargs): return self
+        def observe(self, n): pass
+    
+    RAG_RETRIEVALS_TOTAL = _NoOpCounter()
+    RAG_AVG_SIMILARITY = _NoOpHistogram()
+    RAG_AVG_QUALITY = _NoOpHistogram()
+    RAG_RETRIEVAL_LATENCY = _NoOpHistogram()
+
 
 _voyage_client: voyageai.Client | None = None
 
@@ -62,6 +102,7 @@ async def store_journal(
     direction: str,
     pnl_pct: float,
     journal: JournalReflection | str,
+    conviction: int = 5,
 ) -> None:
     """Embed a journal reflection and persist it to PostgreSQL with pgvector.
 
@@ -89,6 +130,9 @@ async def store_journal(
     if (refl.quality_score or 0) < min_q:
         discarded = True
 
+    # Determine outcome
+    outcome = "WIN" if pnl_pct > 0.5 else "LOSS" if pnl_pct < -0.5 else "BREAKEVEN"
+
     async with get_db() as db:
         db.add(JournalEntry(
             trade_id=trade_id,
@@ -103,6 +147,8 @@ async def store_journal(
             market_regime=refl.market_regime,
             outcome_reason=refl.outcome_reason,
             one_actionable_lesson=refl.one_actionable_lesson,
+            outcome=outcome,
+            is_high_conviction=(conviction >= 8),
             discarded=discarded,
         ))
 
@@ -163,7 +209,10 @@ async def retrieve_similar(
     fetch_n = max(cfg.max_retrieved_items * 6, cfg.max_fetch_candidates)
 
     sql = sa_text("""
-        SELECT id, trade_id, entry_text, pnl_pct, setup_type, direction, symbol, quality_score, key_lesson, outcome_reason, created_at,
+        SELECT id, trade_id, symbol, setup_type, direction, pnl_pct,
+               entry_text, setup_summary, outcome, reason, 
+               one_actionable_lesson, quality_score, market_regime,
+               is_high_conviction, created_at,
                1 - (embedding <=> :emb ::vector) AS similarity
         FROM   journal_entries
         WHERE  embedding IS NOT NULL AND (discarded IS NULL OR discarded = FALSE)
@@ -213,8 +262,8 @@ async def retrieve_similar(
             pnl_pct=float(getattr(row, "pnl_pct", 0.0) or 0.0),
             similarity=sim,
             quality_score=qscore,
-            key_lesson=getattr(row, "key_lesson", None),
-            outcome_reason=getattr(row, "outcome_reason", None),
+            key_lesson=getattr(row, "key_lesson", None) or getattr(row, "one_actionable_lesson", None),
+            outcome_reason=getattr(row, "outcome_reason", None) or getattr(row, "reason", None),
             created_at=getattr(row, "created_at", None),
             retrieval_reason=retrieval_reason,
         )
@@ -265,12 +314,9 @@ async def retrieve_similar(
     parts: List[str] = []
     for i, ctx in enumerate(selected):
         outcome = "WIN" if (ctx.pnl_pct or 0) > 0 else "LOSS"
-        first_sent = (ctx.key_lesson or "").strip()
-        if not first_sent:
-            first_sent = (ctx.outcome_reason or "")
         entry_summary = (ctx.key_lesson or ctx.outcome_reason or "").strip() or "(no summary)"
-
         why = ctx.retrieval_reason or ""
+        
         parts.append(
             f"{i+1}. {ctx.symbol} | {ctx.setup_type or 'unknown'} | {outcome} {ctx.pnl_pct:+.1f}% | sim={ctx.similarity:.2f}\n"
             f"   - Setup summary : {entry_summary}\n"

@@ -83,6 +83,20 @@ class Settings(BaseSettings):
     # Voyage AI (journal embeddings)
     voyage_api_key: str = ""
 
+    # ── RAG Self-Learning Configuration ───────────────
+    # Max journals to retrieve for context injection
+    rag_max_retrieved: int = Field(default=4, ge=1, le=10)
+    # Minimum quality score to include (filter out low-quality journals)
+    rag_min_quality_score: float = Field(default=6.0, ge=0, le=10)
+    # How far back to look for relevant journals (days)
+    rag_recency_days: int = Field(default=90, ge=7, le=365)
+    # Boost factor for winning trades in retrieval ranking (0-1)
+    rag_outcome_weight: float = Field(default=0.15, ge=0, le=0.5)
+    # Decay factor per week for recency (0-1)
+    rag_recent_decay: float = Field(default=0.02, ge=0, le=0.1)
+    # Enable meta-lessons summary in context injection
+    rag_include_meta_lessons: bool = Field(default=True)
+
     # ── Telegram ──────────────────────────────────────
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

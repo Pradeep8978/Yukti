@@ -31,12 +31,21 @@ async def write_journal_entry(
   pnl_pct:     float,
   conviction:  int,
   reasoning:   str,
+  market_bias: str = "NEUTRAL",
 ) -> JournalReflection:
   """
   Ask Claude to write a structured JSON reflection for a closed trade.
   Returns a `JournalReflection` Pydantic model. If LLM parsing fails,
   returns a best-effort reflection with `quality_score=0`.
   """
+
+  # Determine outcome classification for prompt injection
+  if pnl_pct > 0.5:
+      outcome = "WIN"
+  elif pnl_pct < -0.5:
+      outcome = "LOSS"
+  else:
+      outcome = "BREAKEVEN"
 
   prompt = f"""
 You are a concise trading journal assistant. A trade just closed — produce a JSON object ONLY.
@@ -53,13 +62,15 @@ Input fields:
   pnl_pct: {pnl_pct:+.2f}
   conviction: {conviction}
   reasoning: "{reasoning}"
+  market_bias: "{market_bias}"
+  outcome: "{outcome}"
 
 Produce JSON with the following keys:
 - entry_text: short human-readable 1-2 sentence summary (first-person).
 - quality_score: integer 0-10 (0 = useless, 10 = excellent insight).
 - key_lesson: one short sentence describing the single most important lesson.
 - setup_type: string (reuse or refine the input setup_type).
-- market_regime: one of [BULLISH, BEARISH, NEUTRAL, VOLATILE] if applicable, else null.
+- market_regime: one of [BULLISH, BEARISH, NEUTRAL, VOLATILE] based on market_bias.
 - outcome_reason: 1-2 sentence explanation why trade won/lost.
 - one_actionable_lesson: one concrete action to take next time.
 
@@ -74,7 +85,7 @@ Return ONLY valid JSON (no surrounding text, no markdown fences). Keep values sh
       None,
       lambda: client.messages.create(
         model=settings.claude_model,
-        max_tokens=400,
+        max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
       ),
     )
@@ -91,6 +102,8 @@ Return ONLY valid JSON (no surrounding text, no markdown fences). Keep values sh
       if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1] if len(parts) > 1 else raw
+        if raw.startswith("json"):
+            raw = raw[4:].strip()
       parsed = json.loads(raw)
     except Exception:
       parsed = None
@@ -103,7 +116,7 @@ Return ONLY valid JSON (no surrounding text, no markdown fences). Keep values sh
       quality_score=0,
       key_lesson="",
       setup_type=setup_type,
-      market_regime=None,
+      market_regime=market_bias,
       outcome_reason=str(exit_reason or ""),
       one_actionable_lesson="",
       created_at=datetime.utcnow(),
@@ -114,13 +127,13 @@ Return ONLY valid JSON (no surrounding text, no markdown fences). Keep values sh
   # Validate and convert to JournalReflection
   try:
     refl = JournalReflection(
-      entry_text=parsed.get("entry_text") or parsed.get("journal") or "",
+      entry_text=parsed.get("entry_text") or parsed.get("setup_summary") or parsed.get("journal") or "",
       quality_score=int(parsed.get("quality_score", 0)),
-      key_lesson=parsed.get("key_lesson") or parsed.get("lesson") or "",
+      key_lesson=parsed.get("key_lesson") or parsed.get("lesson") or parsed.get("one_actionable_lesson") or "",
       setup_type=parsed.get("setup_type") or setup_type,
-      market_regime=parsed.get("market_regime"),
-      outcome_reason=parsed.get("outcome_reason") or parsed.get("why"),
-      one_actionable_lesson=parsed.get("one_actionable_lesson") or parsed.get("actionable"),
+      market_regime=parsed.get("market_regime") or market_bias,
+      outcome_reason=parsed.get("outcome_reason") or parsed.get("reason") or parsed.get("why"),
+      one_actionable_lesson=parsed.get("one_actionable_lesson") or parsed.get("actionable") or "",
       created_at=datetime.utcnow(),
     )
   except Exception as exc:
@@ -130,7 +143,7 @@ Return ONLY valid JSON (no surrounding text, no markdown fences). Keep values sh
       quality_score=0,
       key_lesson="",
       setup_type=setup_type,
-      market_regime=None,
+      market_regime=market_bias,
       outcome_reason=str(exit_reason or ""),
       one_actionable_lesson="",
       created_at=datetime.utcnow(),
