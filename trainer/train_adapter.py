@@ -69,6 +69,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--dry_run", action="store_true", dest="dry_run", help="Tokenize and exit without training")
+    parser.add_argument("--min_journals", type=int, default=50, help="Minimum number of quality journals required to start training")
+    parser.add_argument("--min_quality", type=int, default=6, help="Minimum quality score to count a journal")
     parser.add_argument("--use_peft", choices=["auto", "on", "off"], default="auto")
     parser.add_argument("--max_input_length", type=int, default=1024)
     parser.add_argument("--max_target_length", type=int, default=256)
@@ -83,6 +85,29 @@ def main():
 
     LOG.info("Loading dataset from %s", args.data)
     ds = load_dataset("json", data_files={"train": args.data})
+    # Optional safety: ensure enough quality journals before training
+    if not args.dry_run and args.min_journals and args.min_journals > 0:
+        try:
+            # load as iterable to count quality scores if present
+            records = list(ds["train"])
+            kval_count = 0
+            for r in records:
+                q = None
+                if isinstance(r, dict):
+                    q = r.get("quality_score") or (r.get("target") or {}).get("quality_score")
+                try:
+                    if q is not None and float(q) >= float(args.min_quality):
+                        kval_count += 1
+                except Exception:
+                    continue
+
+            LOG.info("Dataset quality check: %d journals with quality >= %s", kval_count, args.min_quality)
+            if kval_count < args.min_journals:
+                LOG.error("Not enough high-quality journals for training: required=%d found=%d", args.min_journals, kval_count)
+                raise SystemExit(1)
+        except Exception:
+            LOG.exception("Failed to validate dataset quality; aborting to avoid accidental training on poor data")
+            raise
     if args.val_data:
         ds_val = load_dataset("json", data_files={"validation": args.val_data})
     else:

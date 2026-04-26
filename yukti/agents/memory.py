@@ -31,13 +31,7 @@ from yukti.metrics import (
 )
 
 log = logging.getLogger(__name__)
-
 # Use central metrics exported from yukti.metrics for observability
-from yukti.metrics import (
-    rag_retrieval_count,
-    rag_avg_similarity,
-    rag_quality_score_avg,
-)
 
 
 _voyage_client: voyageai.Client | None = None
@@ -199,7 +193,6 @@ async def retrieve_similar(
                 f"   - Lesson  : {lesson}\n"
                 f"   - Retrieved because: {why}"
             )
-
         header = "=== Past Similar Trades for Learning ==="
         return header + "\n\n" + "\n\n".join(parts)
 
@@ -316,10 +309,10 @@ async def retrieve_similar(
         why = ctx.retrieval_reason or ""
 
         parts.append(
-            f"{i+1}. {ctx.symbol} | {ctx.setup_type or 'unknown'} | {outcome} {ctx.pnl_pct:+.1f}% | sim={ctx.similarity:.2f}\\n"
-            f"   - Setup summary : {entry_summary}\\n"
-            f"   - What happened : {ctx.reason or 'See journal entry.'}\\n"
-            f"   - Key lesson    : {ctx.one_actionable_lesson or '—'}\\n"
+            f"{i+1}. {ctx.symbol} | {ctx.setup_type or 'unknown'} | {outcome} {ctx.pnl_pct:+.1f}% | sim={ctx.similarity:.2f}\n"
+            f"   - Setup summary : {entry_summary}\n"
+            f"   - What happened : {ctx.reason or 'See journal entry.'}\n"
+            f"   - Key lesson    : {ctx.one_actionable_lesson or '—'}\n"
             f"   - Retrieved because: {why}"
         )
 
@@ -343,10 +336,10 @@ async def retrieve_similar(
     except Exception:
         meta = ""
 
-    header = f"Past Similar Trades (top {len(selected)}):"
-    body = "\\n\\n".join(parts)
+    header = "=== Past Similar Trades for Learning ==="
+    body = "\n\n".join(parts)
     if meta:
-        body = body + "\\n\\n" + meta
+        body = body + "\n\n" + meta
 
     # Log concise retrieval info
     if selected:
@@ -357,7 +350,7 @@ async def retrieve_similar(
         )
         log.info("Retrieved %d past trades. Top match: %s", len(selected), top_match)
 
-    return header + "\\n\\n" + body
+    return header + "\n\n" + body
 
 
 # ─────────────────────────────────────────────────────────────
@@ -554,7 +547,10 @@ async def retrieve_similar_hybrid(
 
     except Exception as exc:
         log.warning("Hybrid retrieval DB query failed: %s", exc)
-        RAG_RETRIEVALS_TOTAL.labels(status="failure").inc()
+        try:
+            rag_retrieval_count.inc()
+        except Exception:
+            pass
         return []
 
 
@@ -573,17 +569,17 @@ def format_retrieved_journals_for_context(
     for i, j in enumerate(journals, 1):
         setup_info = f"{j.symbol} {j.direction} {j.setup_type} | {j.outcome} ({j.pnl_pct:+.2f}%)"
         lesson = j.one_actionable_lesson or j.reason or "See full entry"
-        
+
         lines.append(f"{i}. {setup_info}")
         lines.append(f"   Similarity: {j.similarity:.2f} | {j.why_selected}")
         lines.append(f"   Lesson: {lesson}")
-        
+
         if j.setup_summary:
-            lines.append(f"   Setup: {j.setup_summary[:100]}...")
-        
+            lines.append(f"   Setup: {j.setup_summary[:200]}")
+
         lines.append("")
 
-    if lines[-1] == "":
+    if lines and lines[-1] == "":
         lines.pop()
 
     if include_meta_lessons:
@@ -593,4 +589,4 @@ def format_retrieved_journals_for_context(
         lines.append("- Same-symbol trades: learn from both wins and losses")
         lines.append("- Quality journals (score >= 8) contain most actionable insights")
 
-    return "\\n".join(lines)
+    return "\n".join(lines)

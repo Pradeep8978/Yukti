@@ -752,7 +752,13 @@ class Arjun:
         if not context or len(context) <= max_chars:
             return context
 
-        markers = ["╔══ PAST SIMILAR SETUP", "Past Similar Trades", "PAST SIMILAR SETUP"]
+        markers = [
+            "=== Past Similar Trades for Learning ===",
+            "Past Similar Trades for Learning",
+            "Past Similar Trades",
+            "╔══ PAST SIMILAR SETUP",
+            "PAST SIMILAR SETUP",
+        ]
         idx = -1
         for m in markers:
             idx = context.find(m)

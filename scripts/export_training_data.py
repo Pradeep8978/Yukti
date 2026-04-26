@@ -107,6 +107,7 @@ async def export(out_path: str, since: datetime | None = None, limit: int | None
                     "prompt": (t.reasoning or "") + "\n\nPOST_JOURNAL:\n" + (j.entry_text or ""),
                     "decision": decision,
                     "target": target,
+                    "quality_score": float(j.quality_score) if j.quality_score is not None else None,
                     "reward": reward_val,
                     "created_at": j.created_at.isoformat() if j.created_at else None,
                 }
