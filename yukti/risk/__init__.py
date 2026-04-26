@@ -196,8 +196,10 @@ async def run_gates(
     if trade_decision.conviction < settings.min_conviction:
         return GateResult(False, f"conviction_too_low: {trade_decision.conviction} < {settings.min_conviction}")
 
-    # 4. Reward:Risk ratio >= minimum
-    if trade_decision.risk_reward and trade_decision.risk_reward < settings.min_rr:
+    # 4. Reward:Risk ratio >= minimum — require explicit R:R from the model
+    if trade_decision.risk_reward is None:
+        return GateResult(False, "rr_missing")
+    if trade_decision.risk_reward < settings.min_rr:
         return GateResult(False, f"rr_too_low: {trade_decision.risk_reward:.2f} < {settings.min_rr}")
 
     # 5. Cooldown period passed for the symbol

@@ -23,6 +23,22 @@ from yukti.data.state import (
     set_halt,
 )
 
+
+def _authorize_control(request: Request) -> None:
+    """Require a bearer token for sensitive control endpoints when configured.
+
+    If `settings.control_api_key` is empty, authorization is skipped (development mode).
+    """
+    key = getattr(settings, "control_api_key", "")
+    if not key:
+        return
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not isinstance(auth, str) or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    token = auth.split(" ", 1)[1]
+    if token != key:
+        raise HTTPException(status_code=403, detail="Invalid auth token")
+
 # ── Positions router ──────────────────────────────────────────────────────────
 
 positions_router = APIRouter(prefix="/positions", tags=["positions"])
@@ -159,20 +175,23 @@ async def agent_status() -> dict[str, Any]:
 
 
 @control_router.post("/halt")
-async def halt(req: HaltRequest) -> dict[str, Any]:
+async def halt(req: HaltRequest, request: Request) -> dict[str, Any]:
+    _authorize_control(request)
     await set_halt(True)
     return {"halted": True, "reason": req.reason}
 
 
 @control_router.post("/resume")
-async def resume() -> dict[str, Any]:
+async def resume(request: Request) -> dict[str, Any]:
+    _authorize_control(request)
     await set_halt(False)
     return {"halted": False}
 
 
 @control_router.post("/squareoff")
-async def squareoff_all() -> dict[str, Any]:
+async def squareoff_all(request: Request) -> dict[str, Any]:
     """Close all open positions at market. Also halts the agent."""
+    _authorize_control(request)
     await set_halt(True)
     positions = await get_all_positions()
     results: list[dict] = []

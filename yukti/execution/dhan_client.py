@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from functools import wraps
 from typing import Any, Callable
 
@@ -99,7 +100,6 @@ class DhanClient:
 
     # ── Orders ────────────────────────────────────────────────────────────────
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=5), reraise=True)
     async def place_order(
         self,
         security_id:      str,
@@ -110,23 +110,64 @@ class DhanClient:
         price:            float = 0.0,
         trigger_price:    float = 0.0,
         tag:              str   = "yukti",
+        idempotency_key:  str | None = None,
     ) -> dict[str, Any]:
+        """Place an order with lightweight idempotency checks across retries.
+
+        Strategy:
+        - Generate a stable `idempotency_key` for this high-level call if not provided.
+        - Include it in the `tag` field when calling DhanHQ.
+        - On transient failures, query recent orders for a matching tag and return it if found.
+        """
         self._assert_not_paper("place_order")
-        result = await self._call(
-            self._dhan.place_order,
-            security_id      = security_id,
-            exchange_segment = self._dhan.NSE,
-            transaction_type = transaction_type,
-            quantity         = quantity,
-            order_type       = order_type,
-            product_type     = product_type,
-            price            = price,
-            trigger_price    = trigger_price,
-            validity         = "DAY",
-            tag              = tag,
-        )
-        log.info("place_order %s %s qty=%d → %s", transaction_type, security_id, quantity, result)
-        return result
+
+        if idempotency_key is None:
+            idempotency_key = uuid.uuid4().hex
+
+        tag_value = f"{tag}|id={idempotency_key}" if tag else f"id={idempotency_key}"
+
+        attempts = 3
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                result = await self._call(
+                    self._dhan.place_order,
+                    security_id      = security_id,
+                    exchange_segment = self._dhan.NSE,
+                    transaction_type = transaction_type,
+                    quantity         = quantity,
+                    order_type       = order_type,
+                    product_type     = product_type,
+                    price            = price,
+                    trigger_price    = trigger_price,
+                    validity         = "DAY",
+                    tag              = tag_value,
+                )
+                log.info("place_order %s %s qty=%d → %s", transaction_type, security_id, quantity, result)
+                return result
+            except Exception as exc:
+                last_exc = exc
+                log.warning("place_order attempt %d failed: %s", attempt, exc)
+                # Check for previously placed order that matches our idempotency key
+                try:
+                    orders = await self.get_order_list()
+                    for o in orders:
+                        o_tag = None
+                        if isinstance(o, dict):
+                            o_tag = o.get("tag") or (o.get("data") and o.get("data").get("tag"))
+                        if o_tag and f"id={idempotency_key}" in str(o_tag):
+                            log.info("Found existing order for idempotency key %s: %s", idempotency_key, o)
+                            return o
+                except Exception:
+                    log.debug("Idempotency check via get_order_list() failed; will retry")
+
+                if attempt < attempts:
+                    await asyncio.sleep(min(5, 2 ** (attempt - 1)))
+
+        # All attempts exhausted — surface last exception
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("place_order failed without exception")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=5), reraise=True)
     async def cancel_order(self, order_id: str) -> dict[str, Any]:

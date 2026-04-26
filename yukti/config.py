@@ -133,6 +133,9 @@ class Settings(BaseSettings):
 
     # ── API settings ───────────────────────────────────
     cors_allow_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
+    # API control key required to invoke sensitive control endpoints (/control/*, WS halt/resume).
+    # In development this can be empty; set to a secret value in production.
+    control_api_key: str = ""
 
     # ── Universe scanner ─────────────────────────────
     scanner_pick_count: int = Field(default=15, ge=5, le=50)

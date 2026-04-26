@@ -157,6 +157,18 @@ def create_app() -> FastAPI:
         Messages are JSON with type "state_update".
         Flutter can also send {"type": "halt"} to trigger kill switch.
         """
+        # Optional authentication for control messages. If `control_api_key` is set,
+        # require a Bearer token in the WebSocket request headers.
+        auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
+        if getattr(settings, "control_api_key", ""):
+            if not auth_header or not isinstance(auth_header, str) or not auth_header.lower().startswith("bearer "):
+                await websocket.close(code=1008)
+                return
+            token = auth_header.split(" ", 1)[1]
+            if token != settings.control_api_key:
+                await websocket.close(code=1008)
+                return
+
         await manager.connect(websocket)
         try:
             while True:

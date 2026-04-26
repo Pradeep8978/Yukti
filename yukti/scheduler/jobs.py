@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 log = logging.getLogger(__name__)
 from yukti.config import settings
 from yukti.jobs.meta_lessons import generate_meta_lessons
+
+# Timezone for NSE (India Standard Time)
+KOLKATA = ZoneInfo("Asia/Kolkata")
 
 # ── NSE holidays (update annually from NSE circular) ─────────────────────────
 NSE_HOLIDAYS: set[date] = {
@@ -25,17 +29,29 @@ NSE_HOLIDAYS: set[date] = {
 
 
 def is_trading_day(d: date | None = None) -> bool:
-    d = d or date.today()
+    # Evaluate trading day in Asia/Kolkata timezone to avoid host-UTC mismatches
+    if d is None:
+        d = datetime.now(KOLKATA).date()
     return d.weekday() < 5 and d not in NSE_HOLIDAYS
 
 
 def is_trading_hours(now: datetime | None = None) -> bool:
-    t = (now or datetime.now()).time()
+    # Compare times in Asia/Kolkata timezone
+    if now is None:
+        now = datetime.now(KOLKATA)
+    else:
+        # If naive datetime provided, treat it as UTC and convert to IST
+        if now.tzinfo is None:
+            now = datetime.fromtimestamp(now.timestamp(), tz=KOLKATA)
+        else:
+            now = now.astimezone(KOLKATA)
+    t = now.time()
     return time(9, 15) <= t <= time(15, 10)
 
 
 def is_fo_expiry(d: date | None = None) -> bool:
-    d = d or date.today()
+    if d is None:
+        d = datetime.now(KOLKATA).date()
     if d.weekday() != 3:
         return False
     return (d + timedelta(days=7)).month != d.month
