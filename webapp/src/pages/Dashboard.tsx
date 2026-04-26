@@ -10,7 +10,7 @@ import { useQuery } from "../hooks/useQuery";
 import type { LiveState } from "../hooks/useLive";
 import {
   StatCard, PnlChip, DirectionBadge, ConvictionDots,
-  Spinner, EmptyState, SectionHead, Table, Td,
+  Spinner, EmptyState, SectionHead, Table, Td, Icons,
 } from "../components/ui";
 
 interface Props { live: LiveState }
@@ -19,16 +19,18 @@ export function Dashboard({ live }: Props) {
   const { data: history } = useQuery(() => api.pnlHistory(14), [], 60_000);
   const { data: trades }  = useQuery(() => api.trades(5),      [], 30_000);
 
-  const chartData = useMemo(() =>
-    (history?.history ?? [])
+  const chartData = useMemo(() => {
+    const raw = history?.history ?? [];
+    if (!raw.length) return [];
+    return raw
       .slice()
       .reverse()
       .map(d => ({
-        date:   format(new Date(d.date), "dd MMM"),
-        pnl:    +d.gross_pnl.toFixed(0),
-        wr:     +(d.win_rate * 100).toFixed(1),
-      })),
-  [history]);
+        date:   d.date ? format(new Date(d.date), "dd MMM") : "—",
+        pnl:    +(d.gross_pnl || 0).toFixed(0),
+        wr:     +((d.win_rate || 0) * 100).toFixed(1),
+      }));
+  }, [history]);
 
   const positions   = Object.values(live.positions);
   const perf        = live.perf;
@@ -54,6 +56,7 @@ export function Dashboard({ live }: Props) {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard
           label="today P&L"
+          icon={<Icons.TrendingUp className="w-4 h-4" />}
           value={<PnlChip value={totalPnl} />}
           sub={`${perf?.trades_today ?? 0} trades`}
           accent={pnlAccent}
@@ -61,6 +64,7 @@ export function Dashboard({ live }: Props) {
         />
         <StatCard
           label="win rate (L10)"
+          icon={<Icons.Activity className="w-4 h-4" />}
           value={`${((perf?.win_rate_last_10 ?? 0.5) * 100).toFixed(0)}%`}
           sub="last 10 trades"
           accent={(perf?.win_rate_last_10 ?? 0.5) >= 0.5 ? "up" : "down"}
@@ -68,12 +72,14 @@ export function Dashboard({ live }: Props) {
         />
         <StatCard
           label="open positions"
+          icon={<Icons.Shield className="w-4 h-4" />}
           value={positions.length}
           sub={`of 5 max`}
           animate
         />
         <StatCard
           label="loss streak"
+          icon={<Icons.AlertTriangle className="w-4 h-4" />}
           value={perf?.consecutive_losses ?? 0}
           sub={
             (perf?.consecutive_losses ?? 0) >= 3

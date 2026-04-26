@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 // src/hooks/useLive.ts
 // WebSocket connection to FastAPI /ws/live — pushes state every 5 seconds.
 

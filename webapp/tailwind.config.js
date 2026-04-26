@@ -6,9 +6,9 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        sans:  ["'DM Sans'",     "sans-serif"],
-        mono:  ["'DM Mono'",     "monospace"],
-        display: ["'Syne'",      "sans-serif"],
+        sans:    ["'Plus Jakarta Sans'", "sans-serif"],
+        mono:    ["'Fira Code'",          "monospace"],
+        display: ["'Space Grotesk'",     "sans-serif"],
       },
       colors: {
         brand: {

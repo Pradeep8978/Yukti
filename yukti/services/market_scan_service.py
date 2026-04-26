@@ -102,9 +102,13 @@ class MarketScanService:
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             start = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-            nifty_raw = await dhan.get_candles("13", 5, start, today)
+            nifty_raw = await dhan.get_candles("13", 5, start, today, symbol="NIFTY")
             if nifty_raw and len(nifty_raw) >= 20:
-                nifty_df = pd.DataFrame(nifty_raw, columns=["time", "open", "high", "low", "close", "volume"]).astype({"close": float})
+                nifty_df = pd.DataFrame(nifty_raw, columns=["time", "open", "high", "low", "close", "volume"])
+                nifty_df["time"] = pd.to_datetime(nifty_df["time"])
+                nifty_df.set_index("time", inplace=True)
+                nifty_df.sort_index(inplace=True)
+                nifty_df = nifty_df.astype({"close": float})
                 nifty_chg = float((nifty_df["close"].iloc[-1] - nifty_df["close"].iloc[-2]) / nifty_df["close"].iloc[-2] * 100)
                 nifty_trend = "UP" if nifty_df["close"].iloc[-1] > nifty_df["close"].iloc[-10] else "DOWN"
                 # Cache Nifty change for circuit-breaker gate
@@ -137,13 +141,17 @@ class MarketScanService:
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             start = (datetime.now() - timedelta(days=settings.daily_candle_history + 10)).strftime("%Y-%m-%d")
-            raw = await dhan.get_candles(security_id, "1", start, today)
+            raw = await dhan.get_candles(security_id, "1", start, today, symbol=symbol)
             if not raw or len(raw) < 20:
                 return None
 
             df = pd.DataFrame(
                 raw, columns=["time", "open", "high", "low", "close", "volume"]
-            ).astype({c: float for c in ["open", "high", "low", "close", "volume"]})
+            )
+            df["time"] = pd.to_datetime(df["time"])
+            df.set_index("time", inplace=True)
+            df.sort_index(inplace=True)
+            df = df.astype({c: float for c in ["open", "high", "low", "close", "volume"]})
 
             # Cache with session TTL
             await r.set(cache_key, json.dumps(df.to_dict("records")), ex=settings.daily_cache_ttl)
@@ -162,11 +170,15 @@ class MarketScanService:
                 # ── 5-min candles (existing) ──────────────────────────
                 today = datetime.now().strftime("%Y-%m-%d")
                 start = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-                raw = await dhan.get_candles(security_id, 5, start, today)
+                raw = await dhan.get_candles(security_id, 5, start, today, symbol=symbol)
                 if not raw or len(raw) < 60:
                     return
 
-                df = pd.DataFrame(raw, columns=["time","open","high","low","close","volume"]).astype({c: float for c in ["open","high","low","close","volume"]})
+                df = pd.DataFrame(raw, columns=["time","open","high","low","close","volume"])
+                df["time"] = pd.to_datetime(df["time"])
+                df.set_index("time", inplace=True)
+                df.sort_index(inplace=True)
+                df = df.astype({c: float for c in ["open","high","low","close","volume"]})
                 snap = compute(df, timeframe="5m")
 
                 # ── Daily candles (new — multi-timeframe) ─────────────

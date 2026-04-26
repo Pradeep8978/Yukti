@@ -5,6 +5,8 @@ import {
   DirectionBadge, ConvictionDots, EmptyState,
   SectionHead, Table, Td, PnlChip, Spinner
 } from "../components/ui";
+import { useState } from "react";
+import { clsx } from "clsx";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // src/pages/Trades.tsx
@@ -197,10 +199,6 @@ export function Journal() {
 // ─────────────────────────────────────────────────────────────────────────────
 // src/pages/Control.tsx
 // ─────────────────────────────────────────────────────────────────────────────
-import { useState } from "react";
-import { clsx } from "clsx";
-import type { LiveState } from "../hooks/useLive";
-
 export function Control({ live }: { live: LiveState }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [msg,  setMsg]  = useState<string | null>(null);

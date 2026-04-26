@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     # ── Broker ────────────────────────────────────────
     dhan_client_id: str = ""
     dhan_access_token: str = ""
+    dhan_base_url: str = "https://api.dhan.co/v2"
+    
+    dhan_use_sandbox: bool = False
+    dhan_sandbox_client_id: str = ""
+    dhan_sandbox_access_token: str = ""
+    dhan_sandbox_base_url: str = "https://sandbox.dhan.co/v2"
+
+    watchlist: list[str] = Field(default_factory=list)
 
     # ── AI provider ───────────────────────────────────
     # "claude"  → Anthropic Claude Sonnet 4.6  ($3/$15 per MTok)
