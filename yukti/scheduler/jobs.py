@@ -187,13 +187,25 @@ def build_scheduler() -> AsyncIOScheduler:
         sched.add_job(job_self_learning_loop, "cron", hour=3, minute=0)
     # Meta-lessons: daily summary generation (config gated)
     if getattr(settings, "enable_meta_lessons", False):
-        # Prefer explicit summary time, fallback to daily_journal + 5 minutes
+        # Schedule meta-lessons to run daily at end-of-day (default: daily_journal + 5m)
+        # Allow explicit override via `daily_journal_summary_time` (HH:MM)
         tj = getattr(settings, "daily_journal_summary_time", None) or getattr(settings, "daily_journal", "16:00")
         try:
             hh, mm = [int(p) for p in str(tj).split(":")]
         except Exception:
             hh, mm = 16, 5
-        sched.add_job(generate_meta_lessons, "cron", hour=hh, minute=mm)
+
+        async def job_generate_meta_lessons_wrapper() -> None:
+            # Run only on trading days — avoid executing on holidays/weekends
+            try:
+                if not is_trading_day():
+                    log.info("Meta-lessons job skipped: non-trading day")
+                    return
+                await generate_meta_lessons()
+            except Exception as exc:
+                log.error("Meta-lessons job failed: %s", exc)
+
+        sched.add_job(job_generate_meta_lessons_wrapper, "cron", hour=hh, minute=mm)
     return sched
 
 

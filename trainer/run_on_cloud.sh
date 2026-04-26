@@ -14,6 +14,7 @@ MODEL="facebook/opt-125m"
 MIN_JOURNALS=50
 MIN_QUALITY=6
 DRY_RUN=0
+POSTGRES_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -21,6 +22,7 @@ while [[ $# -gt 0 ]]; do
     --model) MODEL="$2"; shift 2;;
     --min-journals) MIN_JOURNALS="$2"; shift 2;;
     --min-quality) MIN_QUALITY="$2"; shift 2;;
+    --postgres-url) POSTGRES_URL="$2"; shift 2;;
     --dry_run) DRY_RUN=1; shift 1;;
     *) echo "Unknown arg $1"; exit 1;;
   esac
@@ -30,7 +32,12 @@ mkdir -p "$OUTDIR"
 
 # 1) Export latest journals from Postgres into JSONL
 echo "Exporting journals to $DATA_OUT (since=$SINCE)"
-python3 scripts/export_training_data.py --out "$DATA_OUT" ${SINCE:+--since $SINCE}
+if [ -n "$POSTGRES_URL" ]; then
+  echo "Using external Postgres at POSTGRES_URL (supplied)"
+  env POSTGRES_URL="$POSTGRES_URL" python3 scripts/export_training_data.py --out "$DATA_OUT" ${SINCE:+--since $SINCE}
+else
+  python3 scripts/export_training_data.py --out "$DATA_OUT" ${SINCE:+--since $SINCE}
+fi
 
 # Quick sanity check: count high-quality journals
 echo "Checking exported quality (min_journals=${MIN_JOURNALS}, min_quality=${MIN_QUALITY})"
@@ -89,9 +96,11 @@ python3 -m pip install -r trainer/requirements.txt
 # python3 -m venv venv; . venv/bin/activate
 
 # Preprocess dataset (tokenize optional)
+# If your Postgres is external, set POSTGRES_URL on the node before running the exporter:
+#  export POSTGRES_URL="postgresql+psycopg://user:pass@host:5432/dbname"
 python3 trainer/preprocess.py --input data/training/journal_export.jsonl --out_dir data/training/processed --val_frac 0.05 --test_frac 0.05 --dry_run
 
-# If dry_run summary is OK, run full preprocess
+# If dry_run summary is OK, run full preprocess (on-node exporter will use POSTGRES_URL if set)
 python3 trainer/preprocess.py --input data/training/journal_export.jsonl --out_dir data/training/processed --val_frac 0.05 --test_frac 0.05
 
 # Run training (example: QLoRA on 7B-like using bitsandbytes + PEFT)
@@ -139,25 +148,23 @@ cat <<COST
 Estimated example costs (April 2026) and quickstarts:
 
 Vast.ai (spot style):
-- Typical GPU: A100-40GB or 80GB (spot); price range: ~₹500–₹1,400/hr depending on spot availability and region.
-- Quickstart:
   1) Create an account on Vast.ai and search for an "A100 40GB" instance with Ubuntu 22.04.
   2) Choose a 1–2 hour lease to control cost, set SSH key, and deploy.
   3) Upload `yukti_trainer_package.tar.gz` via `scp` or `curl` from object storage.
   4) Run the commands printed by this script (install deps, preprocess, train).
 
 RunPod (on-demand):
-- Typical GPU: A100 / 4090; price range: ~₹700–₹1,800/hr on-demand.
-- Quickstart:
   1) Create a RunPod account and spin up a pod with Ubuntu and the desired GPU (choose 4GB+ VRAM based on model).
   2) Use `scp` or upload the tarball to the pod. Run the same commands below.
 
 E2E Networks (or similar providers):
-- Price range and offerings vary; check spot/discounted options. Use 1-hour runs to cap cost.
 
 Practical per-run budget guidance (aim: ≤ ₹1,000):
-- To reliably stay under ₹1,000 per run, prefer smaller base models (e.g., `facebook/opt-125m`, `opt-350m`, or `Llama2-7B` with small-adapter approaches) or run very short jobs (30–60 minutes) on larger GPUs.
-- QLoRA on 7B/13B on an A100 will often exceed ₹1,000 if run >1 hour. Use those only when you have many (>500) high-quality examples or for infrequent monthly runs.
+
+Quick safety notes:
+- Avoid embedding secrets in the package. Set `POSTGRES_URL` as an environment variable on the GPU node instead of adding to the tarball.
+- Run with `--dry_run` locally to validate preprocessing and counts before committing to a long/cloud run.
+
 
 Cost-optimized plan examples:
 - Low-cost fine-tune (recommended): `opt-125m` or `opt-350m` on a cheap 1-2 hour slot — expected ≈ ₹150–₹600.

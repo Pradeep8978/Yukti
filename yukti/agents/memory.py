@@ -38,6 +38,8 @@ log = logging.getLogger(__name__)
 
 _voyage_client: voyageai.Client | None = None
 
+from pathlib import Path
+
 
 def _voyage() -> voyageai.Client:
     global _voyage_client
@@ -637,30 +639,42 @@ def format_retrieved_journals_for_context(
     """
     if not journals:
         return ""
-
     lines = ["=== Past Similar Trades for Learning ==="]
 
     for i, j in enumerate(journals, 1):
-        setup_info = f"{j.symbol} {j.direction} {j.setup_type}"
-        lesson = j.one_actionable_lesson or j.reason or "See full entry"
+        setup_info = f"{j.symbol} {j.direction} {j.setup_type or 'unknown'}"
+        lesson = (j.one_actionable_lesson or j.reason or "—").strip()
 
-        lines.append(f"{i}. {setup_info}")
-        if j.setup_summary:
-            lines.append(f"   - Setup       : {j.setup_summary[:200]}")
-        lines.append(f"   - Outcome     : {j.outcome} ({j.pnl_pct:+.2f}%)")
-        lines.append(f"   - Key lesson  : {lesson}")
-        lines.append(f"   - Similarity  : {j.similarity:.2f}")
-        lines.append(f"   - Why relevant: {j.why_selected}")
+        lines.append(f"{i}. Setup: {setup_info}")
+        lines.append(f"   Outcome: {j.outcome} ({j.pnl_pct:+.2f}%)")
+        lines.append(f"   Key Lesson: {lesson}")
+        lines.append(f"   Similarity Score: {j.similarity:.2f}")
+        lines.append(f"   Why Relevant: {j.why_selected or 'See retrieval reason.'}")
         lines.append("")
 
+    # Remove trailing blank
     if lines and lines[-1] == "":
         lines.pop()
 
+    # Include meta-lessons cache if requested (reads data/meta_lessons.json produced by the daily job)
     if include_meta_lessons:
-        lines.append("")
-        lines.append("=== Meta Lessons Learned So Far ===")
-        lines.append("- Prioritize high-conviction setups (8+) in trending markets")
-        lines.append("- Same-symbol trades: learn from both wins and losses")
-        lines.append("- Quality journals (score >= 8) contain most actionable insights")
+        try:
+            meta_path = Path("data") / "meta_lessons.json"
+            if meta_path.exists():
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                lessons = payload.get("lessons", [])
+                if lessons:
+                    lines.append("")
+                    lines.append("=== Meta Lessons Learned So Far ===")
+                    for item in lessons:
+                        lines.append(f"- {item.get('lesson')} ({item.get('count')})")
+        except Exception:
+            # Best-effort fallback static hints
+            lines.append("")
+            lines.append("=== Meta Lessons Learned So Far ===")
+            lines.append("- Prioritize high-conviction setups (8+) in trending markets")
+            lines.append("- Same-symbol trades: learn from both wins and losses")
+            lines.append("- Quality journals (score >= 8) contain most actionable insights")
 
     return "\n".join(lines)
