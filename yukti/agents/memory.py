@@ -488,7 +488,14 @@ async def retrieve_similar_hybrid(
 
                 final_score = base_sim * outcome_mul * symbol_bonus * regime_bonus * decay * quality_mul
 
-                candidates.append((final_score, base_sim, row))
+                # store candidate with metadata for richer explanation and MMR
+                candidates.append((final_score, base_sim, row, {
+                    "outcome_mul": outcome_mul,
+                    "decay": decay,
+                    "quality_mul": quality_mul,
+                    "symbol_bonus": symbol_bonus,
+                    "regime_bonus": regime_bonus,
+                }))
             except Exception:
                 continue
 
@@ -502,54 +509,142 @@ async def retrieve_similar_hybrid(
         # sort by final_score desc
         candidates.sort(key=lambda t: t[0], reverse=True)
 
-        # Diversity selection: prefer mix of outcomes and at least one win when available
-        selected: list[RetrievedJournal] = []
-        outcome_counts = {"WIN": 0, "LOSS": 0, "BREAKEVEN": 0}
-        max_same_outcome = min(2, max_retrieved)
+        # Advanced diversity selection using MMR (maximal marginal relevance) if embeddings available
+        lambda_div = getattr(settings, "rag_diversity_lambda", 0.7)
 
-        # First pass: try to include top winners if available
-        wins_available = [c for c in candidates if (getattr(c[2], "pnl_pct", 0) or 0) > 0]
+        # Prepare candidate texts for embedding (short summary + lesson + reason)
+        candidate_rows = [c[2] for c in candidates]
+        candidate_scores = [c[0] for c in candidates]
+        candidate_base_sims = [c[1] for c in candidates]
+        candidate_meta = [c[3] for c in candidates]
 
-        for score, base_sim, row in candidates:
-            if len(selected) >= max_retrieved:
-                break
+        candidate_texts = []
+        for row in candidate_rows:
+            parts = []
+            if getattr(row, "setup_summary", None):
+                parts.append(str(getattr(row, "setup_summary")))
+            if getattr(row, "one_actionable_lesson", None):
+                parts.append(str(getattr(row, "one_actionable_lesson")))
+            if getattr(row, "reason", None):
+                parts.append(str(getattr(row, "reason")))
+            if not parts:
+                parts.append(str(getattr(row, "entry_text", ""))[:400])
+            candidate_texts.append(" \n ".join(parts)[:1500])
 
-            outcome = (getattr(row, "outcome", None) or ("WIN" if (getattr(row, "pnl_pct", 0) or 0) > 0 else "LOSS"))
+        emboks = None
+        try:
+            if candidate_texts:
+                emboks = await _embed(candidate_texts, input_type="document")
+        except Exception:
+            emboks = None
 
-            # enforce diversity cap
-            if outcome_counts.get(outcome, 0) >= max_same_outcome:
-                # allow if very high quality or high conviction
-                if not (getattr(row, "is_high_conviction", False) or (getattr(row, "quality_score", 0) or 0) >= 8):
-                    continue
+        def cos_sim(a, b):
+            try:
+                da = math.sqrt(sum(x * x for x in a))
+                db = math.sqrt(sum(x * x for x in b))
+                if da == 0 or db == 0:
+                    return 0.0
+                return sum(x * y for x, y in zip(a, b)) / (da * db)
+            except Exception:
+                return 0.0
 
-            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        selected_indices: list[int] = []
 
-            # build RetrievedJournal
-            r = RetrievedJournal(
-                trade_id = getattr(row, "trade_id", None),
-                symbol = getattr(row, "symbol", None),
-                setup_type = getattr(row, "setup_type", None),
-                direction = getattr(row, "direction", None),
-                pnl_pct = float(getattr(row, "pnl_pct", 0.0) or 0.0),
-                entry_text = getattr(row, "entry_text", "") or "",
-                setup_summary = getattr(row, "setup_summary", None),
-                outcome = outcome,
-                reason = getattr(row, "reason", None),
-                one_actionable_lesson = getattr(row, "one_actionable_lesson", None) or getattr(row, "key_lesson", None),
-                quality_score = getattr(row, "quality_score", None),
-                market_regime = getattr(row, "market_regime", None),
-                is_high_conviction = bool(getattr(row, "is_high_conviction", False)),
-                similarity = float(base_sim),
-                created_at = getattr(row, "created_at", now) or now,
-                why_selected = (
-                    f"final_score={score:.3f}, base_sim={base_sim:.2f}, outcome_mul={('+' if (getattr(row,'pnl_pct',0) or 0)>0 else '-')}{outcome_weight}, "
-                    f"decay={decay:.3f}, quality={getattr(row,'quality_score',0)}"
-                ),
-            )
-            selected.append(r)
+        if emboks is not None and len(emboks) == len(candidate_rows):
+            # Normalize relevance to [0,1]
+            max_score = max(candidate_scores) if candidate_scores else 1.0
+            rel = [s / max_score if max_score > 0 else 0.0 for s in candidate_scores]
 
-        # Trim to requested max_retrieved
-        selected = selected[:max_retrieved]
+            # MMR selection
+            remaining = set(range(len(candidate_rows)))
+            # pick highest relevance first
+            first = max(remaining, key=lambda i: rel[i])
+            selected_indices.append(first)
+            remaining.remove(first)
+
+            while len(selected_indices) < max_retrieved and remaining:
+                best_i = None
+                best_score = None
+                for i in list(remaining):
+                    diversity_penalty = 0.0
+                    if selected_indices:
+                        diversity_penalty = max(cos_sim(emboks[i], emboks[j]) for j in selected_indices)
+                    mmr_score = lambda_div * rel[i] - (1 - lambda_div) * diversity_penalty
+                    if best_score is None or mmr_score > best_score:
+                        best_score = mmr_score
+                        best_i = i
+                if best_i is None:
+                    break
+                selected_indices.append(best_i)
+                remaining.remove(best_i)
+
+            # Build selected list from indices
+            selected = []
+            outcome_counts = {"WIN": 0, "LOSS": 0, "BREAKEVEN": 0}
+            for idx in selected_indices[:max_retrieved]:
+                row = candidate_rows[idx]
+                base_sim = candidate_base_sims[idx]
+                score = candidate_scores[idx]
+                meta = candidate_meta[idx]
+                outcome = (getattr(row, "outcome", None) or ("WIN" if (getattr(row, "pnl_pct", 0) or 0) > 0 else "LOSS"))
+                r = RetrievedJournal(
+                    trade_id = getattr(row, "trade_id", None),
+                    symbol = getattr(row, "symbol", None),
+                    setup_type = getattr(row, "setup_type", None),
+                    direction = getattr(row, "direction", None),
+                    pnl_pct = float(getattr(row, "pnl_pct", 0.0) or 0.0),
+                    entry_text = getattr(row, "entry_text", "") or "",
+                    setup_summary = getattr(row, "setup_summary", None),
+                    outcome = outcome,
+                    reason = getattr(row, "reason", None),
+                    one_actionable_lesson = getattr(row, "one_actionable_lesson", None) or getattr(row, "key_lesson", None),
+                    quality_score = getattr(row, "quality_score", None),
+                    market_regime = getattr(row, "market_regime", None),
+                    is_high_conviction = bool(getattr(row, "is_high_conviction", False)),
+                    similarity = float(base_sim),
+                    created_at = getattr(row, "created_at", now) or now,
+                    why_selected = (
+                        f"final_score={score:.3f}, base_sim={base_sim:.2f}, outcome_mul={meta.get('outcome_mul'):.2f}, "
+                        f"decay={meta.get('decay'):.3f}, quality_mul={meta.get('quality_mul'):.2f}, diversity_lambda={lambda_div:.2f}"
+                    ),
+                )
+                selected.append(r)
+
+        else:
+            # Fallback greedy with simple diversity cap (legacy behavior)
+            selected = []
+            outcome_counts = {"WIN": 0, "LOSS": 0, "BREAKEVEN": 0}
+            max_same_outcome = min(2, max_retrieved)
+            for score, base_sim, row, meta in candidates:
+                if len(selected) >= max_retrieved:
+                    break
+                outcome = (getattr(row, "outcome", None) or ("WIN" if (getattr(row, "pnl_pct", 0) or 0) > 0 else "LOSS"))
+                if outcome_counts.get(outcome, 0) >= max_same_outcome:
+                    if not (getattr(row, "is_high_conviction", False) or (getattr(row, "quality_score", 0) or 0) >= 8):
+                        continue
+                outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+                r = RetrievedJournal(
+                    trade_id = getattr(row, "trade_id", None),
+                    symbol = getattr(row, "symbol", None),
+                    setup_type = getattr(row, "setup_type", None),
+                    direction = getattr(row, "direction", None),
+                    pnl_pct = float(getattr(row, "pnl_pct", 0.0) or 0.0),
+                    entry_text = getattr(row, "entry_text", "") or "",
+                    setup_summary = getattr(row, "setup_summary", None),
+                    outcome = outcome,
+                    reason = getattr(row, "reason", None),
+                    one_actionable_lesson = getattr(row, "one_actionable_lesson", None) or getattr(row, "key_lesson", None),
+                    quality_score = getattr(row, "quality_score", None),
+                    market_regime = getattr(row, "market_regime", None),
+                    is_high_conviction = bool(getattr(row, "is_high_conviction", False)),
+                    similarity = float(base_sim),
+                    created_at = getattr(row, "created_at", now) or now,
+                    why_selected = (
+                        f"final_score={score:.3f}, base_sim={base_sim:.2f}, outcome_mul={('+' if (getattr(row,'pnl_pct',0) or 0)>0 else '-')}{outcome_weight}, "
+                        f"decay={meta.get('decay'):.3f}, quality={getattr(row,'quality_score',0)}"
+                    ),
+                )
+                selected.append(r)
 
         # Metrics and logging
         try:

@@ -198,10 +198,10 @@ async def test_format_retrieved_journals_for_context(monkeypatch):
     formatted = format_retrieved_journals_for_context(journals, include_meta_lessons=True)
     
     assert "=== Past Similar Trades for Learning ===" in formatted
-    assert "1. ABC LONG ORB | WIN (+2.50%)" in formatted
-    assert "2. DEF SHORT VWAP | LOSS (-1.20%)" in formatted
-    assert "Similarity: 0.92" in formatted
-    assert "Lesson: Wait for retest confirmation" in formatted
+    assert "1. Setup: ABC LONG ORB" in formatted
+    assert "2. Setup: DEF SHORT VWAP" in formatted
+    assert "Similarity Score: 0.92" in formatted
+    assert "Key Lesson: Wait for retest confirmation" in formatted
     assert "=== Meta Lessons Learned So Far ===" in formatted
 
 
