@@ -39,10 +39,10 @@ async def generate_meta_lessons(limit: int | None = None) -> Dict[str, Any]:
 
     sql = sa_text(
         """
-        SELECT key_lesson, COUNT(*) as cnt
+        SELECT COALESCE(one_actionable_lesson, key_lesson) as lesson, COUNT(*) as cnt
         FROM journal_entries
-        WHERE key_lesson IS NOT NULL AND quality_score >= :min_q AND created_at >= :cutoff
-        GROUP BY key_lesson
+        WHERE (one_actionable_lesson IS NOT NULL OR key_lesson IS NOT NULL) AND quality_score >= :min_q AND created_at >= :cutoff
+        GROUP BY lesson
         ORDER BY cnt DESC
         LIMIT :limit
         """
@@ -51,7 +51,7 @@ async def generate_meta_lessons(limit: int | None = None) -> Dict[str, Any]:
     async with get_db() as db:
         rows = (await db.execute(sql, {"min_q": min_q, "cutoff": cutoff, "limit": limit})).fetchall()
 
-    lessons = [{"key_lesson": r.key_lesson, "count": int(r.cnt)} for r in rows]
+    lessons = [{"lesson": r.lesson, "count": int(r.cnt)} for r in rows]
     payload = {"generated_at": datetime.utcnow().isoformat(), "lessons": lessons}
 
     DEFAULT_PATH.parent.mkdir(parents=True, exist_ok=True)

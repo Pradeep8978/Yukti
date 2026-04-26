@@ -161,6 +161,8 @@ class Settings(BaseSettings):
     rag_max_fetch_candidates: int = 50
     rag_diversity_lambda: float = 0.7
     rag_max_context_chars: int = 4000
+    # Include meta lessons (daily summary) in injected context
+    rag_include_meta_lessons: bool = True
 
     # ── DhanHQ constants ──────────────────────────────
     exchange_nse:     str = "NSE_EQ"

@@ -65,16 +65,16 @@ Input fields:
   market_bias: "{market_bias}"
   outcome: "{outcome}"
 
-Produce JSON with the following keys:
-- entry_text: short human-readable 1-2 sentence summary (first-person).
-- quality_score: integer 0-10 (0 = useless, 10 = excellent insight).
-- key_lesson: one short sentence describing the single most important lesson.
-- setup_type: string (reuse or refine the input setup_type).
-- market_regime: one of [BULLISH, BEARISH, NEUTRAL, VOLATILE] based on market_bias.
-- outcome_reason: 1-2 sentence explanation why trade won/lost.
-- one_actionable_lesson: one concrete action to take next time.
+Produce JSON with the following keys (use these exact key names):
+- `setup_summary`: short human-readable 1-2 sentence summary (first-person).
+- `outcome`: one of `WIN`, `LOSS`, or `BREAKEVEN`.
+- `reason`: 1-2 sentence explanation why the trade won or lost.
+- `one_actionable_lesson`: one concrete action to take next time (single sentence).
+- `quality_score`: integer 0-10 (0 = useless, 10 = excellent insight). If unsure, self-score and return an honest value.
+- `market_regime`: one of [BULLISH, BEARISH, NEUTRAL, VOLATILE] if applicable, else null.
+- `setup_type`: string (reuse or refine the input setup_type).
 
-Return ONLY valid JSON (no surrounding text, no markdown fences). Keep values short.
+Return ONLY valid JSON (no surrounding text, no markdown fences). Keep values concise.
 """.strip()
 
   loop = asyncio.get_event_loop()
@@ -110,15 +110,15 @@ Return ONLY valid JSON (no surrounding text, no markdown fences). Keep values sh
 
   if parsed is None:
     # Fallback: create a minimal reflection using the free-text output
-    entry_text = (raw.splitlines()[0] if raw else f"Trade {symbol} closed: {pnl_pct:+.2f}%")
+    setup_summary = (raw.splitlines()[0] if raw else f"Trade {symbol} closed: {pnl_pct:+.2f}%")
     refl = JournalReflection(
-      entry_text=str(entry_text),
-      quality_score=0,
-      key_lesson="",
-      setup_type=setup_type,
-      market_regime=market_bias,
-      outcome_reason=str(exit_reason or ""),
+      setup_summary=str(setup_summary),
+      outcome=outcome,
+      reason=str(exit_reason or ""),
       one_actionable_lesson="",
+      quality_score=0,
+      market_regime=market_bias,
+      setup_type=setup_type,
       created_at=datetime.utcnow(),
     )
     log.info("Journal written (fallback) for %s quality=%d", symbol, refl.quality_score)
@@ -126,26 +126,48 @@ Return ONLY valid JSON (no surrounding text, no markdown fences). Keep values sh
 
   # Validate and convert to JournalReflection
   try:
+    # Prefer the new field names; accept legacy aliases too.
+    setup_summary = parsed.get("setup_summary") or parsed.get("entry_text") or parsed.get("summary") or ""
+    outcome_val = (parsed.get("outcome") or parsed.get("result") or outcome or "BREAKEVEN")
+    reason_val = parsed.get("reason") or parsed.get("outcome_reason") or parsed.get("why") or ""
+    actionable = parsed.get("one_actionable_lesson") or parsed.get("actionable") or parsed.get("one_actionable") or ""
+    raw_quality = parsed.get("quality_score")
+    if raw_quality is None:
+        # simple heuristic fallback: longer summary + presence of reason/actionable -> higher score
+        length_score = min(6, max(0, int(len(setup_summary) / 40)))
+        bonus = 0
+        if reason_val:
+            bonus += 1
+        if actionable:
+            bonus += 1
+        heuristic_score = min(10, length_score + bonus)
+        qual = int(heuristic_score)
+    else:
+        try:
+            qual = int(raw_quality)
+        except Exception:
+            qual = 0
+
     refl = JournalReflection(
-      entry_text=parsed.get("entry_text") or parsed.get("setup_summary") or parsed.get("journal") or "",
-      quality_score=int(parsed.get("quality_score", 0)),
-      key_lesson=parsed.get("key_lesson") or parsed.get("lesson") or parsed.get("one_actionable_lesson") or "",
-      setup_type=parsed.get("setup_type") or setup_type,
+      setup_summary=str(setup_summary),
+      outcome=str(outcome_val),
+      reason=str(reason_val),
+      one_actionable_lesson=str(actionable),
+      quality_score=qual,
       market_regime=parsed.get("market_regime") or market_bias,
-      outcome_reason=parsed.get("outcome_reason") or parsed.get("reason") or parsed.get("why"),
-      one_actionable_lesson=parsed.get("one_actionable_lesson") or parsed.get("actionable") or "",
+      setup_type=parsed.get("setup_type") or setup_type,
       created_at=datetime.utcnow(),
     )
   except Exception as exc:
     log.warning("Journal parsing/validation failed for %s: %s — raw=%s", symbol, exc, raw[:300])
     refl = JournalReflection(
-      entry_text=raw[:1000],
-      quality_score=0,
-      key_lesson="",
-      setup_type=setup_type,
-      market_regime=market_bias,
-      outcome_reason=str(exit_reason or ""),
+      setup_summary=raw[:1000],
+      outcome=outcome,
+      reason=str(exit_reason or ""),
       one_actionable_lesson="",
+      quality_score=0,
+      market_regime=market_bias,
+      setup_type=setup_type,
       created_at=datetime.utcnow(),
     )
 

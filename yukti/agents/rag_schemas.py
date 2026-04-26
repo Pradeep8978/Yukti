@@ -11,13 +11,13 @@ from pydantic import BaseModel, Field
 
 
 class JournalReflection(BaseModel):
-    entry_text: str
-    quality_score: int = Field(ge=0, le=10)
-    key_lesson: Optional[str] = None
-    setup_type: Optional[str] = None
-    market_regime: Optional[str] = None
-    outcome_reason: Optional[str] = None
+    setup_summary: str
+    outcome: str  # WIN | LOSS | BREAKEVEN
+    reason: Optional[str] = None
     one_actionable_lesson: Optional[str] = None
+    quality_score: int = Field(ge=0, le=10)
+    market_regime: Optional[str] = None
+    setup_type: Optional[str] = None
     created_at: Optional[datetime] = None
 
 
@@ -30,8 +30,8 @@ class RetrievedTradeContext(BaseModel):
     pnl_pct: Optional[float]
     similarity: Optional[float]
     quality_score: Optional[int]
-    key_lesson: Optional[str]
-    outcome_reason: Optional[str]
+    one_actionable_lesson: Optional[str]
+    reason: Optional[str]
     created_at: Optional[datetime]
     retrieval_reason: Optional[str] = None
 

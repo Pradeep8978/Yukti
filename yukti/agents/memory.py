@@ -32,44 +32,12 @@ from yukti.metrics import (
 
 log = logging.getLogger(__name__)
 
-# Prometheus metrics for RAG observability
-try:
-    from prometheus_client import Counter, Histogram
-    
-    RAG_RETRIEVALS_TOTAL = Counter(
-        "rag_retrievals_total",
-        "Total number of RAG retrieval attempts",
-        ["status"],  # success, failure, fallback
-    )
-    RAG_AVG_SIMILARITY = Histogram(
-        "rag_avg_similarity",
-        "Average similarity score of retrieved journals",
-        buckets=[0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0],
-    )
-    RAG_AVG_QUALITY = Histogram(
-        "rag_avg_quality_score",
-        "Average quality score of retrieved journals",
-        buckets=[0, 2, 4, 6, 8, 10],
-    )
-    RAG_RETRIEVAL_LATENCY = Histogram(
-        "rag_retrieval_latency_seconds",
-        "Time taken for RAG retrieval",
-        buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
-    )
-except ImportError:
-    # Prometheus not available — create no-op metrics
-    class _NoOpCounter:
-        def labels(self, **kwargs): return self
-        def inc(self, n=1): pass
-    
-    class _NoOpHistogram:
-        def labels(self, **kwargs): return self
-        def observe(self, n): pass
-    
-    RAG_RETRIEVALS_TOTAL = _NoOpCounter()
-    RAG_AVG_SIMILARITY = _NoOpHistogram()
-    RAG_AVG_QUALITY = _NoOpHistogram()
-    RAG_RETRIEVAL_LATENCY = _NoOpHistogram()
+# Use central metrics exported from yukti.metrics for observability
+from yukti.metrics import (
+    rag_retrieval_count,
+    rag_avg_similarity,
+    rag_quality_score_avg,
+)
 
 
 _voyage_client: voyageai.Client | None = None
@@ -118,12 +86,26 @@ async def store_journal(
 
     # Normalize reflection to JournalReflection
     if isinstance(journal, str):
-        refl = JournalReflection(entry_text=journal, quality_score=0, key_lesson="", created_at=datetime.utcnow())
+        refl = JournalReflection(
+            setup_summary=journal,
+            outcome="BREAKEVEN",
+            reason="",
+            one_actionable_lesson="",
+            quality_score=0,
+            market_regime=None,
+            setup_type=setup_type,
+            created_at=datetime.utcnow(),
+        )
     else:
         refl = journal
 
+    # Build a concise text to embed (include summary, reason, lesson)
+    embed_text = (
+        (refl.setup_summary or "") + "\nReason: " + (refl.reason or "") + "\nLesson: " + (refl.one_actionable_lesson or "")
+    )
+
     try:
-        embedding = await embed_journal(refl.entry_text)
+        embedding = await embed_journal(embed_text)
     except Exception as exc:
         log.warning("Embedding failed for trade %d: %s", trade_id, exc)
         embedding = None
@@ -143,14 +125,16 @@ async def store_journal(
             setup_type=setup_type,
             direction=direction,
             pnl_pct=pnl_pct,
-            entry_text=refl.entry_text,
+            entry_text=(refl.setup_summary or "")[:2000],
+            setup_summary=refl.setup_summary,
             embedding=embedding,
             quality_score=refl.quality_score,
-            key_lesson=refl.key_lesson,
+            # populate both legacy and new fields for compatibility
+            key_lesson=(refl.one_actionable_lesson or None),
             market_regime=refl.market_regime,
-            outcome_reason=refl.outcome_reason,
-            one_actionable_lesson=refl.one_actionable_lesson,
-            outcome=outcome,
+            outcome_reason=(refl.reason or None),
+            one_actionable_lesson=(refl.one_actionable_lesson or None),
+            outcome=refl.outcome or outcome,
             is_high_conviction=(conviction >= 8),
             discarded=discarded,
         ))
@@ -192,7 +176,8 @@ async def retrieve_similar(
         # Fallback: return most recent same-symbol entries
         async with get_db() as db:
             sql_fb = sa_text("""
-                SELECT id, trade_id, entry_text, pnl_pct, setup_type, direction, symbol, quality_score, key_lesson, outcome_reason, created_at
+                SELECT id, trade_id, entry_text, pnl_pct, setup_type, direction, symbol,
+                       quality_score, one_actionable_lesson, setup_summary, outcome, reason, created_at
                 FROM journal_entries
                 WHERE symbol = :symbol AND embedding IS NOT NULL
                 ORDER BY created_at DESC
@@ -204,8 +189,18 @@ async def retrieve_similar(
         parts = []
         for i, row in enumerate(rows[:top_k]):
             outcome = "WIN" if (row.pnl_pct or 0) > 0 else "LOSS"
-            parts.append(f"  [{outcome} {row.pnl_pct:+.1f}%] {row.symbol} {row.direction} {row.setup_type}\n  {row.entry_text}")
-        header = f"Past similar setups (fallback {len(parts)}):"
+            setup = getattr(row, "setup_summary", None) or getattr(row, "entry_text", "(no summary)")
+            lesson = getattr(row, "one_actionable_lesson", None) or getattr(row, "key_lesson", None) or "—"
+            why = f"fallback_recent_{i+1}"
+            parts.append(
+                f"{i+1}. {row.symbol} | {row.setup_type or 'unknown'} | {outcome} {row.pnl_pct:+.1f}% | sim={getattr(row,'similarity',0.0):.2f}\n"
+                f"   - Setup   : {setup}\n"
+                f"   - Outcome : {getattr(row,'reason', '') or ''}\n"
+                f"   - Lesson  : {lesson}\n"
+                f"   - Retrieved because: {why}"
+            )
+
+        header = "=== Past Similar Trades for Learning ==="
         return header + "\n\n" + "\n\n".join(parts)
 
     # Fetch a larger candidate set from DB to allow re-ranking with metadata
@@ -265,8 +260,8 @@ async def retrieve_similar(
             pnl_pct=float(getattr(row, "pnl_pct", 0.0) or 0.0),
             similarity=sim,
             quality_score=qscore,
-            key_lesson=getattr(row, "key_lesson", None) or getattr(row, "one_actionable_lesson", None),
-            outcome_reason=getattr(row, "outcome_reason", None) or getattr(row, "reason", None),
+            one_actionable_lesson=getattr(row, "one_actionable_lesson", None) or getattr(row, "key_lesson", None),
+            reason=getattr(row, "reason", None) or getattr(row, "outcome_reason", None),
             created_at=getattr(row, "created_at", None),
             retrieval_reason=retrieval_reason,
         )
@@ -317,14 +312,14 @@ async def retrieve_similar(
     parts: List[str] = []
     for i, ctx in enumerate(selected):
         outcome = "WIN" if (ctx.pnl_pct or 0) > 0 else "LOSS"
-        entry_summary = (ctx.key_lesson or ctx.outcome_reason or "").strip() or "(no summary)"
+        entry_summary = (ctx.one_actionable_lesson or ctx.reason or "").strip() or "(no summary)"
         why = ctx.retrieval_reason or ""
-        
+
         parts.append(
             f"{i+1}. {ctx.symbol} | {ctx.setup_type or 'unknown'} | {outcome} {ctx.pnl_pct:+.1f}% | sim={ctx.similarity:.2f}\\n"
             f"   - Setup summary : {entry_summary}\\n"
-            f"   - What happened : {ctx.outcome_reason or 'See journal entry.'}\\n"
-            f"   - Key lesson    : {ctx.key_lesson or '—'}\\n"
+            f"   - What happened : {ctx.reason or 'See journal entry.'}\\n"
+            f"   - Key lesson    : {ctx.one_actionable_lesson or '—'}\\n"
             f"   - Retrieved because: {why}"
         )
 
@@ -333,17 +328,17 @@ async def retrieve_similar(
     try:
         recent_cutoff = datetime.utcnow() - timedelta(days=cfg.recency_days)
         sql_meta = sa_text("""
-            SELECT key_lesson, COUNT(*) as cnt
+            SELECT COALESCE(one_actionable_lesson, key_lesson) as lesson, COUNT(*) as cnt
             FROM journal_entries
-            WHERE key_lesson IS NOT NULL AND quality_score >= :min_q AND created_at >= :cutoff
-            GROUP BY key_lesson
+            WHERE (one_actionable_lesson IS NOT NULL OR key_lesson IS NOT NULL) AND quality_score >= :min_q AND created_at >= :cutoff
+            GROUP BY lesson
             ORDER BY cnt DESC
             LIMIT 3
         """)
         async with get_db() as db:
             rows_meta = (await db.execute(sql_meta, {"min_q": cfg.min_quality_score, "cutoff": recent_cutoff})).fetchall()
         if rows_meta:
-            lessons = [f"{r.key_lesson} ({r.cnt})" for r in rows_meta]
+            lessons = [f"{r.lesson} ({r.cnt})" for r in rows_meta]
             meta = "Meta Lessons Learned: " + ", ".join(lessons)
     except Exception:
         meta = ""
@@ -356,7 +351,10 @@ async def retrieve_similar(
     # Log concise retrieval info
     if selected:
         top = selected[0]
-        top_match = f"{top.symbol} - similarity {top.similarity:.2f} - outcome: {'win' if (top.pnl_pct or 0)>0 else 'loss'} - lesson: {top.key_lesson or '—'}"
+        top_match = (
+            f"{top.symbol} - similarity {top.similarity:.2f} - outcome: {'win' if (top.pnl_pct or 0)>0 else 'loss'}"
+            f" - lesson: {top.one_actionable_lesson or top.reason or '—'}"
+        )
         log.info("Retrieved %d past trades. Top match: %s", len(selected), top_match)
 
     return header + "\\n\\n" + body
@@ -431,7 +429,7 @@ async def retrieve_similar_hybrid(
         [query_emb] = await _embed([query_text], input_type="query")
     except Exception as exc:
         log.warning("Hybrid retrieval embedding failed: %s", exc)
-        RAG_RETRIEVALS_TOTAL.labels(status="failure").inc()
+        rag_retrieval_count.inc()
         return []
 
     # Calculate recency cutoff
@@ -543,13 +541,14 @@ async def retrieve_similar_hybrid(
                 "Retrieved %d past journals. Top match similarity: %.2f | Outcome: %s | Lesson: %s",
                 len(results), top_sim, top_outcome, top_lesson[:50]
             )
-            RAG_RETRIEVALS_TOTAL.labels(status="success").inc()
-            RAG_AVG_SIMILARITY.observe(sum(r.similarity for r in results) / len(results))
+            rag_retrieval_count.inc()
+            # record averages to Gauges
+            rag_avg_similarity.set(sum(r.similarity for r in results) / len(results))
             if any(r.quality_score for r in results):
                 avg_qual = sum(r.quality_score for r in results if r.quality_score) / len(results)
-                RAG_AVG_QUALITY.observe(avg_qual)
+                rag_quality_score_avg.set(avg_qual)
         else:
-            RAG_RETRIEVALS_TOTAL.labels(status="fallback").inc()
+            rag_retrieval_count.inc()
             
         return results
 
@@ -569,7 +568,7 @@ def format_retrieved_journals_for_context(
     if not journals:
         return ""
 
-    lines = ["=== Past Similar Trades (for learning) ==="]
+    lines = ["=== Past Similar Trades for Learning ==="]
 
     for i, j in enumerate(journals, 1):
         setup_info = f"{j.symbol} {j.direction} {j.setup_type} | {j.outcome} ({j.pnl_pct:+.2f}%)"
