@@ -123,7 +123,7 @@ async def job_daily_reset() -> None:
                 elif "BEARISH" in t.reasoning.upper():
                     market_bias = "BEARISH"
             
-            text, structured = await write_journal_entry(
+            refl = await write_journal_entry(
                 symbol=t.symbol, direction=t.direction, setup_type=t.setup_type,
                 entry=t.entry_price, stop_loss=t.stop_loss, target=t.target_1,
                 exit_price=t.exit_price or t.entry_price,
@@ -133,9 +133,7 @@ async def job_daily_reset() -> None:
             )
             await store_journal(
                 t.id, t.symbol, t.setup_type, t.direction,
-                t.pnl_pct or 0.0, text, 
-                structured_data=structured,
-                market_bias=market_bias,
+                t.pnl_pct or 0.0, refl,
                 conviction=t.conviction,
             )
         except Exception as exc:
@@ -170,6 +168,23 @@ async def job_daily_report() -> None:
     )
 
 
+async def job_meta_lessons() -> None:
+    """Daily EOD job: aggregate top key_lessons and write data/meta_lessons.json.
+
+    Gated by `enable_meta_lessons` in Settings (default True).
+    Only runs on NSE trading days.
+    """
+    if not is_trading_day():
+        log.info("Meta-lessons job skipped: non-trading day")
+        return
+    log.info("=== meta-lessons aggregation ===")
+    try:
+        payload = await generate_meta_lessons()
+        log.info("Meta-lessons done: %d lessons written", len(payload.get("lessons", [])))
+    except Exception as exc:
+        log.error("Meta-lessons job failed: %s", exc)
+
+
 async def job_universe_scan() -> None:
     """Pre-market universe scan at 08:45 IST."""
     log.info("=== universe scan (primary) ===")
@@ -195,33 +210,27 @@ def build_scheduler() -> AsyncIOScheduler:
     sched.add_job(job_eod_squareoff,    "cron", hour=15, minute=10)
     sched.add_job(job_daily_reset,      "cron", hour=16, minute=0)
     sched.add_job(job_daily_report,     "cron", hour=16, minute=30)
-    # Learning loop: run during low-traffic hours (config-gated)
+
+    # Learning loop: embed pending journals (config-gated, runs at 2am)
     if getattr(settings, "enable_learning_loop", False):
         sched.add_job(job_learning_loop, "cron", hour=2, minute=0)
-    # Self-learning loop: runs at 3am if enabled
+
+    # Self-learning loop: export→retrain→eval→promote (config-gated, runs at 3am)
     if getattr(settings, "enable_self_learning", True):
         sched.add_job(job_self_learning_loop, "cron", hour=3, minute=0)
-    # Meta-lessons: daily summary generation (config gated)
-    if getattr(settings, "enable_meta_lessons", False):
-        # Schedule meta-lessons to run daily at end-of-day (default: daily_journal + 5m)
-        # Allow explicit override via `daily_journal_summary_time` (HH:MM)
-        tj = getattr(settings, "daily_journal_summary_time", None) or getattr(settings, "daily_journal", "16:00")
+
+    # Meta-lessons: aggregate key_lessons → data/meta_lessons.json (config-gated)
+    # Runs daily at `daily_journal_summary_time` (default: 16:05 IST, 5m after journals)
+    if settings.enable_meta_lessons:
+        tj = settings.daily_journal_summary_time or "16:05"
         try:
-            hh, mm = [int(p) for p in str(tj).split(":")]
+            hh, mm = (int(p) for p in tj.split(":"))
         except Exception:
             hh, mm = 16, 5
+        sched.add_job(job_meta_lessons, "cron", hour=hh, minute=mm,
+                      id="meta_lessons", replace_existing=True)
+        log.info("Meta-lessons job scheduled at %02d:%02d IST", hh, mm)
 
-        async def job_generate_meta_lessons_wrapper() -> None:
-            # Run only on trading days — avoid executing on holidays/weekends
-            try:
-                if not is_trading_day():
-                    log.info("Meta-lessons job skipped: non-trading day")
-                    return
-                await generate_meta_lessons()
-            except Exception as exc:
-                log.error("Meta-lessons job failed: %s", exc)
-
-        sched.add_job(job_generate_meta_lessons_wrapper, "cron", hour=hh, minute=mm)
     return sched
 
 

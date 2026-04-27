@@ -382,6 +382,40 @@ class RetrievedJournal:
     why_selected: str  # Human-readable reason for selection
 
 
+def _build_why_selected(
+    row_sym: str,
+    row_setup: str,
+    query_sym: str,
+    query_setup: str,
+    outcome: str,
+    pnl_pct: float,
+    age_days: int,
+    qscore: float,
+    base_sim: float,
+    recency_days: int,
+) -> str:
+    """Produce a concise human-readable string explaining why this journal was retrieved."""
+    parts: list[str] = []
+    if row_sym and row_sym == query_sym:
+        parts.append(f"same symbol ({row_sym})")
+    if row_setup and row_setup == query_setup:
+        parts.append(f"same setup ({row_setup})")
+    elif row_setup:
+        parts.append(f"similar setup ({row_setup})")
+    if outcome == "WIN":
+        parts.append("winning trade")
+    elif outcome == "LOSS":
+        parts.append(f"loss trade (learn what went wrong)")
+    if age_days <= recency_days:
+        parts.append(f"recent ({age_days}d ago)")
+    else:
+        parts.append(f"{age_days}d ago")
+    if qscore >= 8:
+        parts.append(f"high quality ({int(qscore)}/10)")
+    parts.append(f"similarity {base_sim:.2f}")
+    return ", ".join(parts)
+
+
 def _get_rag_config() -> dict:
     """Get RAG configuration from settings with sensible defaults."""
     return {
@@ -587,6 +621,29 @@ async def retrieve_similar_hybrid(
                 score = candidate_scores[idx]
                 meta = candidate_meta[idx]
                 outcome = (getattr(row, "outcome", None) or ("WIN" if (getattr(row, "pnl_pct", 0) or 0) > 0 else "LOSS"))
+                # Build human-readable retrieval reason
+                _why: list[str] = []
+                _row_sym = getattr(row, "symbol", "") or ""
+                _row_setup = getattr(row, "setup_type", "") or ""
+                _age = max(0, (now - (getattr(row, "created_at", now) or now)).days)
+                _qsc = float(getattr(row, "quality_score", 0) or 0)
+                if meta.get("symbol_bonus", 1.0) > 1.0:
+                    _why.append(f"same symbol ({_row_sym})")
+                if _row_setup and _row_setup == setup_type:
+                    _why.append(f"same setup ({_row_setup})")
+                elif _row_setup:
+                    _why.append(f"similar setup ({_row_setup})")
+                if meta.get("regime_bonus", 1.0) > 1.0:
+                    _why.append("same market regime")
+                if outcome in ("WIN",) and meta.get("outcome_mul", 1.0) > 1.0:
+                    _why.append("winning trade (boosted)")
+                if _age <= recency_days:
+                    _why.append(f"recent ({_age}d ago)")
+                else:
+                    _why.append(f"{_age}d ago")
+                if _qsc >= 8:
+                    _why.append(f"high quality ({int(_qsc)}/10)")
+                _why.append(f"similarity {base_sim:.2f}")
                 r = RetrievedJournal(
                     trade_id = getattr(row, "trade_id", None),
                     symbol = getattr(row, "symbol", None),
@@ -603,10 +660,7 @@ async def retrieve_similar_hybrid(
                     is_high_conviction = bool(getattr(row, "is_high_conviction", False)),
                     similarity = float(base_sim),
                     created_at = getattr(row, "created_at", now) or now,
-                    why_selected = (
-                        f"final_score={score:.3f}, base_sim={base_sim:.2f}, outcome_mul={meta.get('outcome_mul'):.2f}, "
-                        f"decay={meta.get('decay'):.3f}, quality_mul={meta.get('quality_mul'):.2f}, diversity_lambda={lambda_div:.2f}"
-                    ),
+                    why_selected = ", ".join(_why),
                 )
                 selected.append(r)
 
@@ -639,9 +693,17 @@ async def retrieve_similar_hybrid(
                     is_high_conviction = bool(getattr(row, "is_high_conviction", False)),
                     similarity = float(base_sim),
                     created_at = getattr(row, "created_at", now) or now,
-                    why_selected = (
-                        f"final_score={score:.3f}, base_sim={base_sim:.2f}, outcome_mul={('+' if (getattr(row,'pnl_pct',0) or 0)>0 else '-')}{outcome_weight}, "
-                        f"decay={meta.get('decay'):.3f}, quality={getattr(row,'quality_score',0)}"
+                    why_selected = _build_why_selected(
+                        row_sym=getattr(row, "symbol", "") or "",
+                        row_setup=getattr(row, "setup_type", "") or "",
+                        query_sym=symbol,
+                        query_setup=setup_type,
+                        outcome=outcome,
+                        pnl_pct=float(getattr(row, "pnl_pct", 0.0) or 0.0),
+                        age_days=max(0, (now - (getattr(row, "created_at", now) or now)).days),
+                        qscore=float(getattr(row, "quality_score", 0) or 0),
+                        base_sim=float(base_sim),
+                        recency_days=recency_days,
                     ),
                 )
                 selected.append(r)
@@ -729,22 +791,40 @@ def format_retrieved_journals_for_context(
     journals: list[RetrievedJournal],
     include_meta_lessons: bool = False,
 ) -> str:
-    """
-    Format retrieved journals for injection into AI context.
+    """Format retrieved journals for injection into Arjun's AI context.
+
+    Produces a numbered, educational block that the LLM can reason over:
+      - Setup summary (what happened)
+      - Outcome + P&L
+      - Key lesson extracted from the trade
+      - Similarity score (0-1)
+      - Why this trade was retrieved (human-readable)
     """
     if not journals:
         return ""
     lines = ["=== Past Similar Trades for Learning ==="]
 
     for i, j in enumerate(journals, 1):
-        setup_info = f"{j.symbol} {j.direction} {j.setup_type or 'unknown'}"
-        lesson = (j.one_actionable_lesson or j.reason or "—").strip()
+        direction_str = f" {j.direction}" if j.direction else ""
+        setup_label = j.setup_type or "unknown"
+        header = f"{i}. {j.symbol}{direction_str} | {setup_label} | {j.outcome} {j.pnl_pct:+.1f}%"
+        lines.append(header)
 
-        lines.append(f"{i}. Setup: {setup_info}")
-        lines.append(f"   Outcome: {j.outcome} ({j.pnl_pct:+.2f}%)")
-        lines.append(f"   Key Lesson: {lesson}")
-        lines.append(f"   Similarity Score: {j.similarity:.2f}")
-        lines.append(f"   Why Relevant: {j.why_selected or 'See retrieval reason.'}")
+        # Setup narrative (prefer setup_summary, fall back to first 200 chars of entry_text)
+        setup_detail = (j.setup_summary or j.entry_text or "").strip()
+        if len(setup_detail) > 220:
+            setup_detail = setup_detail[:220].rsplit(" ", 1)[0] + "…"
+        if setup_detail:
+            lines.append(f"   Setup   : {setup_detail}")
+
+        # What happened
+        outcome_detail = (j.reason or "").strip()
+        if outcome_detail:
+            lines.append(f"   Outcome : {outcome_detail}")
+
+        lesson = (j.one_actionable_lesson or "—").strip()
+        lines.append(f"   Lesson  : {lesson}")
+        lines.append(f"   Sim={j.similarity:.2f} | Why retrieved: {j.why_selected or 'vector match'}")
         lines.append("")
 
     # Remove trailing blank
@@ -761,15 +841,11 @@ def format_retrieved_journals_for_context(
                 lessons = payload.get("lessons", [])
                 if lessons:
                     lines.append("")
-                    lines.append("=== Meta Lessons Learned So Far ===")
-                    for item in lessons:
-                        lines.append(f"- {item.get('lesson')} ({item.get('count')})")
+                    lines.append("=== Recurring Lessons Across All Past Trades ===")
+                    for item in lessons[:5]:  # cap at 5 to keep tokens low
+                        cnt = item.get("count", 1)
+                        lines.append(f"- {item.get('lesson')} (seen {cnt}x)")
         except Exception:
-            # Best-effort fallback static hints
-            lines.append("")
-            lines.append("=== Meta Lessons Learned So Far ===")
-            lines.append("- Prioritize high-conviction setups (8+) in trending markets")
-            lines.append("- Same-symbol trades: learn from both wins and losses")
-            lines.append("- Quality journals (score >= 8) contain most actionable insights")
+            pass  # Skip silently — meta_lessons.json may not exist yet
 
     return "\n".join(lines)
