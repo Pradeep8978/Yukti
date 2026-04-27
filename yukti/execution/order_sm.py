@@ -181,7 +181,8 @@ async def open_trade(
     pos["fill_price"] = fill_price
     pos["status"]     = "FILLED"
     await save_position(symbol, pos)
-    await increment_trades_today()
+    # NOTE: increment_trades_today() moved to after ARMED — emergency-exited
+    # trades should not consume the daily trade limit.
 
     # ═══════════════════════════════════════════════════════════
     #  STEP 4 — Arm SL + target GTTs
@@ -220,6 +221,7 @@ async def open_trade(
     pos["target_gtt_id"] = t1_id
     pos["status"]        = "ARMED"
     await save_position(symbol, pos)
+    await increment_trades_today()
 
     log.info(
         "Trade ARMED intent #%d: %s %s %d @ ₹%.2f | SL ₹%.2f | T1 ₹%.2f",

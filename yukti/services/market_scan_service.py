@@ -24,7 +24,7 @@ from yukti.data.state import (
 )
 from yukti.execution.dhan_client import dhan
 from yukti.execution.order_sm import open_trade
-from yukti.metrics import signals_scanned, record_skip, record_trade_opened
+from yukti.metrics import signals_scanned, scan_failures, record_skip, record_trade_opened
 from yukti.risk import calculate_levels, calculate_position, run_gates, Portfolio
 from yukti.scheduler.jobs import is_trading_day, is_trading_hours
 from yukti.services.macro_context_service import MacroContext, fetch_macro_context, filter_headlines_for_symbol
@@ -84,8 +84,14 @@ class MarketScanService:
                     self._scan_symbol(symbol, security_id, macro, perf)
                     for symbol, security_id in self.universe.items()
                 ]
+                symbols_list = list(self.universe.keys())
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                failed_scans = sum(1 for r in results if isinstance(r, Exception))
+                failed_scans = 0
+                for sym, result in zip(symbols_list, results):
+                    if isinstance(result, Exception):
+                        failed_scans += 1
+                        scan_failures.labels(symbol=sym).inc()
+                        log.error("MarketScanService: scan failed for %s: %s", sym, result, exc_info=result)
                 if failed_scans > 0:
                     log.warning("MarketScanService: cycle completed with %d/%d failed scans", failed_scans, len(self.universe))
 
@@ -278,4 +284,5 @@ class MarketScanService:
                         log.warning("Telegram trade alert failed: %s", tg_exc)
 
             except Exception as exc:
-                log.error("MarketScanService: scan error %s: %s", symbol, exc)
+                scan_failures.labels(symbol=symbol).inc()
+                log.error("MarketScanService: scan error %s: %s", symbol, exc, exc_info=True)

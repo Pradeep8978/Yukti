@@ -63,6 +63,12 @@ signals_skipped = Counter(
     ["reason"],
 )
 
+scan_failures = Counter(
+    "yukti_scan_failures_total",
+    "Per-symbol scan failures in signal loop",
+    ["symbol"],
+)
+
 # ── Claude API ────────────────────────────────────────────────────────────────
 
 claude_latency = Histogram(

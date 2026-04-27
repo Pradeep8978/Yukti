@@ -27,3 +27,12 @@ groups:
         annotations:
           summary: "High canary failure rate"
           description: "Canary failure rate is high over the last 5 minutes." 
+
+      - alert: YuktiScanFailures
+        expr: increase(yukti_scan_failures_total[10m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Repeated symbol scan failures"
+          description: "Symbol {{ $labels.symbol }} has failed scanning {{ $value }} times in the last 10 minutes."
