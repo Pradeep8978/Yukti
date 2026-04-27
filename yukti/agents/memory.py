@@ -453,6 +453,10 @@ async def retrieve_similar_hybrid(
     outcome_weight = config.get("outcome_weight", 0.15)
     recent_half_life = getattr(settings, "rag_recency_half_life_days", 365)
     max_fetch = getattr(settings, "rag_max_fetch_candidates", max_retrieved * 10)
+    # Widen the candidate pool when market_regime is provided so the Python-side
+    # regime_bonus (1.10x) has more entries to promote during re-ranking.
+    if market_regime:
+        max_fetch = int(max_fetch * 1.5)
 
     from yukti.data.database import get_db
 

@@ -108,42 +108,30 @@ async def monitor_positions(poll_interval: int = 10) -> None:
 async def write_journal_entry(
     trade:              dict[str, Any],
     original_reasoning: str,
-) -> tuple[str, Any]:
-    """
-    Claude writes a structured post-trade reflection.
-    Returns the journal text string and structured data.
-    """
-    from yukti.agents.journal import write_journal_entry as write_journal_structured, JournalStructuredData
-    
-    entry     = float(trade.get("fill_price") or trade.get("entry_price", 0))
-    exit_p    = float(trade.get("exit_price", 0))
-    pnl_pct   = float(trade.get("pnl_pct", 0))
-    symbol    = trade.get("symbol", "")
-    direction = trade.get("direction", "")
-    setup     = trade.get("setup_type", "")
-    sl        = float(trade.get("stop_loss", 0))
-    t1        = float(trade.get("target_1", 0))
-    conv      = int(trade.get("conviction", 0))
-    reason    = trade.get("exit_reason", "")
-    market_bias = trade.get("market_bias", "NEUTRAL")
+) -> "JournalReflection":
+    """Write a structured post-trade reflection using Claude.
 
-    # Use the new structured journal writing
-    text, structured = await write_journal_structured(
-        symbol=symbol,
-        direction=direction,
-        setup_type=setup,
-        entry=entry,
-        stop_loss=sl,
-        target=t1,
-        exit_price=exit_p,
-        exit_reason=reason,
-        pnl_pct=pnl_pct,
-        conviction=conv,
-        reasoning=original_reasoning,
-        market_bias=market_bias,
+    Returns a `JournalReflection` model ready to pass to `store_journal`.
+    """
+    from yukti.agents.journal import write_journal_entry as write_journal_structured
+    from yukti.agents.rag_schemas import JournalReflection
+
+    refl = await write_journal_structured(
+        symbol      = trade.get("symbol", ""),
+        direction   = trade.get("direction", ""),
+        setup_type  = trade.get("setup_type", ""),
+        entry       = float(trade.get("fill_price") or trade.get("entry_price", 0)),
+        stop_loss   = float(trade.get("stop_loss", 0)),
+        target      = float(trade.get("target_1", 0)),
+        exit_price  = float(trade.get("exit_price", 0)),
+        exit_reason = trade.get("exit_reason", ""),
+        pnl_pct     = float(trade.get("pnl_pct", 0)),
+        conviction  = int(trade.get("conviction", 0)),
+        reasoning   = original_reasoning,
+        market_bias = trade.get("market_bias", "NEUTRAL"),
     )
-    log.info("Journal written for %s (quality=%.1f)", symbol, structured.quality_score)
-    return text, structured
+    log.info("Journal written for %s (quality=%d)", trade.get("symbol", ""), refl.quality_score or 0)
+    return refl
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -297,22 +285,18 @@ async def job_daily_journal(closed_trades: list[dict[str, Any]]) -> None:
     for trade in closed_trades:
         if trade.get("pnl") is None:
             continue
-        journal_text, structured = await write_journal_entry(
+        refl = await write_journal_entry(
             trade,
             original_reasoning=trade.get("reasoning", ""),
         )
-        
-        # Use the new store_journal with structured data
         from yukti.agents.memory import store_journal
         await store_journal(
-            trade_id=trade.get("db_id", 0),
-            symbol=trade.get("symbol", ""),
-            setup_type=trade.get("setup_type", ""),
-            direction=trade.get("direction", ""),
-            pnl_pct=float(trade.get("pnl_pct", 0)),
-            journal_text=journal_text,
-            structured_data=structured,
-            market_bias=trade.get("market_bias", "NEUTRAL"),
-            conviction=int(trade.get("conviction", 5)),
+            trade_id  = trade.get("db_id", 0),
+            symbol    = trade.get("symbol", ""),
+            setup_type= trade.get("setup_type", ""),
+            direction = trade.get("direction", ""),
+            pnl_pct   = float(trade.get("pnl_pct", 0)),
+            journal   = refl,
+            conviction= int(trade.get("conviction", 5)),
         )
-        log.info("Journal saved for %s (quality=%.1f)", trade.get("symbol"), structured.quality_score)
+        log.info("Journal saved for %s (quality=%d)", trade.get("symbol", ""), refl.quality_score or 0)

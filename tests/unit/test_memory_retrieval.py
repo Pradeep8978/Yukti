@@ -2,6 +2,54 @@ import pytest
 from datetime import datetime, timedelta
 
 
+def test_build_why_selected_same_symbol_win_recent():
+    """_build_why_selected returns human-readable explanation."""
+    from yukti.agents.memory import _build_why_selected
+
+    reason = _build_why_selected(
+        row_sym="RELIANCE",
+        row_setup="orb_breakout",
+        query_sym="RELIANCE",
+        query_setup="orb_breakout",
+        outcome="WIN",
+        pnl_pct=2.5,
+        age_days=10,
+        qscore=9.0,
+        base_sim=0.88,
+        recency_days=90,
+    )
+    assert "same symbol" in reason
+    assert "same setup" in reason
+    assert "winning trade" in reason
+    assert "recent" in reason
+    assert "high quality" in reason
+    assert "0.88" in reason
+
+
+def test_build_why_selected_different_symbol_loss_old():
+    from yukti.agents.memory import _build_why_selected
+
+    reason = _build_why_selected(
+        row_sym="INFY",
+        row_setup="vwap_bounce",
+        query_sym="TCS",
+        query_setup="orb_breakout",
+        outcome="LOSS",
+        pnl_pct=-1.5,
+        age_days=120,
+        qscore=6.0,
+        base_sim=0.75,
+        recency_days=90,
+    )
+    assert "similar setup" in reason
+    assert "loss trade" in reason
+    # 120d is outside recency window, should not say 'recent'
+    assert "recent" not in reason
+    assert "120d ago" in reason
+    # quality 6 is not "high quality"
+    assert "high quality" not in reason
+
+
 @pytest.mark.asyncio
 async def test_retrieve_similar_formats_results(monkeypatch):
     """Mock embeddings and DB to validate formatted retrieval output."""
@@ -196,13 +244,23 @@ async def test_format_retrieved_journals_for_context(monkeypatch):
     ]
 
     formatted = format_retrieved_journals_for_context(journals, include_meta_lessons=True)
-    
+
+    # Header
     assert "=== Past Similar Trades for Learning ===" in formatted
-    assert "1. Setup: ABC LONG ORB" in formatted
-    assert "2. Setup: DEF SHORT VWAP" in formatted
-    assert "Similarity Score: 0.92" in formatted
-    assert "Key Lesson: Wait for retest confirmation" in formatted
-    assert "=== Meta Lessons Learned So Far ===" in formatted
+    # Entry 1: new header format is "1. SYMBOL DIR | setup | OUTCOME pnl%"
+    assert "ABC" in formatted
+    assert "ORB" in formatted
+    assert "WIN" in formatted
+    # Lesson line uses new label
+    assert "Lesson  :" in formatted
+    assert "Wait for retest confirmation" in formatted
+    # Sim line
+    assert "Sim=0.92" in formatted
+    # Entry 2
+    assert "DEF" in formatted
+    assert "LOSS" in formatted
+    assert "Use tighter stop" in formatted
+    # meta_lessons.json does not exist in test env → section silently omitted (no assertion needed)
 
 
 @pytest.mark.asyncio

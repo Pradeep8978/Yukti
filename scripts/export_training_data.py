@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover - optional
     compute_reward = None
 
 
-async def export(out_path: str, since: datetime | None = None, limit: int | None = None) -> int:
+async def export(out_path: str, since: datetime | None = None, limit: int | None = None, min_quality: float | None = None) -> int:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     async with get_db() as db:
         q = select(JournalEntry, Trade).join(Trade, JournalEntry.trade_id == Trade.id)
@@ -47,6 +47,7 @@ async def export(out_path: str, since: datetime | None = None, limit: int | None
         rows = res.fetchall()
 
         written = 0
+        skipped_quality = 0
         with open(out_path, "w", encoding="utf-8") as fh:
             for row in rows:
                 # row is a SQLAlchemy Row; elements are (JournalEntry, Trade)
@@ -55,6 +56,13 @@ async def export(out_path: str, since: datetime | None = None, limit: int | None
                     t: Trade = row[1]
                 except Exception:
                     continue
+
+                # Quality gate: skip low-quality journals
+                if min_quality is not None:
+                    q_val = float(j.quality_score) if j.quality_score is not None else 0.0
+                    if q_val < min_quality:
+                        skipped_quality += 1
+                        continue
 
                 target = {
                     "direction": t.direction,
@@ -115,6 +123,8 @@ async def export(out_path: str, since: datetime | None = None, limit: int | None
                 written += 1
 
     print(f"Exported {written} rows to {out_path}")
+    if min_quality is not None:
+        print(f"  (skipped {skipped_quality} rows with quality_score < {min_quality})")
     return written
 
 
@@ -129,10 +139,12 @@ def main() -> None:
     p.add_argument("--out", default="data/training/journal_export.jsonl")
     p.add_argument("--since", default=None, help="ISO date e.g. 2024-01-01")
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--min-quality", type=float, default=None,
+                   help="Skip journals with quality_score below this threshold (e.g. 6)")
     args = p.parse_args()
 
     since = _parse_date(args.since)
-    asyncio.run(export(args.out, since=since, limit=args.limit))
+    asyncio.run(export(args.out, since=since, limit=args.limit, min_quality=args.min_quality))
 
 
 if __name__ == "__main__":
