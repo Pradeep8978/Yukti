@@ -453,10 +453,6 @@ async def retrieve_similar_hybrid(
     outcome_weight = config.get("outcome_weight", 0.15)
     recent_half_life = getattr(settings, "rag_recency_half_life_days", 365)
     max_fetch = getattr(settings, "rag_max_fetch_candidates", max_retrieved * 10)
-    # Widen the candidate pool when market_regime is provided so the Python-side
-    # regime_bonus (1.10x) has more entries to promote during re-ranking.
-    if market_regime:
-        max_fetch = int(max_fetch * 1.5)
 
     from yukti.data.database import get_db
 
@@ -475,29 +471,78 @@ async def retrieve_similar_hybrid(
 
     recency_cutoff = datetime.utcnow() - timedelta(days=recency_days)
 
-    # Fetch candidate set (vector-nearest), then compute final score in Python
-    sql = sa_text("""
-        SELECT 
+    # When market_regime is provided use a UNION SQL pre-filter so regime-matched
+    # entries are always represented in the candidate pool, even if they fall
+    # outside the global top-N by raw vector distance.  A second branch fetches
+    # the broader pool; Python-side de-duplication keeps unique rows only.
+    _select_cols = """
             id, trade_id, symbol, setup_type, direction, pnl_pct,
             entry_text, setup_summary, outcome, reason,
             one_actionable_lesson, quality_score, market_regime,
             is_high_conviction, created_at,
-            1 - (embedding <=> :emb ::vector) AS base_similarity
-        FROM journal_entries
-        WHERE embedding IS NOT NULL
+            1 - (embedding <=> :emb ::vector) AS base_similarity"""
+    _base_where = """embedding IS NOT NULL
           AND (discarded IS NULL OR discarded = FALSE)
-          AND created_at >= :recency_cutoff
-        ORDER BY embedding <=> :emb ::vector
-        LIMIT :limit
-    """)
+          AND created_at >= :recency_cutoff"""
+
+    if market_regime:
+        # Half of the budget reserved for regime-matched entries (guaranteed slot),
+        # the other half for the global nearest neighbours.
+        limit_regime = max(8, max_fetch // 2)
+        limit_all = max_fetch
+        sql = sa_text(f"""
+            (SELECT {_select_cols}
+             FROM journal_entries
+             WHERE {_base_where}
+               AND market_regime = :market_regime
+             ORDER BY embedding <=> :emb ::vector
+             LIMIT :limit_regime)
+            UNION ALL
+            (SELECT {_select_cols}
+             FROM journal_entries
+             WHERE {_base_where}
+             ORDER BY embedding <=> :emb ::vector
+             LIMIT :limit_all)
+        """)
+        sql_params = {
+            "emb": str(query_emb),
+            "recency_cutoff": recency_cutoff,
+            "market_regime": market_regime,
+            "limit_regime": limit_regime,
+            "limit_all": limit_all,
+        }
+        log.debug(
+            "RAG hybrid SQL pre-filter: market_regime=%s (regime_limit=%d, all_limit=%d)",
+            market_regime, limit_regime, limit_all,
+        )
+    else:
+        sql = sa_text(f"""
+            SELECT {_select_cols}
+            FROM journal_entries
+            WHERE {_base_where}
+            ORDER BY embedding <=> :emb ::vector
+            LIMIT :limit
+        """)
+        sql_params = {
+            "emb": str(query_emb),
+            "recency_cutoff": recency_cutoff,
+            "limit": max_fetch,
+        }
 
     try:
         async with get_db() as db:
-            rows = (await db.execute(sql, {
-                "emb": str(query_emb),
-                "recency_cutoff": recency_cutoff,
-                "limit": max_fetch,
-            })).fetchall()
+            raw_rows = (await db.execute(sql, sql_params)).fetchall()
+
+        # De-duplicate by journal id (UNION ALL may return the same row twice
+        # when a regime-matched entry also appears in the global top-N).
+        seen_ids: set[int] = set()
+        rows = []
+        for r in raw_rows:
+            rid = getattr(r, "id", None)
+            if rid is None or rid not in seen_ids:
+                rows.append(r)
+                if rid is not None:
+                    seen_ids.add(rid)
 
         now = datetime.utcnow()
         candidates: list[tuple[float, float, Any]] = []  # (final_score, base_sim, row)
@@ -739,6 +784,19 @@ async def retrieve_similar_hybrid(
                     }))
                 except Exception:
                     pass
+
+                # Human-readable per-entry log (one line each) for debugging
+                for i, r in enumerate(selected, 1):
+                    log.info(
+                        "RAG[%d/%d] %s %s | sim=%.2f q=%s | %s | Why: %s",
+                        i, len(selected),
+                        r.symbol or "?",
+                        r.outcome or "?",
+                        r.similarity,
+                        f"{r.quality_score:.0f}" if r.quality_score is not None else "?",
+                        f"pnl={r.pnl_pct:+.1f}%" if r.pnl_pct is not None else "",
+                        r.why_selected or "vector match",
+                    )
         except Exception:
             pass
 

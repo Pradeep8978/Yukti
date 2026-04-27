@@ -1,0 +1,167 @@
+name: CD — Build & Deploy
+
+# Runs only after the Tests workflow succeeds on main.
+# Also supports manual dispatch (e.g. to redeploy without a code push).
+on:
+  workflow_run:
+    workflows: ["Tests"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Trading mode: paper | shadow | live"
+        required: false
+        default: "paper"
+
+# ── Required repository secrets ──────────────────────────────────────────────
+#  VPS_HOST        — IP or hostname of your Ubuntu VPS
+#  VPS_USER        — SSH login user (e.g. ubuntu, root, yukti)
+#  VPS_SSH_KEY     — PEM-encoded SSH private key (matching an authorised_key on VPS)
+#  VPS_DEPLOY_DIR  — Absolute path on the VPS where docker-compose.yml lives
+#                    (e.g. /home/ubuntu/yukti)
+#  GHCR_TOKEN      — GitHub PAT with "read:packages" scope  (used by VPS to pull)
+#                    Create at: Settings → Developer settings → Personal access tokens
+#  POSTGRES_PASSWORD — passed to docker compose on the VPS
+#  GRAFANA_PASSWORD  — (optional) Grafana admin password
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+  # ── Guard: skip if triggered by a failed test run ─────────────────────────
+  guard:
+    name: Check upstream status
+    runs-on: ubuntu-latest
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+    steps:
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.workflow_run.conclusion }}" = "success" ]; then
+            echo "should_deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream Tests workflow did not succeed (conclusion: ${{ github.event.workflow_run.conclusion }}). Skipping deploy."
+            echo "should_deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Build Docker image and push to GHCR ───────────────────────────────────
+  build:
+    name: Build & push image
+    needs: guard
+    if: needs.guard.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write      # needed to push to ghcr.io
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for ARM64 cross-build)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/yukti
+          tags: |
+            type=sha,prefix=main-,format=short
+            type=raw,value=latest,enable=true
+
+      - name: Build and push (multi-arch: amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # linux/amd64 for local dev; linux/arm64 for Oracle A1 free tier
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Separate cache keys per platform to avoid cross-arch cache poisoning
+          cache-from: |
+            type=gha,scope=amd64
+            type=gha,scope=arm64
+          cache-to: |
+            type=gha,scope=amd64,mode=max
+            type=gha,scope=arm64,mode=max
+
+  # ── SSH deploy to VPS ─────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to VPS
+    needs: [guard, build]
+    if: needs.guard.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    environment: production     # add manual approval here in repo Settings → Environments
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          DEPLOY_MODE: ${{ github.event.inputs.mode || 'paper' }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          GRAFANA_PASSWORD: ${{ secrets.GRAFANA_PASSWORD }}
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          envs: GHCR_TOKEN,GITHUB_ACTOR,IMAGE_TAG,DEPLOY_MODE,POSTGRES_PASSWORD,GRAFANA_PASSWORD
+          script: |
+            set -euo pipefail
+
+            DEPLOY_DIR="${{ secrets.VPS_DEPLOY_DIR }}"
+            IMAGE="ghcr.io/${{ github.repository_owner }}/yukti:latest"
+
+            echo "[deploy] logging in to GHCR..."
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+            echo "[deploy] pulling image ${IMAGE} (tag: ${IMAGE_TAG})..."
+            docker pull "$IMAGE"
+
+            echo "[deploy] restarting service in $DEPLOY_DIR..."
+            cd "$DEPLOY_DIR"
+
+            # Export env vars for docker compose interpolation
+            export POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
+            export GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-admin}"
+            export MODE="$DEPLOY_MODE"
+
+            # Rolling restart: only restart the yukti container; leave DB/Redis up
+            docker compose pull yukti
+            docker compose up -d --no-deps --force-recreate yukti
+
+            echo "[deploy] cleaning up old images..."
+            docker image prune -f
+
+            echo "[deploy] done. Container status:"
+            docker compose ps yukti
+
+      - name: Notify success
+        if: success()
+        run: |
+          echo "Deployed yukti (mode=${{ github.event.inputs.mode || 'paper' }}, sha=${{ github.sha }}) successfully."
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "::error::Deploy failed for sha=${{ github.sha }}. Check SSH logs above."
