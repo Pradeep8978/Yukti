@@ -63,6 +63,15 @@ async def job_morning_prep() -> None:
     log.info("=== morning prep ===")
     from yukti.execution.reconcile import reconcile_positions
     await reconcile_positions()
+    if not is_trading_day():
+        return
+    from yukti.telegram.bot import alert
+    now = datetime.now(KOLKATA)
+    await alert(
+        f"🌅 *Yukti Morning Check-in*\n"
+        f"Pre-market prep complete for {now:%Y-%m-%d}.\n"
+        "Market opens at *09:15 IST*."
+    )
 
 
 async def job_eod_squareoff() -> None:

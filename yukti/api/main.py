@@ -158,18 +158,6 @@ def create_app() -> FastAPI:
         Messages are JSON with type "state_update".
         Flutter can also send {"type": "halt"} to trigger kill switch.
         """
-        # Optional authentication for control messages. If `control_api_key` is set,
-        # require a Bearer token in the WebSocket request headers.
-        auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
-        if getattr(settings, "control_api_key", ""):
-            if not auth_header or not isinstance(auth_header, str) or not auth_header.lower().startswith("bearer "):
-                await websocket.close(code=1008)
-                return
-            token = auth_header.split(" ", 1)[1]
-            if token != settings.control_api_key:
-                await websocket.close(code=1008)
-                return
-
         await manager.connect(websocket)
         # Per-connection rate-limiting / backpressure state
         setattr(websocket, "_last_msg_ts", 0.0)
@@ -202,6 +190,9 @@ def create_app() -> FastAPI:
 
                 msg_type = msg.get("type")
                 if msg_type == "halt":
+                    if getattr(settings, "control_api_key", "") and msg.get("token") != settings.control_api_key:
+                        await websocket.send_json({"type": "error", "error": "unauthorized"})
+                        continue
                     from yukti.data.state import set_halt
                     await set_halt(True)
                     # Audit log for WS-initiated halt
@@ -227,6 +218,9 @@ def create_app() -> FastAPI:
                         pass
                     await websocket.send_json({"type": "ack", "halted": True})
                 elif msg_type == "resume":
+                    if getattr(settings, "control_api_key", "") and msg.get("token") != settings.control_api_key:
+                        await websocket.send_json({"type": "error", "error": "unauthorized"})
+                        continue
                     from yukti.data.state import set_halt
                     await set_halt(False)
                     # Audit log for WS-initiated resume

@@ -5,7 +5,8 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { Perf, Position } from "../lib/api";
 
-const WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${window.location.host}/ws/live`;
+const WS_PROTOCOL = window.location.protocol === "https:" ? "wss:" : "ws:";
+const WS_URL = import.meta.env.VITE_WS_URL ?? `${WS_PROTOCOL}//${window.location.host}/ws/live`;
 
 export interface LiveState {
   halted:    boolean;

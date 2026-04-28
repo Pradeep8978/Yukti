@@ -6,8 +6,11 @@ services:
       - yukti
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./deploy/nginx/yukti.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/nginx/certbot:/var/www/certbot:ro
+      - ./deploy/nginx/letsencrypt:/etc/letsencrypt:ro
 
   redis:
     image: redis:7-alpine
