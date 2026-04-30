@@ -233,7 +233,19 @@ class MarketScanService:
                 )
 
                 decision = await arjun.safe_decide(context)
-                log.info("MarketScanService: AI decision for %s: %s (conviction %d)", symbol, decision.action, decision.conviction)
+                reasoning_excerpt = " ".join((decision.reasoning or "").split())
+                if len(reasoning_excerpt) > 240:
+                    reasoning_excerpt = reasoning_excerpt[:237] + "..."
+                log.info(
+                    "MarketScanService: AI decision for %s: %s dir=%s conviction=%d bias=%s skip_reason=%s reasoning=%s",
+                    symbol,
+                    decision.action,
+                    decision.direction or "-",
+                    decision.conviction,
+                    decision.market_bias,
+                    decision.skip_reason or "-",
+                    reasoning_excerpt or "-",
+                )
 
                 if decision.action == "SKIP":
                     record_skip(decision.skip_reason or "claude_skip")

@@ -6,6 +6,7 @@ Handles retries, rate limiting, and maps to DhanHQ constants.
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 import logging
 import time
 import uuid
@@ -250,7 +251,17 @@ class DhanClient:
             log.info("DhanClient: No data for %s, trying yfinance fallback...", symbol)
             try:
                 s_int = str(interval)
-                yf_interval = f"{s_int}m" if s_int.isdigit() else "1d" if s_int == "1" else "5m"
+                yf_interval = "5m"
+                if s_int.isdigit():
+                    yf_interval = f"{s_int}m"
+                    if s_int == "1" and from_date and to_date:
+                        try:
+                            from_day = date.fromisoformat(str(from_date))
+                            to_day = date.fromisoformat(str(to_date))
+                            if (to_day - from_day).days > 8:
+                                yf_interval = "1d"
+                        except ValueError:
+                            log.debug("DhanClient: could not parse candle date range %s -> %s", from_date, to_date)
                 ticker_sym = f"{symbol}.NS" if security_id != "13" else "^NSEI"
                 
                 # yfinance uses start/end dates

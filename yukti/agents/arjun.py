@@ -235,6 +235,24 @@ class BaseProvider(ABC):
         except IndexError:
             return "UNKNOWN"
 
+    @staticmethod
+    def _validate(data: dict, provider: str, symbol: str = "UNKNOWN") -> TradeDecision:
+        """Normalize provider output and validate it against the trade schema."""
+        if not isinstance(data, dict):
+            raise ValueError(f"Schema validation failed ({provider}): response was not a JSON object")
+
+        normalized = dict(data)
+        normalized.setdefault("symbol", symbol or "UNKNOWN")
+
+        for field_name in ("direction", "setup_type", "skip_reason"):
+            if normalized.get(field_name) == "null":
+                normalized[field_name] = None
+
+        try:
+            return TradeDecision(**normalized)
+        except Exception as exc:
+            raise ValueError(f"Schema validation failed ({provider}): {exc}") from exc
+
 
 # ═══════════════════════════════════════════════════════════════
 #  MOCK PROVIDER (for testing without API keys)

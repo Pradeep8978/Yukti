@@ -10,6 +10,8 @@ from typing import Optional
 from decimal import Decimal, ROUND_HALF_UP
 
 from yukti.agents.arjun import TradeDecision
+from yukti.config import settings
+from yukti.data.state import is_on_cooldown
 
 log = logging.getLogger(__name__)
 
@@ -223,8 +225,9 @@ async def run_gates(
         trade_decision.conviction,
         portfolio.account_value,
     )
-    if position.capital_pct > settings.max_per_trade_risk_pct:
-        return GateResult(False, f"position_size_too_large: {position.capital_pct:.2f}% > {settings.max_per_trade_risk_pct:.2f}%")
+    max_capital_pct = Decimal(str(settings.max_per_trade_risk_pct)) * Decimal("100")
+    if position.capital_pct > max_capital_pct:
+        return GateResult(False, f"position_size_too_large: {position.capital_pct:.2f}% > {max_capital_pct:.2f}%")
 
     # 7. No market halt / circuit breaker conditions
     if await is_market_halted():
