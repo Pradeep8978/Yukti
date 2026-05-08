@@ -62,6 +62,9 @@ async def job_morning_prep() -> None:
 
 
 async def job_eod_squareoff() -> None:
+    if not is_trading_day():
+        log.info("EOD squareoff skipped: non-trading day")
+        return
     log.info("=== EOD squareoff ===")
     from yukti.data.state import get_all_positions
     from yukti.execution.broker_factory import get_broker
@@ -153,6 +156,9 @@ async def job_learning_loop() -> None:
 
 
 async def job_daily_report() -> None:
+    if not is_trading_day():
+        log.info("Daily report skipped: non-trading day")
+        return
     from yukti.data.state import get_performance_state
     from yukti.telegram.bot import alert
     perf = await get_performance_state()
@@ -184,6 +190,9 @@ async def job_meta_lessons() -> None:
 
 async def job_universe_scan() -> None:
     """Pre-market universe scan at 08:45 IST."""
+    if not is_trading_day():
+        log.info("Universe scan skipped: non-trading day")
+        return
     log.info("=== universe scan (primary) ===")
     from yukti.services.universe_scanner_service import UniverseScannerService
     scanner = UniverseScannerService()
@@ -303,6 +312,12 @@ async def job_premarket_rank() -> None:
 
 async def job_universe_refresh() -> None:
     """Intraday universe refresh — add new movers, never remove."""
+    if not is_trading_day():
+        log.info("Universe refresh skipped: non-trading day")
+        return
+    if not is_trading_hours():
+        log.info("Universe refresh skipped: outside market hours")
+        return
     log.info("=== universe refresh ===")
     from yukti.services.universe_scanner_service import UniverseScannerService
     scanner = UniverseScannerService()
