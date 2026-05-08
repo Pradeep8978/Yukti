@@ -111,11 +111,22 @@ async def open_trade(
     except Exception as exc:
         await mark_abandoned(intent_id, f"entry_order_failed: {exc}")
         log.error("Entry order failed for %s (intent #%d): %s", symbol, intent_id, exc)
+        try:
+            from yukti.telegram.bot import alert_order_failed
+            await alert_order_failed(symbol, entry_side, str(exc))
+        except Exception:
+            pass
         return None
     # Defensive handling: some Dhan responses use an envelope {status: 'ERROR', message: ...}
     if isinstance(order_resp, dict) and str(order_resp.get("status", "")).upper() == "ERROR":
-        await mark_abandoned(intent_id, f"entry_order_api_error: {order_resp.get('message', order_resp)}")
+        err_msg = order_resp.get("message", str(order_resp))
+        await mark_abandoned(intent_id, f"entry_order_api_error: {err_msg}")
         log.error("Entry order API returned error for %s: %s", symbol, order_resp)
+        try:
+            from yukti.telegram.bot import alert_order_failed
+            await alert_order_failed(symbol, entry_side, err_msg)
+        except Exception:
+            pass
         return None
 
     order_id = None

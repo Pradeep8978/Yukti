@@ -88,6 +88,11 @@ async def job_eod_squareoff() -> None:
             log.info("EOD closed %s", symbol)
         except Exception as exc:
             log.error("EOD squareoff failed %s: %s", symbol, exc)
+            try:
+                from yukti.telegram.bot import alert_eod_squareoff_failed
+                await alert_eod_squareoff_failed(symbol, str(exc))
+            except Exception:
+                pass
 
 
 async def job_daily_reset() -> None:
@@ -186,6 +191,11 @@ async def job_meta_lessons() -> None:
         log.info("Meta-lessons done: %d lessons written", len(payload.get("lessons", [])))
     except Exception as exc:
         log.error("Meta-lessons job failed: %s", exc)
+        try:
+            from yukti.telegram.bot import alert_job_failed
+            await alert_job_failed("meta_lessons", str(exc))
+        except Exception:
+            pass
 
 
 async def job_universe_scan() -> None:
@@ -212,6 +222,11 @@ async def job_exclusions_refresh() -> None:
                  len(excl.fno_ban), len(excl.asm), len(excl.gsm))
     except Exception as exc:
         log.error("Exclusions refresh failed: %s", exc)
+        try:
+            from yukti.telegram.bot import alert_job_failed
+            await alert_job_failed("exclusions_refresh", str(exc))
+        except Exception:
+            pass
 
 
 async def job_catalyst_refresh() -> None:
@@ -226,6 +241,11 @@ async def job_catalyst_refresh() -> None:
         log.info("Catalysts: %s", summary)
     except Exception as exc:
         log.error("Catalyst refresh failed: %s", exc)
+        try:
+            from yukti.telegram.bot import alert_job_failed
+            await alert_job_failed("catalyst_refresh", str(exc))
+        except Exception:
+            pass
 
 
 async def job_premarket_pool_build() -> None:
@@ -251,6 +271,11 @@ async def job_premarket_pool_build() -> None:
             log.warning("Candidate pool build returned empty — keeping previous Redis snapshot")
     except Exception as exc:
         log.error("Premarket pool build failed: %s", exc)
+        try:
+            from yukti.telegram.bot import alert_job_failed
+            await alert_job_failed("premarket_pool_build", str(exc))
+        except Exception:
+            pass
 
 
 async def job_premarket_rank() -> None:
@@ -308,6 +333,11 @@ async def job_premarket_rank() -> None:
             log.debug("at-circuit annotation skipped: %s", exc)
     except Exception as exc:
         log.error("Premarket rank failed: %s", exc)
+        try:
+            from yukti.telegram.bot import alert_job_failed
+            await alert_job_failed("premarket_rank", str(exc))
+        except Exception:
+            pass
 
 
 async def job_universe_refresh() -> None:

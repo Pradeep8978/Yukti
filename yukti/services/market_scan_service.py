@@ -126,11 +126,22 @@ class MarketScanService:
                         log.error("MarketScanService: scan failed for %s: %s", sym, result, exc_info=result)
                 if failed_scans > 0:
                     log.warning("MarketScanService: cycle completed with %d/%d failed scans", failed_scans, len(cycle_universe))
+                    if len(cycle_universe) > 0 and failed_scans / len(cycle_universe) >= 0.3:
+                        try:
+                            from yukti.telegram.bot import alert_scan_error
+                            await alert_scan_error("High scan failure rate", failed_scans, len(cycle_universe))
+                        except Exception:
+                            pass
 
                 heartbeat()
 
             except Exception as exc:
                 log.error("MarketScanService: cycle error: %s", exc)
+                try:
+                    from yukti.telegram.bot import alert_scan_error
+                    await alert_scan_error(str(exc))
+                except Exception:
+                    pass
 
             elapsed = asyncio.get_event_loop().time() - cycle_start
             await asyncio.sleep(max(5, self.interval_secs - elapsed))
