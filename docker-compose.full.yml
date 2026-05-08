@@ -31,7 +31,7 @@ services:
       - ./deploy/init-pgvector.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   yukti:
-    image: yukti:latest
+    image: ${YUKTI_IMAGE:-yukti:latest}
     restart: unless-stopped
     depends_on:
       - redis

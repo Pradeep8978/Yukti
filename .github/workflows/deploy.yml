@@ -1,7 +1,8 @@
 name: CD — Build & Deploy
 
-# Runs only after the Tests workflow succeeds on main.
-# Also supports manual dispatch (e.g. to redeploy without a code push).
+# Runs after PRs are merged to main: the Tests workflow runs on the merge commit,
+# and this workflow deploys only when that test run succeeds. Manual dispatch is
+# also supported (e.g. to redeploy without a code push).
 on:
   workflow_run:
     workflows: ["Tests"]
@@ -15,6 +16,8 @@ on:
         default: "paper"
 
 # ── Required repository secrets ──────────────────────────────────────────────
+#  Deploy target is not hard-coded. A merge deploys to the VPS described by
+#  these production environment/repository secrets:
 #  VPS_HOST        — IP or hostname of your Ubuntu VPS
 #  VPS_USER        — SSH login user (e.g. ubuntu, root, yukti)
 #  VPS_SSH_KEY     — PEM-encoded SSH private key (matching an authorised_key on VPS)
@@ -25,6 +28,10 @@ on:
 #  POSTGRES_PASSWORD — passed to docker compose on the VPS
 #  GRAFANA_PASSWORD  — (optional) Grafana admin password
 # ─────────────────────────────────────────────────────────────────────────────
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
 
 jobs:
   # ── Guard: skip if triggered by a failed test run ─────────────────────────
@@ -56,7 +63,7 @@ jobs:
       packages: write      # needed to push to ghcr.io
 
     outputs:
-      image_tag: ${{ steps.meta.outputs.version }}
+      image_tag: ${{ steps.image_tag.outputs.value }}
 
     steps:
       - name: Checkout
@@ -72,6 +79,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set immutable image tag
+        id: image_tag
+        run: echo "value=main-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -86,7 +97,7 @@ jobs:
         with:
           context: .
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -101,6 +112,28 @@ jobs:
     environment: production     # add manual approval here in repo Settings → Environments
 
     steps:
+      - name: Validate deployment target secrets
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_DEPLOY_DIR: ${{ secrets.VPS_DEPLOY_DIR }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in VPS_HOST VPS_USER VPS_SSH_KEY VPS_DEPLOY_DIR GHCR_TOKEN POSTGRES_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Required deploy secret $name is not set. This merge cannot deploy until production target secrets are configured."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Deploy target secrets are configured. The exact host and path come from VPS_HOST and VPS_DEPLOY_DIR."
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         env:
@@ -119,31 +152,38 @@ jobs:
             set -euo pipefail
 
             DEPLOY_DIR="${{ secrets.VPS_DEPLOY_DIR }}"
-            IMAGE="ghcr.io/${{ github.repository_owner }}/yukti:latest"
+            IMAGE="ghcr.io/${{ github.repository_owner }}/yukti:${IMAGE_TAG}"
 
             echo "[deploy] logging in to GHCR..."
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-            echo "[deploy] pulling image ${IMAGE} (tag: ${IMAGE_TAG})..."
+            echo "[deploy] pulling image ${IMAGE}..."
             docker pull "$IMAGE"
 
-            echo "[deploy] restarting service in $DEPLOY_DIR..."
+            echo "[deploy] preparing deploy directory $DEPLOY_DIR..."
             cd "$DEPLOY_DIR"
+            if [ -d .git ]; then
+              git fetch --prune origin main
+              git reset --hard origin/main
+            fi
 
             # Export env vars for docker compose interpolation
             export POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
             export GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-admin}"
             export MODE="$DEPLOY_MODE"
+            export YUKTI_IMAGE="$IMAGE"
+
+            COMPOSE="docker compose -f docker-compose.yml -f docker-compose.deploy.yml"
 
             # Rolling restart: only restart the yukti container; leave DB/Redis up
-            docker compose pull yukti
-            docker compose up -d --no-deps --force-recreate yukti
+            $COMPOSE pull yukti
+            $COMPOSE up -d --no-deps --force-recreate yukti
 
             echo "[deploy] cleaning up old images..."
             docker image prune -f
 
             echo "[deploy] done. Container status:"
-            docker compose ps yukti
+            $COMPOSE ps yukti
 
       - name: Notify success
         if: success()

@@ -176,10 +176,12 @@ git commit -m "chore: trigger first deploy"
 git push origin main
 ```
 
+GitHub Actions will deploy to the server identified by your Actions secrets: `VPS_HOST` is the Oracle instance public IP/hostname, `VPS_USER` is usually `ubuntu`, and `VPS_DEPLOY_DIR` is usually `/home/ubuntu/yukti`. If those secrets are missing, the deploy job stops before SSH and nothing is deployed.
+
 GitHub Actions will:
-1. Run unit tests (`test.yml`)
-2. Build a multi-arch Docker image (AMD64 + ARM64) and push to `ghcr.io`
-3. SSH into the Oracle instance, pull the new image, and restart the `yukti` container
+1. Run unit tests (`test.yml`) on the merge commit in `main`
+2. Build a multi-arch Docker image (AMD64 + ARM64) and push it to `ghcr.io`
+3. SSH into the Oracle instance from `VPS_HOST`, export `YUKTI_IMAGE` with that exact image tag, pull it with Docker Compose, and restart only the `yukti` container in `VPS_DEPLOY_DIR`
 
 Watch progress at: `https://github.com/<you>/yukti/actions`
 
@@ -246,8 +248,9 @@ docker compose restart yukti
 ```bash
 cd ~/yukti
 git pull
-docker compose pull yukti
-docker compose up -d --no-deps --force-recreate yukti
+export YUKTI_IMAGE=ghcr.io/<your-github-username>/yukti:latest
+docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull yukti
+docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --no-deps --force-recreate yukti
 ```
 
 ### Prometheus + Grafana (metrics)
