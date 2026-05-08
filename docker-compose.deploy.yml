@@ -1,0 +1,7 @@
+# Production override used by GitHub Actions CD.
+# Keep docker-compose.yml friendly for local builds, but let deploys pull the
+# exact GHCR image built by the workflow instead of rebuilding on the server.
+services:
+  yukti:
+    image: ${YUKTI_IMAGE:?Set YUKTI_IMAGE to the GHCR image tag to deploy}
+    pull_policy: always

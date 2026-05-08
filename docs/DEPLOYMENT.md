@@ -224,6 +224,25 @@ Or via Telegram (if bot is configured):
 /pnl
 ```
 
+### Automatic deployment after PR merge
+
+Yukti includes a GitHub Actions CD workflow at `.github/workflows/deploy.yml`. When a pull request is merged into `main`, the `Tests` workflow runs on the merge commit. If that test run succeeds, the CD workflow builds the Docker image, pushes it to GitHub Container Registry, SSHes into the server, pulls that exact image tag, and recreates only the `yukti` container while leaving PostgreSQL and Redis running.
+
+**Where does it deploy?** There is no hard-coded server in the repository. A merge deploys to the machine configured in GitHub Actions secrets: `VPS_HOST` is the destination host/IP, `VPS_USER` is the SSH user, and `VPS_DEPLOY_DIR` is the directory on that host where Docker Compose is run. If those secrets are not set, the deploy job fails before SSH and nothing is deployed.
+
+One-time setup:
+
+1. Bootstrap or prepare a VM with Docker and a cloned copy of this repository.
+2. Add these GitHub Actions repository or `production` environment secrets: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_DEPLOY_DIR`, `GHCR_TOKEN`, `POSTGRES_PASSWORD`, and optionally `GRAFANA_PASSWORD`.
+3. Ensure the server deploy directory has both `docker-compose.yml` and `docker-compose.deploy.yml`. The deploy workflow exports `YUKTI_IMAGE=ghcr.io/<owner>/yukti:<merge-sha-tag>` and runs:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull yukti
+docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --no-deps --force-recreate yukti
+```
+
+Manual updates are still possible when you need them:
+
 ### Update code from GitHub
 
 ```bash
