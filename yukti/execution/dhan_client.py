@@ -6,6 +6,8 @@ Handles retries, rate limiting, and maps to DhanHQ constants.
 from __future__ import annotations
 
 import asyncio
+import os
+import requests
 from datetime import date
 import logging
 import time
@@ -65,29 +67,140 @@ class DhanClient:
     """
 
     def __init__(self) -> None:
-        if settings.dhan_use_sandbox:
-            cid = settings.dhan_sandbox_client_id
-            tok = settings.dhan_sandbox_access_token
+        # Resolve environment (sandbox overrides production when enabled)
+        cid = settings.dhan_client_id
+        base = settings.dhan_base_url
+        use_sandbox = settings.dhan_use_sandbox
+
+        if use_sandbox:
+            cid = settings.dhan_sandbox_client_id or cid
             base = settings.dhan_sandbox_base_url
             log.info("DhanClient: Using SANDBOX environment")
-        else:
-            cid = settings.dhan_client_id
-            tok = settings.dhan_access_token
-            base = settings.dhan_base_url
-            log.info("DhanClient: Using PRODUCTION environment")
 
-        ctx = DhanContext(client_id=cid, access_token=tok)
-        if base:
-            ctx.dhan_http.base_url = base.rstrip("/")
+        # Gather credentials (use sandbox access token when sandbox enabled)
+        access_token = settings.dhan_sandbox_access_token if use_sandbox else settings.dhan_access_token
+
+        # Prefer using an access token (only supported auth method in current flow)
+        ctx = None
+        self._cid = cid
+        self._base = base.rstrip('/')
+        self._access_token = access_token
+        self._auth_method = None
+
+        if access_token:
+            try:
+                ctx = DhanContext(client_id=cid, access_token=access_token)
+                self._auth_method = 'access_token'
+                log.info("DhanClient: using access_token auth")
+            except TypeError:
+                log.debug("DhanContext(access_token) unsupported; attempting context without token")
+
+        if ctx is None:
+            # Try to create a context without an access token; calls will surface auth errors.
+            try:
+                ctx = DhanContext(client_id=cid)
+                self._auth_method = 'none'
+                log.warning("DhanClient: no access token configured; API calls may fail")
+            except Exception:
+                log.exception("DhanClient: failed to initialize DhanContext without token")
+
+        if hasattr(ctx, 'dhan_http') and base:
+            ctx.dhan_http.base_url = base.rstrip('/')
             if "sandbox" in ctx.dhan_http.base_url and not ctx.dhan_http.base_url.endswith("/v2"):
-                 ctx.dhan_http.base_url += "/v2"
+                ctx.dhan_http.base_url += "/v2"
+
         self._dhan = dhanhq(ctx)
         self._loop = asyncio.get_event_loop()
 
+    def _renew_access_token_sync(self) -> str | None:
+        """Synchronous renew token call using the Dhan RenewToken endpoint.
+
+        Returns the new access token string on success, otherwise None.
+        """
+        try:
+            if not self._access_token:
+                log.debug("DhanClient: no access token present to renew")
+                return None
+            url = self._base + '/RenewToken'
+            headers = {
+                'access-token': str(self._access_token),
+                'dhanClientId': str(self._cid),
+            }
+            r = requests.get(url, headers=headers, timeout=10)
+            try:
+                data = r.json()
+            except Exception:
+                log.warning("DhanClient: RenewToken non-json response: %s", r.text[:200])
+                return None
+            if r.status_code == 200:
+                # New token typically in 'accessToken' key
+                new_token = data.get('accessToken') or data.get('access_token') or data.get('AccessToken')
+                if new_token:
+                    return new_token
+                # Some responses may nest the token
+                if isinstance(data.get('data'), dict):
+                    return data['data'].get('accessToken') or data['data'].get('access_token')
+            else:
+                log.warning("DhanClient: RenewToken failed status=%s body=%s", r.status_code, r.text[:400])
+        except Exception as exc:
+            log.exception("DhanClient: RenewToken request failed: %s", exc)
+        return None
+
+    async def _renew_access_token(self) -> bool:
+        """Async wrapper to renew the access token and reinitialize the client if successful."""
+        new_token = await self._loop.run_in_executor(None, self._renew_access_token_sync)
+        if not new_token:
+            return False
+        # Update runtime settings and recreate underlying client
+        try:
+            import os as _os
+            _os.environ['DHAN_ACCESS_TOKEN'] = new_token
+        except Exception:
+            pass
+        try:
+            settings.dhan_access_token = new_token
+        except Exception:
+            pass
+        self._access_token = new_token
+        # Recreate context + client using new token
+        try:
+            ctx = DhanContext(client_id=self._cid, access_token=new_token)
+            if hasattr(ctx, 'dhan_http') and self._base:
+                ctx.dhan_http.base_url = self._base
+            self._dhan = dhanhq(ctx)
+            log.info("DhanClient: access token renewed and client reinitialized")
+            return True
+        except Exception as exc:
+            log.exception("DhanClient: failed to reinitialize client after token renewal: %s", exc)
+            return False
+
     async def _call(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:
-        """Run a synchronous SDK call in the thread pool + rate limiter."""
+        """Run a synchronous SDK call in the thread pool + rate limiter.
+
+        On authentication failures, attempt to renew the access token once and
+        retry the call.
+        """
         await _bucket.acquire()
-        return await self._loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+        try:
+            return await self._loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+        except Exception as exc:
+            msg = str(exc) or ""
+            # Detect likely auth errors from Dhan (HTTP 401 / DH-901 / token issues)
+            if any(token in msg for token in ("401", "DH-901", "access token is invalid", "invalid or expired")) or "Unauthorized" in msg:
+                log.info("DhanClient: detected authentication error, attempting token renew: %s", msg[:200])
+                try:
+                    renewed = await self._renew_access_token()
+                except Exception:
+                    renewed = False
+                if renewed:
+                    # Retry once after successful renewal
+                    try:
+                        return await self._loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+                    except Exception as exc2:
+                        log.warning("DhanClient: retry after token renewal failed: %s", exc2)
+                        raise
+            # Not an auth failure or renew failed — re-raise original exception
+            raise
 
     # ── Paper-mode safety guard ────────────────────────────────────────────────
 

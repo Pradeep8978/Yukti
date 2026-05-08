@@ -54,6 +54,13 @@ class ControlPlaneService:
             self.scheduler = build_scheduler()
             self.scheduler.start()
             log.info("ControlPlaneService: scheduler started")
+            # Run a quick DhanHQ API startup check in background
+            try:
+                from yukti.scheduler.jobs import job_test_dhan_api
+                asyncio.create_task(job_test_dhan_api())
+                log.info("ControlPlaneService: scheduled DhanHQ startup API check")
+            except Exception as exc:
+                log.warning("ControlPlaneService: failed to schedule DhanHQ startup check: %s", exc)
         except Exception as exc:
             log.warning("ControlPlaneService: Scheduler startup failed: %s", exc)
 

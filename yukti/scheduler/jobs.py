@@ -9,6 +9,9 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pathlib import Path
+import os
+import subprocess
 
 log = logging.getLogger(__name__)
 from yukti.config import settings
@@ -240,7 +243,123 @@ def build_scheduler() -> AsyncIOScheduler:
                       id="meta_lessons", replace_existing=True)
         log.info("Meta-lessons job scheduled at %02d:%02d IST", hh, mm)
 
+    # Schedule Dhan token renewal at 08:00 and 18:00 IST daily
+    try:
+        sched.add_job(job_renew_and_test_dhan, "cron", hour=8, minute=0, id="renew_dhan_morning", replace_existing=True)
+        sched.add_job(job_renew_and_test_dhan, "cron", hour=18, minute=0, id="renew_dhan_evening", replace_existing=True)
+        log.info("Scheduled Dhan token renewal at 08:00 and 18:00 IST daily")
+    except Exception as exc:
+        log.warning("Failed to schedule Dhan renew jobs: %s", exc)
+
     return sched
+
+
+async def job_renew_and_test_dhan() -> None:
+    """Renew the Dhan access token, persist it to .env files, and test the API.
+
+    This job renews the access token via the in-process `dhan` client, writes
+    the updated token to `.env` and `.env.deploy`, and verifies `/profile`.
+    If configured, it will attempt a best-effort restart of the `yukti` container.
+    """
+    from yukti.execution.dhan_client import dhan
+    try:
+        log.info("Dhan renew job: starting")
+        renewed = await dhan._renew_access_token()
+        new_token = getattr(dhan, "_access_token", None)
+        if not renewed and not new_token:
+            log.warning("Dhan renew job: no new token obtained")
+            return
+
+        token_to_use = new_token or settings.dhan_access_token
+        client_id = getattr(dhan, "_cid", settings.dhan_client_id)
+        base = getattr(dhan, "_base", settings.dhan_base_url).rstrip("/")
+
+        # Test profile endpoint
+        try:
+            import requests
+            profile_url = f"{base}/profile"
+            r = requests.get(profile_url, headers={"access-token": token_to_use, "dhanClientId": client_id}, timeout=10)
+            if r.status_code == 200:
+                log.info("Dhan renew job: profile OK after renew")
+            else:
+                log.warning("Dhan renew job: profile check failed status=%s body=%s", r.status_code, r.text[:200])
+        except Exception as exc:
+            log.warning("Dhan renew job: profile test failed: %s", exc)
+
+        # Persist to .env and .env.deploy in repo root
+        repo_root = Path(__file__).resolve().parents[2]
+        for fname in (".env", ".env.deploy"):
+            p = repo_root / fname
+            try:
+                lines = p.read_text(encoding="utf-8").splitlines()
+            except FileNotFoundError:
+                lines = []
+            out = []
+            replaced_token = False
+            replaced_cid = False
+            for l in lines:
+                if l.strip().startswith("DHAN_ACCESS_TOKEN="):
+                    out.append(f"DHAN_ACCESS_TOKEN={token_to_use}")
+                    replaced_token = True
+                elif l.strip().startswith("DHAN_CLIENT_ID="):
+                    out.append(f"DHAN_CLIENT_ID={settings.dhan_client_id}")
+                    replaced_cid = True
+                else:
+                    out.append(l)
+            if not replaced_token:
+                out.append(f"DHAN_ACCESS_TOKEN={token_to_use}")
+            if not replaced_cid:
+                out.append(f"DHAN_CLIENT_ID={settings.dhan_client_id}")
+            try:
+                tmp = p.with_suffix(".tmp")
+                tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+                tmp.replace(p)
+                log.info("Dhan token persisted to %s", p)
+            except Exception as exc:
+                log.error("Failed to persist Dhan token to %s: %s", p, exc)
+
+        # Optionally attempt a best-effort container restart if configured
+        if getattr(settings, "dhan_auto_restart_on_renew", False):
+            try:
+                if os.path.exists("/var/run/docker.sock"):
+                    try:
+                        out = subprocess.check_output(["sh", "-c", "docker ps -q -f name=yukti | head -n1"], stderr=subprocess.STDOUT).decode().strip()
+                        if out:
+                            subprocess.check_call(["docker", "restart", out])
+                            log.info("Restarted docker container %s after token update", out)
+                        else:
+                            log.warning("No 'yukti' container found to restart")
+                    except Exception as exc:
+                        log.warning("Container restart attempt failed: %s", exc)
+                else:
+                    log.info("Docker socket not present; skipping container restart")
+            except Exception as exc:
+                log.warning("Auto-restart after renew failed: %s", exc)
+
+        log.info("Dhan renew job: completed")
+    except Exception as exc:
+        log.exception("Dhan renew job failed: %s", exc)
+
+
+async def job_test_dhan_api() -> bool:
+    """Simple test of Dhan `/profile` endpoint using current settings token.
+
+    Returns True on 200 OK, False otherwise.
+    """
+    try:
+        import requests
+        token = settings.dhan_access_token
+        client_id = settings.dhan_client_id
+        base = settings.dhan_base_url.rstrip("/")
+        url = f"{base}/profile"
+        r = requests.get(url, headers={"access-token": token, "dhanClientId": client_id}, timeout=10)
+        if r.status_code == 200:
+            log.info("Dhan API startup check: profile OK")
+            return True
+        log.warning("Dhan API startup check: status=%s body=%s", r.status_code, r.text[:200])
+    except Exception as exc:
+        log.exception("Dhan API startup check failed: %s", exc)
+    return False
 
 
 # ── Self-learning loop: continuous ingestion, retrain, eval, promote ──────────

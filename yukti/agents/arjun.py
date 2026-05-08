@@ -335,6 +335,22 @@ class ClaudeProvider(BaseProvider):
         loop = asyncio.get_event_loop()
         t0   = time.monotonic()
 
+        # Audit: record each Gemini invocation (helps verify gating/runtime usage)
+        try:
+            _audit_symbol = self._extract_symbol(context)
+        except Exception:
+            _audit_symbol = "UNKNOWN"
+        try:
+            log.info(
+                "GeminiProvider: invoking model=%s symbol=%s time=%s",
+                self._model,
+                _audit_symbol,
+                datetime.utcnow().isoformat(),
+            )
+        except Exception:
+            # Keep provider resilient to logging failures
+            pass
+
         # Run synchronous SDK call in thread pool
         response = await loop.run_in_executor(
             None,

@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     dhan_client_id: str = ""
     dhan_access_token: str = ""
     dhan_base_url: str = "https://api.dhan.co/v2"
+    # How often (hours) to attempt RenewToken. Set to 0 to disable automatic renewal.
+    dhan_token_renew_interval_hours: int = 6
+    # If true, attempt to restart the container after persisting a renewed token.
+    # Note: restart is best-effort and may require docker socket or host automation.
+    dhan_auto_restart_on_renew: bool = False
     
     dhan_use_sandbox: bool = False
     dhan_sandbox_client_id: str = ""
