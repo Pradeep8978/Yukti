@@ -47,7 +47,7 @@ Every 5 minutes, for each symbol in the active universe:
 ```
 1. OHLCV candle arrives
         ↓
-2. Technical pre-filter (7 patterns)
+2. Technical pre-filter (9 patterns)
    — Skips ~80% of candles with no setup
    — Saves API cost
         ↓  [only if a pattern fires]
@@ -256,9 +256,8 @@ doppler run -- uv run python -m yukti
 ## Roadmap
 
 - [ ] Trailing stop to breakeven after T1 hit, partial exit at T1
-- [ ] Multi-timeframe confluence (1m + 5m + 15m)
-- [ ] Opening Range Breakout (ORB) pattern — 09:15–09:30 IST
-- [ ] Slippage tracking (fill price vs. intended entry per trade)
+- [ ] Full multi-timeframe confluence strategy (1m + 5m + 15m — daily trend filter exists, full framework pending)
+- [ ] Slippage tracking on live fills (fill price vs. intended entry, persisted per trade)
 - [ ] F&O support (futures and options)
 - [ ] Tax reporting in ITR-3 format
 - [ ] Automated weekly conviction-vs-outcomes alert
