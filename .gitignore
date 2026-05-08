@@ -77,3 +77,5 @@ doppler.json
 
 # Local GitHub Actions runner install
 actions-runner/
+
+.venv/

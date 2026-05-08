@@ -110,4 +110,14 @@ if __name__ == '__main__':
 PY
 
 echo "entrypoint: launching command: $@"
-exec "$@"
+
+# If the user invoked `python` directly (e.g. docker run ... python -m yukti ...)
+# prefix the command with `uv run` so it runs inside the uv-managed environment
+# where dependencies from pyproject.toml were installed.
+first_cmd=$(basename "$1" 2>/dev/null || echo "")
+if [ "$first_cmd" = "python" ] || [ "$first_cmd" = "python3" ]; then
+    echo "entrypoint: prefixing python command with 'uv run' to use uv virtualenv"
+    exec uv run "$@"
+else
+    exec "$@"
+fi
