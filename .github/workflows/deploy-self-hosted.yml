@@ -1,0 +1,42 @@
+name: Self-Hosted Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Trading mode: paper | shadow | live"
+        required: false
+        default: "paper"
+
+concurrency:
+  group: self-hosted-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy on self-hosted runner
+    runs-on: [self-hosted, yukti, production]
+    environment: production
+
+    steps:
+      - name: Deploy local checkout
+        env:
+          DEPLOY_MODE: ${{ github.event.inputs.mode || 'paper' }}
+        run: |
+          set -euo pipefail
+
+          cd /opt/yukti
+
+          echo "[deploy] syncing repository..."
+          git fetch --prune origin main
+          git reset --hard origin/main
+
+          echo "[deploy] starting stack..."
+          export MODE="$DEPLOY_MODE"
+          docker compose up -d --build
+
+          echo "[deploy] pruning unused images..."
+          docker image prune -f
+
+          echo "[deploy] status:"
+          docker compose ps
