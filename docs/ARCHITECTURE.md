@@ -8,7 +8,7 @@ flowchart LR
   Market[Market (NSE / BSE)] -->|Market data| Ingest[Ingestion & Feeds]
   Ingest --> Signals[Signals & Indicators]
   Signals --> PreFilter[Signal Pre-filter]
-  PreFilter --> Arjun[AI Brain (`Arjun`) — yukti/agents/arjun.py]
+  PreFilter --> Arjun[AI Brain - Arjun - yukti/agents/arjun.py]
   Arjun --> Risk[Risk Gates]
   Risk --> Execution[Execution (DhanHQ broker)]
   Execution --> Broker[DhanHQ]
