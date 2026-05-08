@@ -70,26 +70,43 @@ def build_context(
         else "(average)"
     )
 
-    # Options market section
-    if macro.nifty_atm_iv is not None:
-        if macro.nifty_atm_iv > 25:
+    # Options market section — safe for older MacroContext shapes or test mocks
+    _atm_iv   = getattr(macro, "nifty_atm_iv",      None)
+    _max_pain = getattr(macro, "nifty_max_pain",     None)
+    _pcr_lbl  = getattr(macro, "pcr_label",          "N/A")
+    _opt_sent = getattr(macro, "options_sentiment",  "NEUTRAL")
+
+    try:
+        _atm_iv = float(_atm_iv) if _atm_iv is not None else None
+    except (TypeError, ValueError):
+        _atm_iv = None
+
+    try:
+        _max_pain = float(_max_pain) if _max_pain is not None else None
+    except (TypeError, ValueError):
+        _max_pain = None
+
+    if _atm_iv is not None:
+        if _atm_iv > 25:
             iv_note = "widen stops — 2×ATR"
-        elif macro.nifty_atm_iv < 12:
+        elif _atm_iv < 12:
             iv_note = "prefer range setups"
         else:
             iv_note = "normal sizing"
-        atm_iv_str = f"{macro.nifty_atm_iv:.1f}%  ({iv_note})"
+        atm_iv_str = f"{_atm_iv:.1f}%  ({iv_note})"
     else:
         atm_iv_str = "N/A"
 
-    max_pain_str = f"₹{macro.nifty_max_pain:.0f}  ← price gravity on expiry" if macro.nifty_max_pain else "N/A"
+    max_pain_str = (
+        f"₹{_max_pain:.0f}  ← price gravity on expiry" if _max_pain else "N/A"
+    )
 
     options_section = f"""
 ╔══ OPTIONS MARKET (Nifty Weekly) ═══════════════════════════════╗
-  Put-Call Ratio   : {macro.pcr_label}
+  Put-Call Ratio   : {_pcr_lbl}
   Max Pain Level   : {max_pain_str}
   ATM IV           : {atm_iv_str}
-  Sentiment        : {macro.options_sentiment}
+  Sentiment        : {_opt_sent}
 ╚════════════════════════════════════════════════════════════════╝
 """
 

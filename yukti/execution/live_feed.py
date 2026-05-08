@@ -2,8 +2,12 @@
 yukti/execution/live_feed.py
 WebSocket live feed manager for real-time LTP ticks from DhanHQ.
 
-Runs DhanFeed in a background daemon thread; dispatches incoming ticks
-back to the asyncio event loop via asyncio.run_coroutine_threadsafe().
+Runs the DhanHQ feed in a background daemon thread; dispatches incoming
+ticks back to the asyncio event loop via asyncio.run_coroutine_threadsafe().
+
+SDK compatibility:
+  dhanhq >= 2.0  → MarketFeed(dhan_context, instruments, version='v1')
+  dhanhq  < 2.0  → DhanFeed(client_id, access_token, ...)
 
 On WebSocket disconnect the feed marks itself unavailable — the REST
 polling loop in monitor.py remains fully functional as a fallback.
@@ -30,6 +34,7 @@ class LiveFeedManager:
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._security_to_symbol: dict[str, str] = {}   # security_id → symbol
         self._subscriptions: dict[str, str] = {}         # symbol → security_id
         self._tick_handler: Callable[[str, float], Coroutine] | None = None
@@ -49,7 +54,7 @@ class LiveFeedManager:
             return
 
         self._tick_handler = tick_handler
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
 
         self._thread = threading.Thread(
             target=self._run_feed, daemon=True, name="dhan-live-feed"
@@ -59,10 +64,11 @@ class LiveFeedManager:
 
     async def subscribe(self, symbol: str, security_id: str) -> None:
         """Register a symbol for LTP ticks."""
-        if security_id in self._security_to_symbol:
-            return
-        self._subscriptions[symbol] = security_id
-        self._security_to_symbol[security_id] = symbol
+        with self._lock:
+            if security_id in self._security_to_symbol:
+                return
+            self._subscriptions[symbol] = security_id
+            self._security_to_symbol[security_id] = symbol
         log.debug("LiveFeedManager: subscribed %s (id=%s)", symbol, security_id)
 
         if self._connected and self._feed is not None:
@@ -75,10 +81,12 @@ class LiveFeedManager:
 
     async def unsubscribe(self, symbol: str) -> None:
         """Remove a symbol from LTP ticks."""
-        security_id = self._subscriptions.pop(symbol, None)
+        with self._lock:
+            security_id = self._subscriptions.pop(symbol, None)
+            if security_id:
+                self._security_to_symbol.pop(security_id, None)
         if not security_id:
             return
-        self._security_to_symbol.pop(security_id, None)
         log.debug("LiveFeedManager: unsubscribed %s", symbol)
 
         if self._connected and self._feed is not None:
@@ -95,9 +103,8 @@ class LiveFeedManager:
     # ── Internal ─────────────────────────────────────────────────
 
     def _run_feed(self) -> None:
-        """Blocking run in daemon thread — creates DhanFeed and calls run_forever()."""
+        """Blocking run in daemon thread — creates the feed and calls run_forever()."""
         try:
-            from dhanhq import DhanFeed
             from yukti.config import settings
             from yukti.execution.broker_factory import get_broker
 
@@ -111,7 +118,59 @@ class LiveFeedManager:
                 log.warning("LiveFeedManager: missing client_id/access_token — feed disabled")
                 return
 
-            self._feed = DhanFeed(
+            # Build pre-subscription instrument list (locked snapshot)
+            with self._lock:
+                pre_instruments = [
+                    {"ExchangeSegment": "NSE_EQ", "SecurityId": sid}
+                    for sid in self._subscriptions.values()
+                ]
+
+            self._feed = self._create_feed(dhan_client, client_id, access_token, pre_instruments)
+            if self._feed is None:
+                return
+
+            self._connected = True
+            log.info("LiveFeedManager: WebSocket connected (LTP mode)")
+            self._feed.run_forever()   # blocks until WebSocket closes
+
+        except Exception as exc:
+            log.warning("LiveFeedManager: feed thread error: %s", exc)
+        finally:
+            self._connected = False
+
+    def _create_feed(
+        self,
+        dhan_client: Any,
+        client_id: str,
+        access_token: str,
+        pre_instruments: list[dict],
+    ) -> Any:
+        """Try MarketFeed (dhanhq>=2.0) then DhanFeed (<2.0). Returns feed or None."""
+        # dhanhq >= 2.0: MarketFeed(dhan_context, instruments, version)
+        try:
+            from dhanhq import MarketFeed  # type: ignore[attr-defined]
+
+            instruments = [(i["ExchangeSegment"], i["SecurityId"], MarketFeed.LTP)
+                           for i in pre_instruments] if pre_instruments else []
+
+            feed = MarketFeed(
+                dhan_client,
+                instruments,
+                version = "v1",
+            )
+            feed.on_message = self._on_message
+            feed.on_close   = self._on_close
+            feed.on_error   = self._on_error
+            log.info("LiveFeedManager: using MarketFeed (dhanhq>=2.0)")
+            return feed
+        except (ImportError, AttributeError, TypeError):
+            pass
+
+        # dhanhq < 2.0: DhanFeed(client_id, access_token, ...)
+        try:
+            from dhanhq import DhanFeed  # type: ignore[attr-defined]
+
+            feed = DhanFeed(
                 client_id         = client_id,
                 access_token      = access_token,
                 subscription_code = DhanFeed.LTP,
@@ -119,29 +178,18 @@ class LiveFeedManager:
                 on_close          = self._on_close,
                 on_error          = self._on_error,
             )
-            self._connected = True
-            log.info("LiveFeedManager: WebSocket connected (LTP mode)")
-
-            # Subscribe any symbols registered before connection
-            if self._subscriptions:
+            if pre_instruments:
                 try:
-                    instruments = [
-                        {"ExchangeSegment": "NSE_EQ", "SecurityId": sid}
-                        for sid in self._subscriptions.values()
-                    ]
-                    self._feed.subscribe_symbols(instruments)
-                    log.info("LiveFeedManager: pre-subscribed %d symbols", len(instruments))
+                    feed.subscribe_symbols(pre_instruments)
                 except Exception as exc:
                     log.debug("LiveFeedManager: pre-connect subscription failed: %s", exc)
+            log.info("LiveFeedManager: using DhanFeed (dhanhq<2.0)")
+            return feed
+        except (ImportError, AttributeError, TypeError):
+            pass
 
-            self._feed.run_forever()   # blocks until WebSocket closes
-
-        except ImportError:
-            log.warning("LiveFeedManager: dhanhq package missing — WebSocket feed disabled")
-        except Exception as exc:
-            log.warning("LiveFeedManager: feed thread error: %s", exc)
-        finally:
-            self._connected = False
+        log.warning("LiveFeedManager: dhanhq package missing or unsupported version — feed disabled")
+        return None
 
     def _on_message(self, data: dict) -> None:
         """Dispatch incoming tick to asyncio tick handler."""
@@ -161,7 +209,8 @@ class LiveFeedManager:
             if not security_id or ltp <= 0:
                 return
 
-            symbol = self._security_to_symbol.get(security_id)
+            with self._lock:
+                symbol = self._security_to_symbol.get(security_id)
             if not symbol:
                 return
 

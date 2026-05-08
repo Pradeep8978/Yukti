@@ -502,7 +502,7 @@ class DhanClient:
         if fn is None:
             log.warning("DhanClient: option_chain not available in installed SDK")
             return {}
-        return await self._call(fn, under_security_id, under_exchange_segment, expiry, 0)
+        return await self._call(fn, under_security_id, under_exchange_segment, expiry)
 
     async def get_market_depth(self, security_id: str) -> dict[str, Any]:
         """

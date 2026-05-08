@@ -287,7 +287,7 @@ class MarketScanService:
                 # ── Liquidity gate: skip illiquid symbols before AI call ───
                 # Fail-open: depth API errors never block a trade.
                 try:
-                    depth = await get_broker().get_market_depth(security_id)
+                    depth = await broker.get_market_depth(security_id)
                     if depth:
                         if depth.get("spread_pct", 0) > 0.15:
                             record_skip("illiquid_spread")

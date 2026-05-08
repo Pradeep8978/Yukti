@@ -28,6 +28,8 @@ log = logging.getLogger(__name__)
 
 # Symbols currently subscribed to the live WebSocket feed
 _feed_subscribed: set[str] = set()
+# Guard against concurrent close from tick handler + REST loop
+_closing_symbols: set[str] = set()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -40,6 +42,8 @@ async def _on_tick(symbol: str, ltp: float) -> None:
     Called from the daemon feed thread via run_coroutine_threadsafe.
     Duplicate-safe: get_position returns None after close_trade removes the position.
     """
+    if symbol in _closing_symbols:
+        return
     try:
         r = await get_redis()
         raw = await r.get(f"yukti:positions:{symbol}")
@@ -64,7 +68,11 @@ async def _on_tick(symbol: str, ltp: float) -> None:
         if is_long:
             if ltp <= active_sl:
                 log.info("WS tick: SL hit for %s @ ₹%.2f (ltp=%.2f)", symbol, active_sl, ltp)
-                await close_trade(symbol, ltp, "stop_loss_hit")
+                _closing_symbols.add(symbol)
+                try:
+                    await close_trade(symbol, ltp, "stop_loss_hit")
+                finally:
+                    _closing_symbols.discard(symbol)
                 closed = True
             elif target_1 and ltp >= target_1:
                 if not partial_done:
@@ -72,12 +80,20 @@ async def _on_tick(symbol: str, ltp: float) -> None:
                     await _partial_exit_t1(symbol, pos, ltp)
                 else:
                     log.info("WS tick: T2 hit for %s @ ₹%.2f", symbol, ltp)
-                    await close_trade(symbol, ltp, "target_2_hit")
+                    _closing_symbols.add(symbol)
+                    try:
+                        await close_trade(symbol, ltp, "target_2_hit")
+                    finally:
+                        _closing_symbols.discard(symbol)
                     closed = True
         else:
             if ltp >= active_sl:
                 log.info("WS tick: SL hit (short) for %s @ ₹%.2f (ltp=%.2f)", symbol, active_sl, ltp)
-                await close_trade(symbol, ltp, "stop_loss_hit")
+                _closing_symbols.add(symbol)
+                try:
+                    await close_trade(symbol, ltp, "stop_loss_hit")
+                finally:
+                    _closing_symbols.discard(symbol)
                 closed = True
             elif target_1 and ltp <= target_1:
                 if not partial_done:
@@ -85,7 +101,11 @@ async def _on_tick(symbol: str, ltp: float) -> None:
                     await _partial_exit_t1(symbol, pos, ltp)
                 else:
                     log.info("WS tick: T2 hit (short) for %s @ ₹%.2f", symbol, ltp)
-                    await close_trade(symbol, ltp, "target_2_hit")
+                    _closing_symbols.add(symbol)
+                    try:
+                        await close_trade(symbol, ltp, "target_2_hit")
+                    finally:
+                        _closing_symbols.discard(symbol)
                     closed = True
 
         if closed:
@@ -195,30 +215,49 @@ async def monitor_positions(poll_interval: int = 10) -> None:
                 else (fill_price > 0 and stop_loss <= fill_price)
             )
 
+            if symbol in _closing_symbols:
+                continue  # tick handler already closing this symbol
+
             if is_long:
                 if last_low <= active_sl:
                     log.info("SL hit for %s @ ₹%.2f (trailing_sl=%.2f)", symbol, active_sl, active_sl)
-                    await close_trade(symbol, active_sl, "stop_loss_hit")
+                    _closing_symbols.add(symbol)
+                    try:
+                        await close_trade(symbol, active_sl, "stop_loss_hit")
+                    finally:
+                        _closing_symbols.discard(symbol)
                 elif target_1 and last_high >= target_1:
                     if not partial_done:
                         log.info("T1 hit for %s @ ₹%.2f — partial exit", symbol, last_high)
                         await _partial_exit_t1(symbol, pos, target_1)
                     else:
                         log.info("T2 hit for %s @ ₹%.2f", symbol, last_high)
-                        await close_trade(symbol, target_1, "target_2_hit")
+                        _closing_symbols.add(symbol)
+                        try:
+                            await close_trade(symbol, target_1, "target_2_hit")
+                        finally:
+                            _closing_symbols.discard(symbol)
                 elif partial_done:
                     await _update_trailing_sl(symbol, pos, last_high, last_low, is_long=True)
             else:
                 if last_high >= active_sl:
                     log.info("SL hit (short) for %s @ ₹%.2f (trailing_sl=%.2f)", symbol, active_sl, active_sl)
-                    await close_trade(symbol, active_sl, "stop_loss_hit")
+                    _closing_symbols.add(symbol)
+                    try:
+                        await close_trade(symbol, active_sl, "stop_loss_hit")
+                    finally:
+                        _closing_symbols.discard(symbol)
                 elif target_1 and last_low <= target_1:
                     if not partial_done:
                         log.info("T1 hit (short) for %s @ ₹%.2f — partial exit", symbol, last_low)
                         await _partial_exit_t1(symbol, pos, target_1)
                     else:
                         log.info("T2 hit (short) for %s @ ₹%.2f", symbol, last_low)
-                        await close_trade(symbol, target_1, "target_2_hit")
+                        _closing_symbols.add(symbol)
+                        try:
+                            await close_trade(symbol, target_1, "target_2_hit")
+                        finally:
+                            _closing_symbols.discard(symbol)
                 elif partial_done:
                     await _update_trailing_sl(symbol, pos, last_high, last_low, is_long=False)
 
