@@ -146,9 +146,74 @@ def create_app() -> FastAPI:
     async def health() -> dict[str, Any]:
         halted = await is_halted()
         agent_halted.set(1 if halted else 0)
+
+        # Database check
+        db_ok = False
+        db_error: str | None = None
+        try:
+            from sqlalchemy import select
+            from yukti.data.database import get_db
+            async with get_db() as db:
+                await db.execute(select(1))
+            db_ok = True
+        except Exception as exc:
+            db_error = str(exc)
+
+        # Redis check
+        redis_ok = False
+        redis_error: str | None = None
+        try:
+            from yukti.data.state import get_redis
+            r = await get_redis()
+            # ping returns True on success
+            pong = await r.ping()
+            redis_ok = bool(pong)
+        except Exception as exc:
+            redis_error = str(exc)
+
+        # Dhan API check (run in thread to avoid blocking event loop)
+        dhan_info: dict[str, Any] = {"ok": False}
+        try:
+            import requests
+
+            def _dhan_check() -> dict[str, Any]:
+                token = settings.dhan_access_token
+                client_id = settings.dhan_client_id
+                base = (settings.dhan_base_url or "").rstrip("/")
+                if not base:
+                    return {"ok": False, "error": "no base url"}
+                url = f"{base}/profile"
+                headers: dict[str, str] = {}
+                if token:
+                    headers["access-token"] = token
+                if client_id:
+                    headers["dhanClientId"] = client_id
+                try:
+                    r = requests.get(url, headers=headers, timeout=5)
+                    if r.status_code == 200:
+                        return {"ok": True}
+                    return {"ok": False, "status_code": r.status_code, "body": r.text[:200]}
+                except Exception as exc:
+                    return {"ok": False, "error": str(exc)}
+
+            dhan_info = await asyncio.to_thread(_dhan_check)
+        except Exception as exc:
+            dhan_info = {"ok": False, "error": str(exc)}
+
+        # Aggregate status
+        all_ok = db_ok and redis_ok and dhan_info.get("ok", False) and not halted
+        any_ok = db_ok or redis_ok or dhan_info.get("ok", False)
+        overall = "ok" if all_ok else ("degraded" if any_ok else "error")
+
         return {
-            "status":    "halted" if halted else "ok",
+            "status":    overall,
             "timestamp": datetime.utcnow().isoformat(),
+            "components": {
+                "agent_halted": halted,
+                "database": {"ok": db_ok, "error": db_error},
+                "redis": {"ok": redis_ok, "error": redis_error},
+                "dhan": dhan_info,
+            },
         }
 
     @app.get("/metrics")

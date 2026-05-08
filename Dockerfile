@@ -25,4 +25,7 @@ RUN uv sync --frozen
 COPY --from=webapp-build /webapp/dist ./yukti/api/static/
 EXPOSE 8000
 ENV MODE=paper
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["uv", "run", "python", "-m", "yukti"]
