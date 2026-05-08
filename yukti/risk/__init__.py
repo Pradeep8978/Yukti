@@ -9,11 +9,17 @@ from dataclasses import dataclass
 from typing import Optional
 from decimal import Decimal, ROUND_HALF_UP
 
+from datetime import date
+
 from yukti.agents.arjun import TradeDecision
 from yukti.config import settings
 from yukti.data.state import is_on_cooldown
 
 log = logging.getLogger(__name__)
+
+# Alert-once-per-day flags to avoid spamming Telegram every scan cycle
+_daily_loss_alerted_date: date | None = None
+_circuit_breaker_alerted: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -205,6 +211,16 @@ async def run_gates(
     # 1. Daily loss limit not breached
     daily_loss_limit_pct = settings.daily_loss_limit_pct * 100
     if portfolio.daily_pnl_pct <= -daily_loss_limit_pct:
+        global _daily_loss_alerted_date
+        today = date.today()
+        if _daily_loss_alerted_date != today:
+            _daily_loss_alerted_date = today
+            try:
+                from yukti.telegram.bot import alert_risk_halt
+                import asyncio
+                asyncio.create_task(alert_risk_halt(portfolio.daily_pnl_pct, daily_loss_limit_pct))
+            except Exception:
+                pass
         return GateResult(False, f"daily_loss_limit: {portfolio.daily_pnl_pct:.2f}% <= -{daily_loss_limit_pct:.2f}%")
 
     # 2. Max open positions / exposure not exceeded
@@ -362,7 +378,17 @@ async def is_market_halted(*, fail_closed: bool | None = None) -> bool:
 
         if nifty_chg <= -5.0:
             log.warning("Circuit breaker: Nifty %.2f%% — halting entries", nifty_chg)
+            global _circuit_breaker_alerted
+            if not _circuit_breaker_alerted:
+                _circuit_breaker_alerted = True
+                try:
+                    from yukti.telegram.bot import alert_circuit_breaker
+                    import asyncio
+                    asyncio.create_task(alert_circuit_breaker(nifty_chg))
+                except Exception:
+                    pass
             return True
+        _circuit_breaker_alerted = False  # Reset once market recovers
         return False
     except Exception as exc:
         log.warning("is_market_halted check failed: %s (fail_closed=%s)", exc, fail_closed)

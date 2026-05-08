@@ -9,7 +9,7 @@ import logging
 import uvicorn
 
 from yukti.api.main import create_app
-from yukti.telegram.bot import get_app as tg_app, alert
+from yukti.telegram.bot import get_app as tg_app, alert, alert_agent_started, alert_agent_shutdown
 from yukti.watchdog import watchdog_loop
 from yukti.scheduler.jobs import build_scheduler
 
@@ -40,7 +40,7 @@ class ControlPlaneService:
             tg = tg_app()
             await tg.initialize()
             self.tg_task = asyncio.create_task(tg.updater.start_polling())
-            await alert(f"🚀 Yukti started in *{self.mode.upper()}* mode")
+            await alert_agent_started(self.mode)
             log.info("ControlPlaneService: Telegram bot active")
         except Exception as exc:
             log.warning("ControlPlaneService: Telegram startup failed: %s", exc)
@@ -64,9 +64,13 @@ class ControlPlaneService:
         except Exception as exc:
             log.warning("ControlPlaneService: Scheduler startup failed: %s", exc)
 
-    async def stop(self) -> None:
+    async def stop(self, reason: str = "") -> None:
         """Stop all services."""
         log.info("ControlPlaneService: stopping")
+        try:
+            await alert_agent_shutdown(reason)
+        except Exception:
+            pass
 
         if self.watchdog_task:
             self.watchdog_task.cancel()

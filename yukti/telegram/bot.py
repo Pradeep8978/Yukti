@@ -197,3 +197,61 @@ async def alert_trade_closed(pos: dict) -> None:
         f"{icon} *{pos['symbol']}* closed: *{pnl:+.2f}%*\n"
         f"Exit ₹{pos.get('exit_price', 0):.2f} | Reason: {pos.get('exit_reason', '')}"
     )
+
+
+async def alert_agent_started(mode: str) -> None:
+    await alert(f"🚀 *Yukti started* in *{mode.upper()}* mode")
+
+
+async def alert_agent_shutdown(reason: str = "") -> None:
+    msg = "🔴 *Yukti stopped*"
+    if reason:
+        msg += f"\nReason: {reason}"
+    await alert(msg)
+
+
+async def alert_risk_halt(daily_pnl_pct: float, limit_pct: float) -> None:
+    await alert(
+        f"🛑 *Daily Loss Limit Hit*\n"
+        f"P&L today: *{daily_pnl_pct:+.2f}%* (limit: -{limit_pct:.2f}%)\n"
+        "All new trades halted for today. Use /resume to manually override."
+    )
+
+
+async def alert_circuit_breaker(nifty_drop_pct: float) -> None:
+    await alert(
+        f"⛔ *NSE Circuit Breaker Triggered*\n"
+        f"Nifty down *{nifty_drop_pct:.2f}%* intraday.\n"
+        "All new entries blocked until market recovers above -5%."
+    )
+
+
+async def alert_order_failed(symbol: str, side: str, error: str) -> None:
+    await alert(
+        f"❌ *Order Failed: {symbol}*\n"
+        f"Side: {side}\n"
+        f"Error: `{error}`"
+    )
+
+
+async def alert_eod_squareoff_failed(symbol: str, error: str) -> None:
+    await alert(
+        f"🚨 *EOD Squareoff Failed: {symbol}*\n"
+        "Position could not be closed at market. *MANUAL ACTION REQUIRED.*\n"
+        f"Error: `{error}`"
+    )
+
+
+async def alert_scan_error(error: str, failed: int = 0, total: int = 0) -> None:
+    detail = f" ({failed}/{total} symbols failed)" if failed and total else ""
+    await alert(
+        f"⚠️ *Scan Cycle Error{detail}*\n"
+        f"`{str(error)[:300]}`"
+    )
+
+
+async def alert_job_failed(job_name: str, error: str) -> None:
+    await alert(
+        f"⚠️ *Scheduled Job Failed: {job_name}*\n"
+        f"`{str(error)[:300]}`"
+    )
