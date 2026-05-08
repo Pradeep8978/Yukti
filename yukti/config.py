@@ -165,17 +165,14 @@ class Settings(BaseSettings):
     enable_meta_lessons: bool = True
     position_recon: str = "09:05"
 
-    # ── RAG / Retrieval settings (self-learning)
-    rag_max_retrieved_items: int = 4
-    rag_recency_days: int = 90
-    rag_min_quality_score: int = 6
+    # ── RAG / Retrieval settings (self-learning) — non-duplicated keys only
+    # rag_max_retrieved, rag_recency_days, rag_min_quality_score and
+    # rag_include_meta_lessons are defined above; do not redeclare them.
     rag_outcome_weight_win: float = 1.2
     rag_recency_half_life_days: int = 365
     rag_max_fetch_candidates: int = 50
     rag_diversity_lambda: float = 0.7
     rag_max_context_chars: int = 4000
-    # Include meta lessons (daily summary) in injected context
-    rag_include_meta_lessons: bool = True
 
     # ── DhanHQ constants ──────────────────────────────
     exchange_nse:     str = "NSE_EQ"

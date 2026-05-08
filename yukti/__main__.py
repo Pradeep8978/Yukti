@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -28,8 +29,10 @@ from yukti.config import settings
 
 log = logging.getLogger("yukti.main")
 
-# Module-level reference so graceful shutdown can reach the control plane
+# Module-level references so graceful shutdown can reach the control plane and scan task
 _control_plane: "ControlPlaneService | None" = None
+_scan_task: "asyncio.Task | None" = None
+_shutdown_event: "asyncio.Event | None" = None
 
 
 def _configure_logging() -> None:
@@ -52,14 +55,21 @@ async def _load_universe() -> dict[str, str]:
         if raw:
             universe_list = json.loads(raw)
             return {u["symbol"]: u["security_id"] for u in universe_list}
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("Universe load from Redis failed: %s — falling back", exc)
 
     fallback = Path("universe.json")
     if fallback.exists():
         return json.loads(fallback.read_text())
 
-    log.warning("No universe found — using built-in 5-symbol universe")
+    if settings.mode in ("live", "shadow"):
+        raise RuntimeError(
+            "No universe found in Redis or universe.json — refusing to start in "
+            f"mode={settings.mode} with the built-in 5-symbol fallback. Run "
+            "scripts/universe_loader.py first."
+        )
+
+    log.warning("No universe found — using built-in 5-symbol universe (mode=%s)", settings.mode)
     return {
         "RELIANCE":  "1333",
         "HDFCBANK":  "1232",
@@ -75,6 +85,13 @@ async def _run_paper_or_live(mode: str) -> None:
     from yukti.services.market_scan_service import MarketScanService
     from yukti.services.control_plane_service import ControlPlaneService
 
+    # Refuse to start sensitive modes without a configured control API key.
+    if mode in ("live", "shadow") and not settings.control_api_key:
+        raise RuntimeError(
+            f"control_api_key is required in mode={mode} — kill-switch / control "
+            "endpoints would be unauthenticated. Set CONTROL_API_KEY in the environment."
+        )
+
     # Bootstrap
     bootstrap = BootstrapService()
     await bootstrap.bootstrap(mode)
@@ -86,16 +103,43 @@ async def _run_paper_or_live(mode: str) -> None:
     # Market scan service
     scanner = MarketScanService(universe)
 
-    # Persistent agent runtime for paper/live/shadow.
-    global _control_plane
-    scan_task = asyncio.create_task(scanner.run_continuous_scan())
+    global _control_plane, _scan_task, _shutdown_event
+    _shutdown_event = asyncio.Event()
+
+    # Install POSIX signal handlers so SIGTERM (docker stop) shuts us down too.
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _shutdown_event.set)
+        except NotImplementedError:
+            # Windows or restricted env — fall back to default handling.
+            pass
+
+    _scan_task = asyncio.create_task(scanner.run_continuous_scan(), name="scan")
 
     # Control plane
     _control_plane = ControlPlaneService(mode)
     await _control_plane.start()
 
-    # Wait for scan to finish (it runs forever)
-    await scan_task
+    shutdown_task = asyncio.create_task(_shutdown_event.wait(), name="shutdown_wait")
+    done, _pending = await asyncio.wait(
+        {_scan_task, shutdown_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+
+    if shutdown_task in done:
+        log.info("Shutdown signal received — cancelling scan loop")
+        _scan_task.cancel()
+        try:
+            await _scan_task
+        except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
+            if not isinstance(exc, asyncio.CancelledError):
+                log.warning("Scan task raised during shutdown: %s", exc)
+    else:
+        shutdown_task.cancel()
+
+    if _control_plane is not None:
+        await _control_plane.stop()
 
 
 async def _run_backtest(start: str, end: str, sample_rate: float) -> None:
@@ -178,7 +222,7 @@ def main() -> None:
         else:
             loop.run_until_complete(_run_paper_or_live(args.mode))
     except KeyboardInterrupt:
-        log.info("Shutdown requested — stopping gracefully")
+        log.info("KeyboardInterrupt — stopping gracefully")
         if _control_plane is not None:
             loop.run_until_complete(_control_plane.stop())
     finally:
