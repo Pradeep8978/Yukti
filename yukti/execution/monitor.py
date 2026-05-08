@@ -7,6 +7,7 @@ yukti/scheduler/jobs.py      — APScheduler cron jobs
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Any
@@ -15,9 +16,12 @@ import anthropic
 import voyageai
 
 from yukti.config import settings
-from yukti.data.state import get_all_positions
+from yukti.data.state import get_all_positions, save_position, add_to_daily_pnl, get_redis
 from yukti.execution.order_sm import close_trade
 from yukti.execution.broker_factory import get_broker
+
+# Trail SL 1.5% behind the high-water mark after T1 partial exit
+TRAIL_PCT = 0.015
 
 log = logging.getLogger(__name__)
 
@@ -82,24 +86,172 @@ async def monitor_positions(poll_interval: int = 10) -> None:
 
             is_long    = pos.get("direction") == "LONG"
             stop_loss  = float(pos.get("stop_loss", 0))
-            target_1   = float(pos.get("target_1", 0))
+            fill_price = float(pos.get("fill_price") or pos.get("entry_price", 0))
+            target_1   = float(pos.get("target_1") or 0)
+            active_sl  = float(pos.get("trailing_sl") or stop_loss)
+
+            # Detect whether T1 partial exit already happened:
+            # after partial exit we move stop_loss to breakeven (fill_price).
+            partial_done = (
+                (stop_loss >= fill_price) if is_long
+                else (fill_price > 0 and stop_loss <= fill_price)
+            )
 
             if is_long:
-                # Use candle low for SL (wick can touch SL without closing below)
-                if last_low <= stop_loss:
-                    log.info("SL hit for %s @ ₹%.2f (low)", symbol, last_low)
-                    await close_trade(symbol, stop_loss, "stop_loss_hit")
+                if last_low <= active_sl:
+                    log.info("SL hit for %s @ ₹%.2f (trailing_sl=%.2f)", symbol, active_sl, active_sl)
+                    await close_trade(symbol, active_sl, "stop_loss_hit")
                 elif target_1 and last_high >= target_1:
-                    log.info("Target 1 hit for %s @ ₹%.2f (high)", symbol, last_high)
-                    await close_trade(symbol, target_1, "target_1_hit")
+                    if not partial_done:
+                        log.info("T1 hit for %s @ ₹%.2f — partial exit", symbol, last_high)
+                        await _partial_exit_t1(symbol, pos, target_1)
+                    else:
+                        log.info("T2 hit for %s @ ₹%.2f", symbol, last_high)
+                        await close_trade(symbol, target_1, "target_2_hit")
+                elif partial_done:
+                    await _update_trailing_sl(symbol, pos, last_high, last_low, is_long=True)
             else:
-                # Use candle high for SL (wick can touch SL without closing above)
-                if last_high >= stop_loss:
-                    log.info("SL hit (short) for %s @ ₹%.2f (high)", symbol, last_high)
-                    await close_trade(symbol, stop_loss, "stop_loss_hit")
+                if last_high >= active_sl:
+                    log.info("SL hit (short) for %s @ ₹%.2f (trailing_sl=%.2f)", symbol, active_sl, active_sl)
+                    await close_trade(symbol, active_sl, "stop_loss_hit")
                 elif target_1 and last_low <= target_1:
-                    log.info("Target 1 hit (short) for %s @ ₹%.2f (low)", symbol, last_low)
-                    await close_trade(symbol, target_1, "target_1_hit")
+                    if not partial_done:
+                        log.info("T1 hit (short) for %s @ ₹%.2f — partial exit", symbol, last_low)
+                        await _partial_exit_t1(symbol, pos, target_1)
+                    else:
+                        log.info("T2 hit (short) for %s @ ₹%.2f", symbol, last_low)
+                        await close_trade(symbol, target_1, "target_2_hit")
+                elif partial_done:
+                    await _update_trailing_sl(symbol, pos, last_high, last_low, is_long=False)
+
+
+async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) -> None:
+    """
+    Sell half the position at T1, move SL to breakeven, trail the remainder.
+
+    After this call the position record reflects the remaining half:
+      - quantity   → remaining shares
+      - stop_loss  → fill_price (breakeven) — doubles as the crash-safe
+                     "partial exit done" marker read by monitor_positions
+      - target_1   → old target_2 (0 if none)
+      - target_2   → None
+      - sl_gtt_id  → new breakeven GTT for remaining shares
+      - trailing_sl→ T1 * (1 ± TRAIL_PCT) in Redis
+    """
+    qty       = int(pos.get("quantity", 0))
+    half_qty  = qty // 2
+    remaining = qty - half_qty
+    if half_qty == 0:
+        log.warning("Partial exit %s: quantity %d too small to split", symbol, qty)
+        return
+
+    direction    = pos.get("direction", "LONG")
+    is_long      = direction == "LONG"
+    security_id  = pos.get("security_id", "")
+    product_type = "INTRADAY" if pos.get("holding_period") == "intraday" else "DELIVERY"
+    fill_price   = float(pos.get("fill_price") or pos.get("entry_price", 0))
+    exit_side    = "SELL" if is_long else "BUY"
+
+    # 1 — Place partial market exit
+    try:
+        await get_broker().market_exit(security_id, direction, half_qty, product_type)
+    except Exception as exc:
+        log.error("Partial exit order failed for %s: %s", symbol, exc)
+        return
+
+    # 2 — Record partial P&L
+    partial_pnl = (
+        (exit_price - fill_price) * half_qty if is_long
+        else (fill_price - exit_price) * half_qty
+    )
+    orig_exposure = fill_price * qty
+    await add_to_daily_pnl(partial_pnl / orig_exposure * 100 if orig_exposure else 0.0)
+
+    # 3 — Replace SL GTT: cancel full-qty one, arm breakeven GTT for remaining
+    if pos.get("sl_gtt_id"):
+        try:
+            await get_broker().cancel_gtt(pos["sl_gtt_id"])
+        except Exception as exc:
+            log.warning("Partial exit: cancel old SL GTT failed for %s: %s", symbol, exc)
+
+    new_sl_gtt_id: str | None = None
+    try:
+        gtt_resp = await get_broker().place_gtt(
+            security_id      = security_id,
+            transaction_type = exit_side,
+            quantity         = remaining,
+            trigger_price    = fill_price,
+            order_type       = "SL-M",
+            product_type     = product_type,
+        )
+        if isinstance(gtt_resp, dict):
+            new_sl_gtt_id = (
+                gtt_resp.get("gttOrderId")
+                or (gtt_resp.get("data") or {}).get("gttOrderId")
+            )
+    except Exception as exc:
+        log.warning("Partial exit: breakeven SL GTT failed for %s: %s", symbol, exc)
+
+    # 4 — Cancel T1 GTT (already exited at T1 via market order above)
+    if pos.get("target_gtt_id"):
+        try:
+            await get_broker().cancel_gtt(pos["target_gtt_id"])
+        except Exception:
+            pass
+
+    # 5 — Update position record; promote T2 → T1 for next monitor check
+    old_t2 = float(pos.get("target_2") or 0)
+    pos["quantity"]      = remaining
+    pos["stop_loss"]     = fill_price          # breakeven — crash-safe "partial done" marker
+    pos["target_1"]      = old_t2             # 0 if no T2 → monitor's "target_1 and ..." skips it
+    pos["target_2"]      = None
+    pos["sl_gtt_id"]     = new_sl_gtt_id
+    pos["target_gtt_id"] = None
+    pos["trailing_sl"]   = round(
+        exit_price * (1 - TRAIL_PCT) if is_long else exit_price * (1 + TRAIL_PCT), 2
+    )
+    await save_position(symbol, pos)
+
+    pnl_pct = partial_pnl / orig_exposure * 100 if orig_exposure else 0.0
+    log.info(
+        "Partial exit %s: sold %d @ ₹%.2f (P&L %.2f%%), holding %d | new SL ₹%.2f (breakeven)",
+        symbol, half_qty, exit_price, pnl_pct, remaining, fill_price,
+    )
+
+    try:
+        from yukti.telegram.bot import alert
+        next_note = f" | Next target ₹{old_t2:.2f}" if old_t2 else " | Trailing SL active"
+        await alert(
+            f"🎯 *T1 Hit — {symbol}*\n"
+            f"Sold {half_qty} shares @ ₹{exit_price:.2f} | P&L: {pnl_pct:+.2f}%\n"
+            f"Holding {remaining} shares | SL → breakeven ₹{fill_price:.2f}{next_note}"
+        )
+    except Exception:
+        pass
+
+
+async def _update_trailing_sl(
+    symbol: str,
+    pos: dict[str, Any],
+    last_high: float,
+    last_low: float,
+    is_long: bool,
+) -> None:
+    """Tighten trailing stop behind the high-water mark. Redis-only update."""
+    current = float(pos.get("trailing_sl") or pos.get("stop_loss", 0))
+    if is_long:
+        candidate = round(last_high * (1 - TRAIL_PCT), 2)
+        if candidate <= current:
+            return
+    else:
+        candidate = round(last_low * (1 + TRAIL_PCT), 2)
+        if candidate >= current:
+            return
+
+    pos["trailing_sl"] = candidate
+    r = await get_redis()
+    await r.set(f"yukti:positions:{symbol}", json.dumps(pos))
+    log.debug("Trailing SL %s: ₹%.2f → ₹%.2f", symbol, current, candidate)
 
 
 # ═══════════════════════════════════════════════════════════════
