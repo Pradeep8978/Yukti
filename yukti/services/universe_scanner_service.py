@@ -84,6 +84,7 @@ def _score_candidate(candidate: dict[str, Any]) -> float:
     vol_ratio = candidate.get("vol_ratio", 0)
     change_pct = abs(candidate.get("change_pct", 0))
     has_catalyst = candidate.get("has_catalyst", False)
+    catalyst_pts_override = candidate.get("catalyst_pts")  # 0..15 graded score
     sector_in_play = candidate.get("sector_in_play", False)
     avg_turnover_cr = candidate.get("avg_turnover_cr", 0)
     gap_pct = abs(candidate.get("gap_pct", 0) or 0)
@@ -95,7 +96,10 @@ def _score_candidate(candidate: dict[str, Any]) -> float:
 
     vol_score = min(vol_ratio / 5.0, 1.0) * 20 if vol_ratio >= vol_floor else 0
     price_score = min(change_pct / 4.0, 1.0) * 15 if change_pct >= price_floor else 0
-    catalyst_score = 15 if has_catalyst else 0
+    if catalyst_pts_override is not None:
+        catalyst_score = max(0.0, min(float(catalyst_pts_override), 15.0))
+    else:
+        catalyst_score = 15 if has_catalyst else 0
     sector_score = 10 if sector_in_play else 0
     liq_score = min(avg_turnover_cr / 50.0, 1.0) * 10
     gap_score = min(gap_pct / 3.0, 1.0) * 10            # 3% gap saturates
@@ -230,9 +234,38 @@ async def _enrich_with_catalysts(
     candidates: list[dict[str, Any]],
     headlines: list[str],
 ) -> None:
-    """Mark candidates that have news catalysts (in-place)."""
-    from yukti.services.macro_context_service import filter_headlines_for_symbol
+    """Mark candidates that have news catalysts (in-place).
 
+    Two paths:
+      1. If the catalyst service is enabled, prefer per-symbol Redis cache
+         (graded 0..15 score via NSE announcements + earnings calendar).
+      2. Otherwise fall back to the legacy broad-market headline filter.
+    """
+    enabled = bool(getattr(settings, "enable_news_enrichment", True))
+    if enabled:
+        try:
+            from yukti.services.catalyst_service import (
+                get_items_for_symbol,
+                is_pre_results,
+                score_catalyst_for_symbol,
+            )
+            for c in candidates:
+                items = await get_items_for_symbol(c["symbol"])
+                pre_res = await is_pre_results(c["symbol"])
+                pts = score_catalyst_for_symbol(c["symbol"], items, in_results_window=pre_res)
+                if pts > 0:
+                    c["catalyst_pts"] = pts
+                    c["has_catalyst"] = True
+                    if items:
+                        c["catalyst_categories"] = sorted({i.category for i in items})
+                    if pre_res:
+                        c["pre_results"] = True
+            return
+        except Exception as exc:
+            log.warning("Graded catalyst enrichment failed (%s) — using headline fallback", exc)
+
+    # Legacy broad-market headline matching
+    from yukti.services.macro_context_service import filter_headlines_for_symbol
     for c in candidates:
         matches = filter_headlines_for_symbol(c["symbol"], headlines)
         if matches:

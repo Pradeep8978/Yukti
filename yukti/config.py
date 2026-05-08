@@ -149,6 +149,13 @@ class Settings(BaseSettings):
     candidate_pool_index: str = "NIFTY 500"
     universe_volatility_band_pct: tuple[float, float] = (1.5, 6.0)
 
+    # Catalyst / news enrichment (slice 3)
+    enable_news_enrichment: bool = True
+    news_provider: Literal["nse_only", "marketaux", "newsapi"] = "nse_only"
+    news_provider_api_key: str = ""
+    news_lookback_hours: int = Field(default=24, ge=1, le=168)
+    results_window_days: int = Field(default=2, ge=0, le=10)
+
     # ── Daily candle (multi-timeframe) ────────────────
     daily_candle_history: int = Field(default=60, ge=20, le=200)
     daily_cache_ttl: int = Field(default=3600 * 8, ge=3600)

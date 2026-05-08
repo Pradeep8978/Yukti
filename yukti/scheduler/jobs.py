@@ -202,6 +202,20 @@ async def job_universe_scan() -> None:
     await scanner.run_with_fallback(is_refresh=False)
 
 
+async def job_catalyst_refresh() -> None:
+    """08:00 IST — pull NSE announcements + earnings calendar."""
+    if not is_trading_day():
+        log.info("Catalyst refresh skipped: non-trading day")
+        return
+    log.info("=== catalyst refresh ===")
+    try:
+        from yukti.services.catalyst_service import refresh
+        summary = await refresh()
+        log.info("Catalysts: %s", summary)
+    except Exception as exc:
+        log.error("Catalyst refresh failed: %s", exc)
+
+
 async def job_premarket_pool_build() -> None:
     """08:30 IST — rebuild yukti:candidate_pool from NIFTY 500 + filters."""
     if not is_trading_day():
@@ -285,6 +299,8 @@ async def job_universe_refresh() -> None:
 
 def build_scheduler() -> AsyncIOScheduler:
     sched = AsyncIOScheduler(timezone="Asia/Kolkata")
+    sched.add_job(job_catalyst_refresh,     "cron", hour=8,  minute=0,
+                  id="catalyst_refresh", replace_existing=True)
     sched.add_job(job_premarket_pool_build, "cron", hour=8,  minute=30,
                   id="premarket_pool_build", replace_existing=True)
     sched.add_job(job_universe_scan,        "cron", hour=8,  minute=45)
