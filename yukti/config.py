@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     watchlist: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # ── AI provider ───────────────────────────────────
+    # Arjun (trade decisions) — the ONLY component allowed to use Gemini.
     # "claude"  → Anthropic Claude Sonnet 4.6  ($3/$15 per MTok)
     # "gemini"  → Google Gemini 2.0 Flash      (free ≤15 rpm, then $0.075/MTok)
     # "ab_test" → run both per call, log comparison, execute the primary
@@ -79,6 +80,11 @@ class Settings(BaseSettings):
     # ab_primary is executed for real; ab_secondary is called in background and logged only
     ab_primary: Literal["claude", "gemini"] = "gemini"
     ab_secondary: Literal["claude", "gemini"] = "claude"
+
+    # Non-decision AI tasks (journal writing, quality reports, …) use this
+    # provider exclusively.  Gemini is intentionally excluded to avoid
+    # burning free-tier quota on ancillary tasks.
+    journal_ai_provider: Literal["claude", "openai"] = "claude"
 
     # Voyage AI (journal embeddings)
     voyage_api_key: str = ""
