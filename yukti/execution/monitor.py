@@ -17,7 +17,7 @@ import voyageai
 from yukti.config import settings
 from yukti.data.state import get_all_positions
 from yukti.execution.order_sm import close_trade
-from yukti.execution.dhan_client import dhan
+from yukti.execution.broker_factory import get_broker
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +40,8 @@ async def monitor_positions(poll_interval: int = 10) -> None:
         # Quick broker-side check to catch fills executed via GTTs
         # which may not be immediately reflected in Redis/Postgres.
         try:
-            broker_positions_raw = await dhan.get_positions()
+            broker = get_broker()
+            broker_positions_raw = await broker.get_positions()
             broker_symbols = {bp.get("tradingSymbol") for bp in broker_positions_raw if int(bp.get("netQty", 0)) != 0}
         except Exception as exc:
             broker_symbols = set()
@@ -68,7 +69,7 @@ async def monitor_positions(poll_interval: int = 10) -> None:
                 continue
 
             try:
-                candles = await dhan.get_candles(security_id, interval="1")
+                candles = await get_broker().get_candles(security_id, interval="1")
                 if not candles:
                     continue
                 last = candles[-1]
@@ -268,7 +269,7 @@ async def job_eod_squareoff() -> None:
             direction    = pos.get("direction", "LONG")
             qty          = int(pos.get("quantity", 0))
             try:
-                result = await dhan.market_exit(security_id, direction, qty, "INTRADAY")
+                result = await get_broker().market_exit(security_id, direction, qty, "INTRADAY")
                 exit_p = float(pos.get("entry_price", 0))  # will be updated by monitor
                 await close_trade(symbol, exit_p, "eod_squareoff")
                 log.info("EOD squareoff: %s %d shares", symbol, qty)

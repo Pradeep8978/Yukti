@@ -28,7 +28,7 @@ from yukti.data.state import (
     save_position,
     reset_daily_pnl,
 )
-from yukti.execution.dhan_client import dhan
+from yukti.execution.broker_factory import get_broker
 from yukti.execution.order_intent import (
     find_unsafe_intents,
     find_stale_intents,
@@ -58,7 +58,7 @@ async def recover_from_crash() -> dict[str, int]:
     for intent in stale:
         try:
             if intent.entry_order_id:
-                await dhan.cancel_order(intent.entry_order_id)
+                await get_broker().cancel_order(intent.entry_order_id)
             await mark_abandoned(intent.id, "stale_after_restart")
             await delete_position(intent.symbol)
             stats["stale_cancelled"] += 1
@@ -91,7 +91,7 @@ async def recover_from_crash() -> dict[str, int]:
         product_type = "INTRADAY" if intent.holding_period == "intraday" else "DELIVERY"
 
         try:
-            sl_gtt = await dhan.place_gtt(
+            sl_gtt = await get_broker().place_gtt(
                 security_id      = intent.security_id,
                 transaction_type = exit_side,
                 quantity         = intent.filled_qty,
@@ -105,7 +105,7 @@ async def recover_from_crash() -> dict[str, int]:
             if not sl_id:
                 raise RuntimeError(f"sl_gtt_no_id_returned: {sl_gtt}")
 
-            t1_gtt = await dhan.place_gtt(
+            t1_gtt = await get_broker().place_gtt(
                 security_id      = intent.security_id,
                 transaction_type = exit_side,
                 quantity         = intent.filled_qty,
@@ -151,7 +151,7 @@ async def recover_from_crash() -> dict[str, int]:
             # Can't re-arm GTTs — market exit as safety measure
             log.critical("Cannot re-arm intent #%d — market exiting: %s", intent.id, exc)
             try:
-                await dhan.market_exit(
+                await get_broker().market_exit(
                     intent.security_id, intent.direction, intent.filled_qty, product_type
                 )
                 await mark_unsafe(intent.id, f"rearm_failed_market_exit: {exc}")
@@ -188,7 +188,7 @@ async def recover_from_crash() -> dict[str, int]:
 async def _verify_position(symbol: str, direction: str, expected_qty: int) -> bool:
     """Check if DhanHQ actually has this position."""
     try:
-        broker_positions = await dhan.get_positions()
+        broker_positions = await get_broker().get_positions()
     except Exception as exc:
         log.warning("Cannot verify position (broker unreachable): %s", exc)
         return False   # Fail-safe: assume not present
@@ -223,7 +223,7 @@ async def reconcile_positions() -> bool:
     redis_positions: dict[str, Any] = await get_all_positions()
 
     try:
-        broker_positions_raw: list[dict] = await dhan.get_positions()
+        broker_positions_raw: list[dict] = await get_broker().get_positions()
     except Exception as exc:
         log.error("Failed to fetch broker positions: %s", exc)
         return True

@@ -72,9 +72,10 @@ async def _read_intraday_dd_pct() -> float:
     try:
         from yukti.data.state import get_redis
         r = await get_redis()
-        raw = await r.get("yukti:state:daily_pnl_pct")
+        raw = await r.get("yukti:pnl:daily") or await r.get("yukti:state:daily_pnl_pct")
         if raw:
-            return float(raw)
+            value = float(raw)
+            return value / 100.0 if abs(value) > 0.5 else value
     except Exception:
         pass
     return 0.0

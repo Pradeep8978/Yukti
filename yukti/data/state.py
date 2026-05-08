@@ -210,6 +210,11 @@ async def reset_daily_pnl() -> None:
     await r.delete("yukti:pnl:daily")
 
 
+async def reset_trades_today() -> None:
+    r = await get_redis()
+    await r.delete("yukti:trades:today")
+
+
 # ── Consecutive loss streak ───────────────────────────────────────────────────
 
 async def record_trade_outcome(won: bool) -> None:

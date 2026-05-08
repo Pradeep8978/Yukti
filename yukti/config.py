@@ -126,8 +126,10 @@ class Settings(BaseSettings):
     account_value: float = Field(default=500_000.0, gt=0)
     risk_pct: float = Field(default=0.01, gt=0, le=0.05)
     max_open_positions: int = Field(default=5, ge=1, le=20)
+    max_trades_per_day: int = Field(default=8, ge=1, le=50)
     max_single_stock_pct: float = Field(default=0.25, gt=0, le=1.0)
     max_sector_pct: float = Field(default=0.40, gt=0, le=1.0)
+    max_total_exposure_pct: float = Field(default=0.80, gt=0, le=2.0)
 
     # ── Risk gates ────────────────────────────────────
     daily_loss_limit_pct: float = Field(default=0.02, gt=0)

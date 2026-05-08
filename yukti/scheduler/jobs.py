@@ -86,7 +86,7 @@ async def job_morning_prep() -> None:
 async def job_eod_squareoff() -> None:
     log.info("=== EOD squareoff ===")
     from yukti.data.state import get_all_positions
-    from yukti.execution.dhan_client import dhan
+    from yukti.execution.broker_factory import get_broker
     from yukti.execution.order_sm import close_trade
 
     for symbol, pos in (await get_all_positions()).items():
@@ -98,10 +98,11 @@ async def job_eod_squareoff() -> None:
         qty  = int(pos.get("quantity", 0))
         dirn = pos.get("direction", "LONG")
         try:
+            broker = get_broker()
             for gtt in [pos.get("sl_gtt_id"), pos.get("target_gtt_id")]:
                 if gtt:
-                    await dhan.cancel_gtt(gtt)
-            await dhan.market_exit(sec, dirn, qty, "INTRADAY")
+                    await broker.cancel_gtt(gtt)
+            await broker.market_exit(sec, dirn, qty, "INTRADAY")
             await close_trade(symbol, float(pos.get("entry_price", 0)), "eod_squareoff")
             log.info("EOD closed %s", symbol)
         except Exception as exc:
@@ -278,7 +279,7 @@ async def job_premarket_rank() -> None:
     try:
         import json as _json
         import redis.asyncio as aioredis
-        from yukti.execution.dhan_client import dhan
+        from yukti.execution.broker_factory import get_broker
         r = await aioredis.from_url(settings.redis_url, decode_responses=True)
         raw = await r.get("yukti:candidate_pool")
         if not raw:
@@ -287,7 +288,7 @@ async def job_premarket_rank() -> None:
             return
         pool = _json.loads(raw)
         sec_ids = [p["security_id"] for p in pool]
-        snap = await dhan.quote_snapshot(sec_ids)
+        snap = await get_broker().quote_snapshot(sec_ids)
 
         out: dict[str, dict] = {}
         for entry in pool:

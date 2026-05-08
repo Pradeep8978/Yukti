@@ -23,7 +23,7 @@ from yukti.data.state import (
     is_halted,
     set_halt,
 )
-from yukti.execution.dhan_client import dhan
+from yukti.execution.broker_factory import get_broker
 
 log = logging.getLogger(__name__)
 
@@ -156,7 +156,7 @@ async def cmd_squareoff(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         qty          = int(pos.get("quantity", 0))
         product_type = "INTRADAY" if pos.get("holding_period") == "intraday" else "DELIVERY"
         try:
-            result = await dhan.market_exit(security_id, direction, qty, product_type)
+            result = await get_broker().market_exit(security_id, direction, qty, product_type)
             exit_p = float(pos.get("entry_price", 0))
             await close_trade(sym, exit_p, "manual_squareoff")
             await update.message.reply_text(f"✅ Closed {sym} {qty} shares")

@@ -66,6 +66,9 @@ class ShadowBroker:
     async def get_order_list(self):
         return []
 
+    async def quote_snapshot(self, *args, **kwargs):
+        return await self._real.quote_snapshot(*args, **kwargs)
+
     # ── LOG-AND-FAKE: write operations ────────────────────────────────────────
 
     def _next_id(self, prefix: str = "SHADOW") -> str:
@@ -199,6 +202,16 @@ class FakeDhanClient:
     async def get_order_list(self) -> list[dict]:
         return []
 
+    async def quote_snapshot(self, security_ids: list[str], chunk_size: int = 100) -> dict[str, dict[str, Any]]:
+        return {
+            str(sid): {
+                "last_price": self.fake_prices.get(str(sid), 1000.0),
+                "prev_close": self.fake_prices.get(str(sid), 1000.0),
+                "volume": 100_000,
+            }
+            for sid in security_ids
+        }
+
     async def place_order(self, **kwargs) -> dict:
         return {"orderId": "FAKE-123", "status": "TRADED", "filledQty": kwargs.get("quantity", 0), "averagePrice": 1000.0}
 
@@ -242,6 +255,9 @@ class PaperBrokerWrapper:
 
     async def get_order_list(self):
         return await self._real.get_order_list()
+
+    async def quote_snapshot(self, *args, **kwargs):
+        return await self._real.quote_snapshot(*args, **kwargs)
 
     # ── SIMULATED: order writes via PaperBroker ──────────────────────────────
 

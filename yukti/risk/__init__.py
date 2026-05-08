@@ -179,6 +179,8 @@ class Portfolio:
     open_positions: int
     daily_pnl_pct: float
     total_exposure_pct: float  # sum of capital_pct across positions
+    trades_today: int = 0
+    min_conviction_override: int | None = None
     # Optional per-sector exposure (capital_pct) and a sector hint for the
     # incoming trade. Both default to "no info" so existing callers aren't
     # forced to pass them; when present, they enable the sector-cap gate.
@@ -201,16 +203,21 @@ async def run_gates(
     All checks are async because they may read Redis.
     """
     # 1. Daily loss limit not breached
-    if portfolio.daily_pnl_pct <= -settings.daily_loss_limit_pct:
-        return GateResult(False, f"daily_loss_limit: {portfolio.daily_pnl_pct:.2%} <= -{settings.daily_loss_limit_pct:.2%}")
+    daily_loss_limit_pct = settings.daily_loss_limit_pct * 100
+    if portfolio.daily_pnl_pct <= -daily_loss_limit_pct:
+        return GateResult(False, f"daily_loss_limit: {portfolio.daily_pnl_pct:.2f}% <= -{daily_loss_limit_pct:.2f}%")
 
     # 2. Max open positions / exposure not exceeded
     if portfolio.open_positions >= settings.max_open_positions:
         return GateResult(False, f"max_positions: {portfolio.open_positions} >= {settings.max_open_positions}")
 
+    if portfolio.trades_today >= settings.max_trades_per_day:
+        return GateResult(False, f"max_trades_today: {portfolio.trades_today} >= {settings.max_trades_per_day}")
+
     # 3. Conviction score >= minimum threshold
-    if trade_decision.conviction < settings.min_conviction:
-        return GateResult(False, f"conviction_too_low: {trade_decision.conviction} < {settings.min_conviction}")
+    min_conviction = portfolio.min_conviction_override or settings.min_conviction
+    if trade_decision.conviction < min_conviction:
+        return GateResult(False, f"conviction_too_low: {trade_decision.conviction} < {min_conviction}")
 
     # 4. Reward:Risk ratio >= minimum — verify against structural levels rather
     # than blindly trusting the LLM's self-reported value.
@@ -250,6 +257,17 @@ async def run_gates(
             False,
             f"single_stock_cap: {position.capital_pct:.2f}% > {single_stock_cap_pct:.2f}%",
         )
+
+    total_exposure_cap_pct = Decimal(str(settings.max_total_exposure_pct)) * Decimal("100")
+    projected_total_exposure = Decimal(str(portfolio.total_exposure_pct)) + position.capital_pct
+    if projected_total_exposure > total_exposure_cap_pct:
+        return GateResult(
+            False,
+            f"total_exposure_cap: {projected_total_exposure:.2f}% > {total_exposure_cap_pct:.2f}%",
+        )
+
+    if trade_decision.holding_period == "swing" and trade_decision.direction == "SHORT":
+        return GateResult(False, "swing_short_blocked: NSE equity delivery cannot carry overnight shorts")
 
     # 8. Sector concentration cap — only enforced when caller passed sector info.
     if portfolio.trade_sector and portfolio.sector_exposure_pct is not None:

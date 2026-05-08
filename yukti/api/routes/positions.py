@@ -228,7 +228,7 @@ async def squareoff_all(request: Request) -> dict[str, Any]:
     positions = await get_all_positions()
     results: list[dict] = []
 
-    from yukti.execution.dhan_client import dhan
+    from yukti.execution.broker_factory import get_broker
     from yukti.execution.order_sm import close_trade
 
     for symbol, pos in positions.items():
@@ -237,7 +237,7 @@ async def squareoff_all(request: Request) -> dict[str, Any]:
         qty   = int(pos.get("quantity", 0))
         ptype = "INTRADAY" if pos.get("holding_period") == "intraday" else "DELIVERY"
         try:
-            await dhan.market_exit(sec, dirn, qty, ptype)
+            await get_broker().market_exit(sec, dirn, qty, ptype)
             await close_trade(symbol, float(pos.get("entry_price", 0)), "api_squareoff")
             results.append({"symbol": symbol, "ok": True})
         except Exception as exc:

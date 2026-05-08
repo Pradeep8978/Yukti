@@ -38,7 +38,7 @@ from yukti.data.state import (
     record_trade_outcome,
     increment_trades_today,
 )
-from yukti.execution.dhan_client import dhan
+from yukti.execution.broker_factory import get_broker
 from yukti.execution.order_intent import (
     save_intent,
     mark_placed,
@@ -98,7 +98,8 @@ async def open_trade(
     #  STEP 2 — Place entry order
     # ═══════════════════════════════════════════════════════════
     try:
-        order_resp = await dhan.place_order(
+        broker = get_broker()
+        order_resp = await broker.place_order(
             security_id      = security_id,
             transaction_type = entry_side,
             quantity         = position.quantity,
@@ -164,7 +165,7 @@ async def open_trade(
     if filled_qty == 0:
         # Cancel and mark abandoned
         try:
-            await dhan.cancel_order(order_id)
+            await get_broker().cancel_order(order_id)
         except Exception:
             pass
         await mark_abandoned(intent_id, "never_filled_cancelled")
@@ -202,7 +203,7 @@ async def open_trade(
         await mark_unsafe(intent_id, f"gtt_arm_failed: {err}")
         log.critical("UNSAFE: %s filled but GTTs failed — market exiting: %s", symbol, err)
         try:
-            await dhan.market_exit(security_id, decision.direction or "LONG", filled_qty, product_type)
+            await get_broker().market_exit(security_id, decision.direction or "LONG", filled_qty, product_type)
             await close_trade(symbol, fill_price, "emergency_exit_gtt_failed")
         except Exception as exit_exc:
             log.critical("CRITICAL: market-exit also failed for %s: %s", symbol, exit_exc)
@@ -247,7 +248,7 @@ async def _wait_for_fill(
         elapsed += FILL_POLL_SECS
 
         try:
-            status_resp = await dhan.get_order_status(order_id)
+            status_resp = await get_broker().get_order_status(order_id)
             data        = status_resp.get("data", status_resp)
             order_status = data.get("orderStatus", "")
             filled_qty   = int(data.get("filledQty", 0))
@@ -266,7 +267,7 @@ async def _wait_for_fill(
 
     # Timeout — return whatever we have
     try:
-        status_resp = await dhan.get_order_status(order_id)
+        status_resp = await get_broker().get_order_status(order_id)
         data         = status_resp.get("data", status_resp)
         return float(data.get("averagePrice", 0) or 0), int(data.get("filledQty", 0))
     except Exception:
@@ -293,7 +294,7 @@ async def _arm_gtts(
 
     # SL GTT — MUST succeed. Retry internally via dhan_client tenacity.
     try:
-        gtt_sl    = await dhan.place_gtt(
+        gtt_sl    = await get_broker().place_gtt(
             security_id      = security_id,
             transaction_type = exit_side,
             quantity         = quantity,
@@ -315,7 +316,7 @@ async def _arm_gtts(
     t1_id: str | None = None
     if target_1:
         try:
-            gtt_t1 = await dhan.place_gtt(
+            gtt_t1 = await get_broker().place_gtt(
                 security_id      = security_id,
                 transaction_type = exit_side,
                 quantity         = quantity,
@@ -377,12 +378,12 @@ async def close_trade(
     # Cancel the other GTT
     if exit_reason == "stop_loss_hit" and pos.get("target_gtt_id"):
         try:
-            await dhan.cancel_gtt(pos["target_gtt_id"])
+            await get_broker().cancel_gtt(pos["target_gtt_id"])
         except Exception:
             pass
     elif "target" in exit_reason and pos.get("sl_gtt_id"):
         try:
-            await dhan.cancel_gtt(pos["sl_gtt_id"])
+            await get_broker().cancel_gtt(pos["sl_gtt_id"])
         except Exception:
             pass
 

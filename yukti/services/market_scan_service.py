@@ -22,11 +22,11 @@ from yukti.data.state import (
     count_open_positions,
     get_all_positions,
 )
-from yukti.execution.dhan_client import dhan
+from yukti.execution.broker_factory import get_broker
 from yukti.execution.order_sm import open_trade
 from yukti.metrics import signals_scanned, scan_failures, record_skip, record_trade_opened
 from yukti.risk import calculate_levels, calculate_position, run_gates, Portfolio
-from yukti.scheduler.jobs import is_trading_day, is_trading_hours
+from yukti.scheduler.jobs import KOLKATA, is_trading_day, is_trading_hours
 from yukti.services.macro_context_service import MacroContext, fetch_macro_context, filter_headlines_for_symbol
 from yukti.signals.context import build_context
 from yukti.signals.indicators import compute
@@ -137,11 +137,13 @@ class MarketScanService:
 
     async def _get_macro_context(self) -> MacroContext:
         """Fetch Nifty data then assemble full MacroContext (VIX, FII/DII, headlines)."""
+        broker = get_broker()
         nifty_chg, nifty_trend = 0.0, "SIDEWAYS"
         try:
-            today = datetime.now().strftime("%Y-%m-%d")
-            start = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-            nifty_raw = await dhan.get_candles("13", 5, start, today, symbol="NIFTY")
+            now_ist = datetime.now(KOLKATA)
+            today = now_ist.strftime("%Y-%m-%d")
+            start = (now_ist - timedelta(days=3)).strftime("%Y-%m-%d")
+            nifty_raw = await broker.get_candles("13", 5, start, today, symbol="NIFTY")
             if nifty_raw and len(nifty_raw) >= 20:
                 nifty_df = pd.DataFrame(nifty_raw, columns=["time", "open", "high", "low", "close", "volume"])
                 nifty_df["time"] = pd.to_datetime(nifty_df["time"])
@@ -185,9 +187,11 @@ class MarketScanService:
 
         # Fetch from DhanHQ
         try:
-            today = datetime.now().strftime("%Y-%m-%d")
-            start = (datetime.now() - timedelta(days=settings.daily_candle_history + 10)).strftime("%Y-%m-%d")
-            raw = await dhan.get_candles(security_id, "1", start, today, symbol=symbol)
+            broker = get_broker()
+            now_ist = datetime.now(KOLKATA)
+            today = now_ist.strftime("%Y-%m-%d")
+            start = (now_ist - timedelta(days=settings.daily_candle_history + 10)).strftime("%Y-%m-%d")
+            raw = await broker.get_candles(security_id, "1", start, today, symbol=symbol)
             if not raw or len(raw) < 20:
                 return None
 
@@ -213,10 +217,12 @@ class MarketScanService:
             signals_scanned.inc()
             log.info("MarketScanService: scanning %s", symbol)
             try:
+                broker = get_broker()
                 # ── 5-min candles (existing) ──────────────────────────
-                today = datetime.now().strftime("%Y-%m-%d")
-                start = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
-                raw = await dhan.get_candles(security_id, 5, start, today, symbol=symbol)
+                now_ist = datetime.now(KOLKATA)
+                today = now_ist.strftime("%Y-%m-%d")
+                start = (now_ist - timedelta(days=3)).strftime("%Y-%m-%d")
+                raw = await broker.get_candles(security_id, 5, start, today, symbol=symbol)
                 if not raw or len(raw) < 60:
                     return
 
@@ -234,17 +240,19 @@ class MarketScanService:
                     snap_daily = compute(daily_df, timeframe="daily")
 
                 # ── Current time for time-gating ──────────────────────
-                current_time = datetime.now().time()
+                current_time = now_ist.time()
+                today_df = df[df.index.date == now_ist.date()]
+                pattern_df = today_df if len(today_df) >= 3 else None
 
                 # ── ORB levels (from first 3 candles of today) ────────
                 or_high, or_low = None, None
-                if len(df) >= 3:
-                    or_candles = df.iloc[:3]
+                if len(today_df) >= 3:
+                    or_candles = today_df.iloc[:3]
                     or_high = float(or_candles["high"].max())
                     or_low = float(or_candles["low"].min())
 
                 # ── Pattern detection (updated with multi-timeframe) ──
-                pattern = best_pattern(snap, candles=df, indicators_daily=snap_daily, current_time=current_time)
+                pattern = best_pattern(snap, candles=pattern_df, indicators_daily=snap_daily, current_time=current_time)
 
                 # ── Memory retrieval (hybrid) ───────────────────────────
                 memory_setup = pattern.pattern_type if pattern else "unknown"
@@ -317,11 +325,25 @@ class MarketScanService:
                     else 0.0
                 )
 
+                regime_min_conviction = settings.min_conviction
+                try:
+                    from yukti.services.regime_service import load as load_regime
+                    regime = await load_regime()
+                    regime_min_conviction = min(10, settings.min_conviction + int(regime.conviction_bump or 0))
+                except Exception as exc:
+                    log.debug("Regime load skipped for gates: %s", exc)
+
+                sector_exposure_pct, trade_sector = self._sector_exposure(all_positions, symbol)
+
                 portfolio = Portfolio(
                     account_value=settings.account_value,
                     open_positions=await count_open_positions(),
                     daily_pnl_pct=await get_daily_pnl_pct(),
                     total_exposure_pct=total_exposure_pct,
+                    trades_today=int(perf.get("trades_today", 0) or 0),
+                    min_conviction_override=regime_min_conviction,
+                    sector_exposure_pct=sector_exposure_pct,
+                    trade_sector=trade_sector,
                 )
                 gate = await run_gates(decision, portfolio)
                 if not gate.passed:
@@ -342,3 +364,33 @@ class MarketScanService:
             except Exception as exc:
                 scan_failures.labels(symbol=symbol).inc()
                 log.error("MarketScanService: scan error %s: %s", symbol, exc, exc_info=True)
+
+    @staticmethod
+    def _sector_exposure(
+        positions: dict[str, dict],
+        incoming_symbol: str,
+    ) -> tuple[dict[str, float], str | None]:
+        """Approximate sector exposure using the scanner's sector map."""
+        try:
+            from yukti.services.universe_scanner_service import SECTOR_STOCKS
+        except Exception:
+            return {}, None
+
+        symbol_to_sector = {
+            symbol: sector
+            for sector, members in SECTOR_STOCKS.items()
+            for symbol in members
+        }
+        exposure: dict[str, float] = {}
+        for pos_symbol, pos in positions.items():
+            sector = symbol_to_sector.get(pos_symbol)
+            if not sector:
+                continue
+            try:
+                notional = float(pos.get("entry_price", 0)) * int(pos.get("quantity", 0))
+            except Exception:
+                continue
+            pct = notional / settings.account_value * 100 if settings.account_value else 0.0
+            exposure[sector] = exposure.get(sector, 0.0) + pct
+
+        return exposure, symbol_to_sector.get(incoming_symbol)
