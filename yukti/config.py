@@ -156,6 +156,14 @@ class Settings(BaseSettings):
     news_lookback_hours: int = Field(default=24, ge=1, le=168)
     results_window_days: int = Field(default=2, ge=0, le=10)
 
+    # Trader hygiene & regime (slice 4)
+    exclude_asm_gsm: bool = True
+    exclude_fno_ban: bool = True
+    exclude_at_circuit: bool = True
+    vix_regime_buckets: list[float] = Field(default_factory=lambda: [12.0, 18.0, 25.0])
+    intraday_dd_throttle_pct: float = Field(default=0.01, gt=0, le=0.10)
+    event_days: list[str] = Field(default_factory=list)
+
     # ── Daily candle (multi-timeframe) ────────────────
     daily_candle_history: int = Field(default=60, ge=20, le=200)
     daily_cache_ttl: int = Field(default=3600 * 8, ge=3600)

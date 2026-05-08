@@ -463,6 +463,17 @@ class UniverseScannerService:
         _annotate_atr_percentile(candidates)
         await _enrich_with_webhook_boosts(candidates)
 
+        # 3c. Hard exclusions (F&O ban / ASM / GSM / at-circuit).
+        try:
+            from yukti.services.exclusions_service import load_today, filter_candidates
+            excl = await load_today()
+            kept, drops = filter_candidates(candidates, excl)
+            if drops:
+                log.info("Exclusions dropped: %s", drops)
+            candidates = kept
+        except Exception as exc:
+            log.warning("Exclusions filter skipped: %s", exc)
+
         # 4. Deduplicate
         candidates = _deduplicate_candidates(candidates)
 
@@ -475,10 +486,24 @@ class UniverseScannerService:
         except Exception:
             pass
 
-        # 6. Select
+        # 6. Apply regime shortlist depth.
+        try:
+            from yukti.services.regime_service import compute as compute_regime
+            regime = await compute_regime()
+            depth = max(0.1, min(1.0, regime.shortlist_depth))
+            effective_pick = max(3, int(round(settings.scanner_pick_count * depth)))
+            log.info(
+                "Regime: bucket=%s vix=%s depth=%.2f → pick_count %d→%d (preservation=%s, event=%s)",
+                regime.bucket, regime.vix, depth, settings.scanner_pick_count,
+                effective_pick, regime.preservation, regime.event_day,
+            )
+        except Exception as exc:
+            log.debug("Regime compute skipped: %s", exc)
+            effective_pick = settings.scanner_pick_count
+
         selected = _select_universe(
             candidates,
-            pick_count=settings.scanner_pick_count,
+            pick_count=effective_pick,
             min_turnover_cr=settings.min_turnover_cr,
             existing_positions=existing_positions,
         )

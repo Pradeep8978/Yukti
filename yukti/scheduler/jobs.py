@@ -202,6 +202,21 @@ async def job_universe_scan() -> None:
     await scanner.run_with_fallback(is_refresh=False)
 
 
+async def job_exclusions_refresh() -> None:
+    """08:15 IST — pull NSE exclusion lists (F&O ban / ASM / GSM)."""
+    if not is_trading_day():
+        log.info("Exclusions refresh skipped: non-trading day")
+        return
+    log.info("=== exclusions refresh ===")
+    try:
+        from yukti.services.exclusions_service import refresh
+        excl = await refresh()
+        log.info("Exclusions: fno_ban=%d asm=%d gsm=%d",
+                 len(excl.fno_ban), len(excl.asm), len(excl.gsm))
+    except Exception as exc:
+        log.error("Exclusions refresh failed: %s", exc)
+
+
 async def job_catalyst_refresh() -> None:
     """08:00 IST — pull NSE announcements + earnings calendar."""
     if not is_trading_day():
@@ -285,6 +300,15 @@ async def job_premarket_rank() -> None:
         await r.set("yukti:premarket:snapshot", _json.dumps(out), ex=6 * 3600)
         await r.aclose()
         log.info("Premarket snapshot: %d symbols with gap data", len(out))
+
+        # Tag at-circuit names from the same snapshot before the scanner runs.
+        try:
+            from yukti.services.exclusions_service import annotate_at_circuit_from_snapshot
+            at_circ = await annotate_at_circuit_from_snapshot()
+            if at_circ:
+                log.info("At-circuit tagged: %d symbols", len(at_circ))
+        except Exception as exc:
+            log.debug("at-circuit annotation skipped: %s", exc)
     except Exception as exc:
         log.error("Premarket rank failed: %s", exc)
 
@@ -301,6 +325,8 @@ def build_scheduler() -> AsyncIOScheduler:
     sched = AsyncIOScheduler(timezone="Asia/Kolkata")
     sched.add_job(job_catalyst_refresh,     "cron", hour=8,  minute=0,
                   id="catalyst_refresh", replace_existing=True)
+    sched.add_job(job_exclusions_refresh,   "cron", hour=8,  minute=15,
+                  id="exclusions_refresh", replace_existing=True)
     sched.add_job(job_premarket_pool_build, "cron", hour=8,  minute=30,
                   id="premarket_pool_build", replace_existing=True)
     sched.add_job(job_universe_scan,        "cron", hour=8,  minute=45)
