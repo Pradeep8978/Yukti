@@ -177,19 +177,53 @@ async def get_items_for_symbol(symbol: str) -> list[NewsItem]:
         return []
 
 
-async def is_pre_results(symbol: str, window_days: int | None = None) -> bool:
-    if window_days is None:
-        window_days = int(getattr(settings, "results_window_days", 2))
+async def get_items_for_symbols(symbols: list[str]) -> dict[str, list[NewsItem]]:
+    """Bulk read of per-symbol catalyst items using a single MGET. Returns a
+    dict keyed by the input symbols; missing/parse-failed entries map to []."""
+    out: dict[str, list[NewsItem]] = {s: [] for s in symbols}
+    if not symbols:
+        return out
+    try:
+        from yukti.data.state import get_redis
+        r = await get_redis()
+        keys = [f"{_CATALYST_PREFIX}{s}" for s in symbols]
+        raws = await r.mget(keys)
+    except Exception as exc:
+        log.debug("CatalystService: bulk read failed: %s", exc)
+        return out
+    for sym, raw in zip(symbols, raws):
+        if not raw:
+            continue
+        try:
+            out[sym] = [NewsItem(**row) for row in json.loads(raw)]
+        except Exception:
+            continue
+    return out
+
+
+async def load_calendar() -> dict[str, str]:
+    """Read the cached earnings calendar once. Empty dict on miss/error."""
     try:
         from yukti.data.state import get_redis
         r = await get_redis()
         raw = await r.get(_CALENDAR_KEY)
         if not raw:
-            return False
-        cal = json.loads(raw)
+            return {}
+        return json.loads(raw)
     except Exception:
-        return False
-    date_str = cal.get(symbol)
+        return {}
+
+
+def is_in_results_window(
+    calendar: dict[str, str],
+    symbol: str,
+    window_days: int | None = None,
+) -> bool:
+    """Pure function: check the pre-loaded calendar dict instead of hitting
+    Redis per symbol."""
+    if window_days is None:
+        window_days = int(getattr(settings, "results_window_days", 2))
+    date_str = calendar.get(symbol)
     if not date_str:
         return False
     try:
@@ -198,3 +232,10 @@ async def is_pre_results(symbol: str, window_days: int | None = None) -> bool:
         return False
     today = datetime.now(timezone.utc).date()
     return abs((d - today).days) <= window_days
+
+
+async def is_pre_results(symbol: str, window_days: int | None = None) -> bool:
+    """Single-symbol async helper retained for backwards compatibility.
+    Prefer `load_calendar()` + `is_in_results_window()` in hot loops."""
+    cal = await load_calendar()
+    return is_in_results_window(cal, symbol, window_days)

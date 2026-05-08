@@ -405,9 +405,13 @@ async def job_renew_and_test_dhan() -> None:
 
         # Test profile endpoint
         try:
-            import requests
+            import httpx
             profile_url = f"{base}/profile"
-            r = requests.get(profile_url, headers={"access-token": token_to_use, "dhanClientId": client_id}, timeout=10)
+            async with httpx.AsyncClient(timeout=10.0) as _hx:
+                r = await _hx.get(
+                    profile_url,
+                    headers={"access-token": token_to_use, "dhanClientId": client_id},
+                )
             if r.status_code == 200:
                 log.info("Dhan renew job: profile OK after renew")
             else:
@@ -482,12 +486,16 @@ async def job_test_dhan_api() -> bool:
     Returns True on 200 OK, False otherwise.
     """
     try:
-        import requests
+        import httpx
         token = settings.dhan_access_token
         client_id = settings.dhan_client_id
         base = settings.dhan_base_url.rstrip("/")
         url = f"{base}/profile"
-        r = requests.get(url, headers={"access-token": token, "dhanClientId": client_id}, timeout=10)
+        async with httpx.AsyncClient(timeout=10.0) as _hx:
+            r = await _hx.get(
+                url,
+                headers={"access-token": token, "dhanClientId": client_id},
+            )
         if r.status_code == 200:
             log.info("Dhan API startup check: profile OK")
             return True

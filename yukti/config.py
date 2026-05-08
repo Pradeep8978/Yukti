@@ -21,12 +21,12 @@ class Settings(BaseSettings):
 
     # ── Self-learning agent ─────────────────────────────
     enable_self_learning: bool = False  # Safe default: must be enabled explicitly
+    enable_learning_loop: bool = False  # Schedules journal-embedding worker
     self_learning_min_rows: int = 100
     self_learning_thresholds: dict = Field(default_factory=lambda: {"win_rate": 0.55, "profit_factor": 1.2})
     # Canary / rollout
     enable_canary_routing: bool = False
     canary_ratio: float = 0.10
-    canary_monitor_duration_seconds: int = 1800
     canary_base_model: str = ""
 
     # Artifact registry (optional S3)
@@ -42,8 +42,6 @@ class Settings(BaseSettings):
     dhan_client_id: str = ""
     dhan_access_token: str = ""
     dhan_base_url: str = "https://api.dhan.co/v2"
-    # How often (hours) to attempt RenewToken. Set to 0 to disable automatic renewal.
-    dhan_token_renew_interval_hours: int = 6
     # If true, attempt to restart the container after persisting a renewed token.
     # Note: restart is best-effort and may require docker socket or host automation.
     dhan_auto_restart_on_renew: bool = False
@@ -131,7 +129,6 @@ class Settings(BaseSettings):
     min_rr: float = Field(default=1.8, gt=0)
     min_conviction: int = Field(default=5, ge=1, le=10)
     max_loss_cap_pct: float = Field(default=0.015, gt=0)
-    max_per_trade_risk_pct: float = Field(default=0.05, gt=0, le=0.1)
     atr_multiplier: float = Field(default=1.5, gt=0)
     max_atr_multiplier: float = Field(default=2.5, gt=0)
 
