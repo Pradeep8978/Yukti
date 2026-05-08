@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, date
+from datetime import datetime
 from typing import Any
 
 import anthropic
@@ -205,47 +205,7 @@ async def retrieve_similar(
     return "Past similar setups:\n" + "\n\n".join(f"  {i+1}. {r}" for i, r in enumerate(results))
 
 
-# ═══════════════════════════════════════════════════════════════
-#  NSE TRADING CALENDAR
-# ═══════════════════════════════════════════════════════════════
-
-# NSE holidays 2025 (update annually)
-NSE_HOLIDAYS_2025 = {
-    date(2025, 1, 26),   # Republic Day
-    date(2025, 3, 14),   # Holi
-    date(2025, 4, 14),   # Dr. Ambedkar Jayanti
-    date(2025, 4, 18),   # Good Friday
-    date(2025, 5, 1),    # Maharashtra Day
-    date(2025, 8, 15),   # Independence Day
-    date(2025, 10, 2),   # Gandhi Jayanti
-    date(2025, 10, 24),  # Diwali (Dussehra)
-    date(2025, 11, 5),   # Diwali Laxmi Pujan
-    date(2025, 12, 25),  # Christmas
-}
-
-NSE_HOLIDAYS_2026 = {
-    date(2026, 1, 26),   # Republic Day
-    date(2026, 8, 15),   # Independence Day
-    date(2026, 10, 2),   # Gandhi Jayanti
-    date(2026, 12, 25),  # Christmas
-    # Add others from NSE circular
-}
-
-ALL_HOLIDAYS = NSE_HOLIDAYS_2025 | NSE_HOLIDAYS_2026
-
-
-def is_trading_day(d: date | None = None) -> bool:
-    d = d or date.today()
-    if d.weekday() >= 5:      # Saturday=5, Sunday=6
-        return False
-    return d not in ALL_HOLIDAYS
-
-
-def is_trading_hours() -> bool:
-    """True if current time is within normal NSE trading window."""
-    from datetime import time
-    now = datetime.now().time()
-    return time(9, 15) <= now <= time(15, 10)
+from yukti.scheduler.calendar import is_trading_day, is_trading_hours
 
 
 # ═══════════════════════════════════════════════════════════════

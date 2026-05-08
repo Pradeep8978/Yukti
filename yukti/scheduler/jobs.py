@@ -5,8 +5,7 @@ APScheduler cron jobs and NSE trading calendar.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pathlib import Path
@@ -22,40 +21,12 @@ _ENV_FILE_MODE = stat.S_IRUSR | stat.S_IWUSR
 log = logging.getLogger(__name__)
 from yukti.config import settings
 from yukti.jobs.meta_lessons import generate_meta_lessons
-
-# Timezone for NSE (India Standard Time)
-KOLKATA = ZoneInfo("Asia/Kolkata")
-
-# ── NSE holidays (update annually from NSE circular) ─────────────────────────
-NSE_HOLIDAYS: set[date] = {
-    date(2025, 1, 26), date(2025, 3, 14), date(2025, 4, 14),
-    date(2025, 4, 18), date(2025, 5, 1),  date(2025, 8, 15),
-    date(2025, 10, 2), date(2025, 10, 24), date(2025, 11, 5),
-    date(2025, 12, 25),
-    date(2026, 1, 26), date(2026, 8, 15), date(2026, 10, 2),
-    date(2026, 12, 25),
-}
-
-
-def is_trading_day(d: date | None = None) -> bool:
-    # Evaluate trading day in Asia/Kolkata timezone to avoid host-UTC mismatches
-    if d is None:
-        d = datetime.now(KOLKATA).date()
-    return d.weekday() < 5 and d not in NSE_HOLIDAYS
-
-
-def is_trading_hours(now: datetime | None = None) -> bool:
-    # Compare times in Asia/Kolkata timezone
-    if now is None:
-        now = datetime.now(KOLKATA)
-    else:
-        # If naive datetime provided, treat it as UTC and convert to IST
-        if now.tzinfo is None:
-            now = datetime.fromtimestamp(now.timestamp(), tz=KOLKATA)
-        else:
-            now = now.astimezone(KOLKATA)
-    t = now.time()
-    return time(9, 15) <= t <= time(15, 10)
+from yukti.scheduler.calendar import (
+    KOLKATA,
+    is_trading_day,
+    is_trading_hours,
+    refresh_holidays,
+)
 
 
 def is_fo_expiry(d: date | None = None) -> bool:
@@ -64,6 +35,13 @@ def is_fo_expiry(d: date | None = None) -> bool:
     if d.weekday() != 3:
         return False
     return (d + timedelta(days=7)).month != d.month
+
+
+async def job_refresh_holidays() -> None:
+    """Weekly job to pull the latest NSE holiday list from the NSE API."""
+    log.info("=== NSE holiday refresh ===")
+    holidays = await refresh_holidays()
+    log.info("NSE holidays updated: %d holidays in calendar", len(holidays))
 
 
 # ── Scheduled jobs ────────────────────────────────────────────────────────────
@@ -386,6 +364,11 @@ def build_scheduler() -> AsyncIOScheduler:
         log.info("Scheduled Dhan token renewal at 08:00 and 18:00 IST daily")
     except Exception as exc:
         log.warning("Failed to schedule Dhan renew jobs: %s", exc)
+
+    # Refresh NSE holiday calendar every Monday at 07:00 IST
+    sched.add_job(job_refresh_holidays, "cron", day_of_week="mon", hour=7, minute=0,
+                  id="nse_holiday_refresh", replace_existing=True)
+    log.info("NSE holiday refresh scheduled: every Monday 07:00 IST")
 
     return sched
 
