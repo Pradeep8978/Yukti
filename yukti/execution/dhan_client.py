@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-import requests
+import httpx
 from datetime import date
 import logging
 import time
@@ -112,43 +112,44 @@ class DhanClient:
         self._dhan = dhanhq(ctx)
         self._loop = asyncio.get_event_loop()
 
-    def _renew_access_token_sync(self) -> str | None:
-        """Synchronous renew token call using the Dhan RenewToken endpoint.
+    async def _fetch_renewed_token(self) -> str | None:
+        """Native-async call to the Dhan RenewToken endpoint via httpx.
 
         Returns the new access token string on success, otherwise None.
         """
+        if not self._access_token:
+            log.debug("DhanClient: no access token present to renew")
+            return None
+        url = self._base + '/RenewToken'
+        headers = {
+            'access-token': str(self._access_token),
+            'dhanClientId': str(self._cid),
+        }
         try:
-            if not self._access_token:
-                log.debug("DhanClient: no access token present to renew")
-                return None
-            url = self._base + '/RenewToken'
-            headers = {
-                'access-token': str(self._access_token),
-                'dhanClientId': str(self._cid),
-            }
-            r = requests.get(url, headers=headers, timeout=10)
-            try:
-                data = r.json()
-            except Exception:
-                log.warning("DhanClient: RenewToken non-json response: %s", r.text[:200])
-                return None
-            if r.status_code == 200:
-                # New token typically in 'accessToken' key
-                new_token = data.get('accessToken') or data.get('access_token') or data.get('AccessToken')
-                if new_token:
-                    return new_token
-                # Some responses may nest the token
-                if isinstance(data.get('data'), dict):
-                    return data['data'].get('accessToken') or data['data'].get('access_token')
-            else:
-                log.warning("DhanClient: RenewToken failed status=%s body=%s", r.status_code, r.text[:400])
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(url, headers=headers)
         except Exception as exc:
             log.exception("DhanClient: RenewToken request failed: %s", exc)
+            return None
+
+        try:
+            data = r.json()
+        except Exception:
+            log.warning("DhanClient: RenewToken non-json response: %s", r.text[:200])
+            return None
+        if r.status_code != 200:
+            log.warning("DhanClient: RenewToken failed status=%s body=%s", r.status_code, r.text[:400])
+            return None
+        new_token = data.get('accessToken') or data.get('access_token') or data.get('AccessToken')
+        if new_token:
+            return new_token
+        if isinstance(data.get('data'), dict):
+            return data['data'].get('accessToken') or data['data'].get('access_token')
         return None
 
     async def _renew_access_token(self) -> bool:
-        """Async wrapper to renew the access token and reinitialize the client if successful."""
-        new_token = await self._loop.run_in_executor(None, self._renew_access_token_sync)
+        """Renew the access token and reinitialise the client if successful."""
+        new_token = await self._fetch_renewed_token()
         if not new_token:
             return False
         # Update runtime settings and recreate underlying client

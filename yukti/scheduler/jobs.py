@@ -11,7 +11,13 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pathlib import Path
 import os
+import stat
 import subprocess
+
+# Owner read+write (0o600). Used for both `.env` and `.env.deploy` after the
+# Dhan token renew job persists fresh credentials. Owner retains write so the
+# next renew cycle can rewrite the file; group/other have no access.
+_ENV_FILE_MODE = stat.S_IRUSR | stat.S_IWUSR
 
 log = logging.getLogger(__name__)
 from yukti.config import settings
@@ -405,9 +411,13 @@ async def job_renew_and_test_dhan() -> None:
 
         # Test profile endpoint
         try:
-            import requests
+            import httpx
             profile_url = f"{base}/profile"
-            r = requests.get(profile_url, headers={"access-token": token_to_use, "dhanClientId": client_id}, timeout=10)
+            async with httpx.AsyncClient(timeout=10.0) as _hx:
+                r = await _hx.get(
+                    profile_url,
+                    headers={"access-token": token_to_use, "dhanClientId": client_id},
+                )
             if r.status_code == 200:
                 log.info("Dhan renew job: profile OK after renew")
             else:
@@ -442,8 +452,30 @@ async def job_renew_and_test_dhan() -> None:
             try:
                 tmp = p.with_suffix(".tmp")
                 tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+                # Restrict perms BEFORE the rename so the destination is never
+                # briefly world-readable; re-chmod AFTER the rename in case the
+                # platform's atomic rename does not preserve mode (rare, but
+                # cheap to be defensive). 0o600 = owner read+write — the renew
+                # job needs write to rewrite the file on the next cycle.
+                try:
+                    os.chmod(tmp, _ENV_FILE_MODE)
+                except OSError as exc:
+                    log.warning("Failed to chmod 600 on %s: %s", tmp, exc)
                 tmp.replace(p)
-                log.info("Dhan token persisted to %s", p)
+                try:
+                    os.chmod(p, _ENV_FILE_MODE)
+                except OSError as exc:
+                    log.warning("Failed to chmod 600 on %s: %s", p, exc)
+
+                # Verify the file is owner-writable so a regression here would
+                # be loud rather than silently breaking the next renew cycle.
+                if not os.access(p, os.W_OK):
+                    log.error(
+                        "Token persist verification failed: %s is not writable "
+                        "by the running user — next renew will fail", p,
+                    )
+                else:
+                    log.info("Dhan token persisted to %s (mode=600, writable)", p)
             except Exception as exc:
                 log.error("Failed to persist Dhan token to %s: %s", p, exc)
 
@@ -476,12 +508,16 @@ async def job_test_dhan_api() -> bool:
     Returns True on 200 OK, False otherwise.
     """
     try:
-        import requests
+        import httpx
         token = settings.dhan_access_token
         client_id = settings.dhan_client_id
         base = settings.dhan_base_url.rstrip("/")
         url = f"{base}/profile"
-        r = requests.get(url, headers={"access-token": token, "dhanClientId": client_id}, timeout=10)
+        async with httpx.AsyncClient(timeout=10.0) as _hx:
+            r = await _hx.get(
+                url,
+                headers={"access-token": token, "dhanClientId": client_id},
+            )
         if r.status_code == 200:
             log.info("Dhan API startup check: profile OK")
             return True

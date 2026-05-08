@@ -185,23 +185,35 @@ def _select_universe(
 #  DATA FETCHING (async, hits DhanHQ / Redis / news)
 # ═══════════════════════════════════════════════════════════════
 
+# Cap on concurrent candle fetches. DhanHQ historical-data endpoints have a
+# token-bucket rate limiter inside the client; this just keeps scheduling
+# overhead and broker pressure bounded for ~500-symbol pools.
+_SCANNER_FETCH_CONCURRENCY = 8
+
+
 async def _fetch_volume_and_price_data(symbols: dict[str, str]) -> list[dict[str, Any]]:
     """
-    Fetch previous-day candles for all symbols in the pool.
-    Computes volume ratio and price change for each.
+    Fetch previous-day candles for all symbols in the pool, in parallel
+    (bounded by `_SCANNER_FETCH_CONCURRENCY`). Computes volume ratio and
+    price change for each surviving symbol.
     """
     from yukti.execution.dhan_client import dhan
 
-    candidates: list[dict[str, Any]] = []
     today = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    sem = asyncio.Semaphore(_SCANNER_FETCH_CONCURRENCY)
 
-    for symbol, sec_id in symbols.items():
+    async def _fetch_one(symbol: str, sec_id: str) -> dict[str, Any] | None:
+        async with sem:
+            try:
+                raw = await dhan.get_candles(sec_id, "1", start, today)
+            except Exception as exc:
+                log.warning("Scanner: failed to fetch %s: %s", symbol, exc)
+                return None
+        if not raw or len(raw) < 20:
+            return None
+
         try:
-            raw = await dhan.get_candles(sec_id, "1", start, today)
-            if not raw or len(raw) < 20:
-                continue
-
             df = pd.DataFrame(
                 raw, columns=["time", "open", "high", "low", "close", "volume"]
             ).astype({c: float for c in ["open", "high", "low", "close", "volume"]})
@@ -214,20 +226,25 @@ async def _fetch_volume_and_price_data(symbols: dict[str, str]) -> list[dict[str
                 change_pct = (df["close"].iloc[-1] - df["close"].iloc[-2]) / df["close"].iloc[-2] * 100
 
             avg_turnover = (df["close"] * df["volume"]).rolling(20).mean().iloc[-1] / 1e7  # in crores
-
-            candidates.append({
-                "symbol": symbol,
-                "security_id": sec_id,
-                "vol_ratio": float(vol_ratio),
-                "change_pct": float(change_pct),
-                "has_catalyst": False,
-                "sector_in_play": False,
-                "avg_turnover_cr": float(avg_turnover),
-            })
         except Exception as exc:
-            log.warning("Scanner: failed to fetch %s: %s", symbol, exc)
+            log.warning("Scanner: failed to compute features for %s: %s", symbol, exc)
+            return None
 
-    return candidates
+        return {
+            "symbol": symbol,
+            "security_id": sec_id,
+            "vol_ratio": float(vol_ratio),
+            "change_pct": float(change_pct),
+            "has_catalyst": False,
+            "sector_in_play": False,
+            "avg_turnover_cr": float(avg_turnover),
+        }
+
+    results = await asyncio.gather(
+        *(_fetch_one(sym, sid) for sym, sid in symbols.items()),
+        return_exceptions=False,
+    )
+    return [r for r in results if r is not None]
 
 
 async def _enrich_with_catalysts(
@@ -245,13 +262,19 @@ async def _enrich_with_catalysts(
     if enabled:
         try:
             from yukti.services.catalyst_service import (
-                get_items_for_symbol,
-                is_pre_results,
+                get_items_for_symbols,
+                load_calendar,
+                is_in_results_window,
                 score_catalyst_for_symbol,
             )
+            symbols = [c["symbol"] for c in candidates]
+            # Two Redis round-trips total (MGET + calendar GET) instead of
+            # 2 × N round-trips in the per-candidate loop.
+            items_by_symbol = await get_items_for_symbols(symbols)
+            calendar = await load_calendar()
             for c in candidates:
-                items = await get_items_for_symbol(c["symbol"])
-                pre_res = await is_pre_results(c["symbol"])
+                items = items_by_symbol.get(c["symbol"], [])
+                pre_res = is_in_results_window(calendar, c["symbol"])
                 pts = score_catalyst_for_symbol(c["symbol"], items, in_results_window=pre_res)
                 if pts > 0:
                     c["catalyst_pts"] = pts
@@ -293,27 +316,26 @@ async def _enrich_with_premarket_gap(candidates: list[dict[str, Any]]) -> None:
 
 
 async def _enrich_with_webhook_boosts(candidates: list[dict[str, Any]]) -> None:
-    """Read non-expired webhook score boosts from `yukti:scanner:boosts`.
-    Slice 5 wires the actual endpoint; this consumer is harmless when empty."""
+    """Read non-expired webhook score boosts. Each symbol's boost lives in its
+    own key (`yukti:scanner:boosts:{SYM}`) with an independent TTL — set by
+    the webhook handler — so reads use a single MGET keyed on candidate
+    symbols rather than scanning the full key space."""
+    if not candidates:
+        return
     try:
         from yukti.data.state import get_redis
         r = await get_redis()
-        keys = await r.hkeys("yukti:scanner:boosts")
-        if not keys:
-            return
-        for sym in keys:
-            raw = await r.hget("yukti:scanner:boosts", sym)
+        keys = [f"yukti:scanner:boosts:{c['symbol']}" for c in candidates]
+        raws = await r.mget(keys)
+        for c, raw in zip(candidates, raws):
             if not raw:
                 continue
             try:
                 payload = json.loads(raw)
             except Exception:
                 continue
-            for c in candidates:
-                if c["symbol"] == sym:
-                    c["score_boost"] = float(payload.get("score_boost") or 0)
-                    c["boost_source"] = payload.get("source")
-                    break
+            c["score_boost"] = float(payload.get("score_boost") or 0)
+            c["boost_source"] = payload.get("source")
     except Exception as exc:
         log.debug("webhook boost read failed: %s", exc)
 

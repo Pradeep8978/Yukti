@@ -37,7 +37,11 @@ _NSE_HEADERS = {
     "Referer": "https://www.nseindia.com/",
 }
 
-_FNO_BAN_URL = "https://www.nseindia.com/api/fiidiiTradeReact"   # placeholder
+# NSE publishes the daily F&O securities-in-ban list as a CSV under nsearchives.
+# Format: header row "SrNo,Symbol" then symbol rows. The JSON `/api/fnoBan`
+# endpoint also exists; we prefer the archive CSV because it has a stable schema.
+_FNO_BAN_CSV_URL = "https://nsearchives.nseindia.com/content/fo/fo_secban.csv"
+_FNO_BAN_JSON_URL = "https://www.nseindia.com/api/fnoBan"        # JSON fallback
 _ASM_URL     = "https://www.nseindia.com/api/reportASM"          # ASM long/short term
 _GSM_URL     = "https://www.nseindia.com/api/reportGSM"          # GSM stages
 
@@ -76,8 +80,33 @@ async def _fetch_json(url: str, prime: bool = True) -> dict | list | None:
             resp.raise_for_status()
             return resp.json()
     except Exception as exc:
-        log.debug("Exclusions fetch failed for %s: %s", url, exc)
+        log.warning("Exclusions fetch failed for %s: %s", url, exc)
         return None
+
+
+async def _fetch_fno_ban_symbols() -> set[str]:
+    """Fetch today's F&O ban list. Tries the CSV archive first, falls back to
+    the JSON API. Returns an empty set on any failure (logged as warning so
+    silent breakage in production is visible)."""
+    out: set[str] = set()
+    # 1) CSV archive: "SrNo,Symbol\n1,ABC\n..."
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+            resp = await client.get(_FNO_BAN_CSV_URL, headers=_NSE_HEADERS)
+            resp.raise_for_status()
+            text = resp.text or ""
+        for line in text.splitlines()[1:]:  # skip header
+            parts = [p.strip() for p in line.split(",") if p.strip()]
+            if len(parts) >= 2 and parts[1].upper().isalnum():
+                out.add(parts[1].upper())
+        if out:
+            return out
+    except Exception as exc:
+        log.warning("F&O ban CSV fetch failed: %s", exc)
+
+    # 2) JSON fallback
+    payload = await _fetch_json(_FNO_BAN_JSON_URL)
+    return _extract_symbols(payload, ("data",), ("Banned",), ("FnOSecBan",))
 
 
 def _extract_symbols(payload, *paths) -> set[str]:
@@ -114,7 +143,7 @@ async def refresh() -> Exclusions:
     excl = Exclusions(as_of=today)
 
     if getattr(settings, "exclude_fno_ban", True):
-        excl.fno_ban = _extract_symbols(await _fetch_json(_FNO_BAN_URL), ("data",), ("Banned",))
+        excl.fno_ban = await _fetch_fno_ban_symbols()
 
     if getattr(settings, "exclude_asm_gsm", True):
         asm_payload = await _fetch_json(_ASM_URL)

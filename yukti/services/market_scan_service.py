@@ -150,10 +150,17 @@ class MarketScanService:
                 nifty_df = nifty_df.astype({"close": float})
                 nifty_chg = float((nifty_df["close"].iloc[-1] - nifty_df["close"].iloc[-2]) / nifty_df["close"].iloc[-2] * 100)
                 nifty_trend = "UP" if nifty_df["close"].iloc[-1] > nifty_df["close"].iloc[-10] else "DOWN"
-                # Cache Nifty change for circuit-breaker gate
+                # Cache Nifty change for circuit-breaker gate. Stored as JSON
+                # with a write timestamp so the consumer can reject stale data
+                # even if (somehow) a long TTL is set elsewhere.
+                import time as _time
                 from yukti.data.state import get_redis
                 r = await get_redis()
-                await r.set("yukti:market:nifty_chg_pct", str(nifty_chg), ex=600)
+                await r.set(
+                    "yukti:market:nifty_chg_pct",
+                    json.dumps({"chg_pct": nifty_chg, "ts": int(_time.time())}),
+                    ex=600,
+                )
         except Exception as exc:
             log.warning("MarketScanService: Nifty fetch failed: %s", exc)
 
