@@ -489,6 +489,56 @@ class DhanClient:
             symbol=symbol,
         )
 
+    # ── Option chain ──────────────────────────────────────────────────────────
+
+    async def fetch_option_chain(
+        self,
+        under_security_id: str,
+        under_exchange_segment: str,
+        expiry: str,
+    ) -> dict[str, Any]:
+        """Fetch full option chain for an underlying. Returns raw SDK response."""
+        fn = getattr(self._dhan, "option_chain", None)
+        if fn is None:
+            log.warning("DhanClient: option_chain not available in installed SDK")
+            return {}
+        return await self._call(fn, under_security_id, under_exchange_segment, expiry)
+
+    async def get_market_depth(self, security_id: str) -> dict[str, Any]:
+        """
+        Returns top-of-book bid/ask spread for a single equity security.
+        Returns {"spread_pct": float, "best_bid_qty": int, "best_ask_qty": int}
+        or empty dict on failure / unsupported SDK.
+        """
+        try:
+            quote_fn = (
+                getattr(self._dhan, "market_quote", None)
+                or getattr(self._dhan, "quote_data", None)
+            )
+            if quote_fn is None:
+                return {}
+            payload = {"NSE_EQ": [int(security_id)]}
+            res = await self._call(quote_fn, securities=payload)
+            data = res.get("data", {}) if isinstance(res, dict) else {}
+            nse = data.get("data", {}).get("NSE_EQ") or data.get("NSE_EQ") or {}
+            entry = nse.get(str(security_id)) or nse.get(int(security_id)) or {}
+            if not entry:
+                return {}
+            best_bid     = float(entry.get("buy_price")      or entry.get("best_bid_price") or 0)
+            best_ask     = float(entry.get("sell_price")      or entry.get("best_ask_price") or entry.get("offer_price") or 0)
+            best_bid_qty = int(entry.get("buy_quantity")  or entry.get("best_bid_qty")   or 999)
+            best_ask_qty = int(entry.get("sell_quantity") or entry.get("best_ask_qty")   or 999)
+            mid          = (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0
+            spread_pct   = ((best_ask - best_bid) / mid * 100) if mid > 0 else 0.0
+            return {
+                "spread_pct":    round(spread_pct, 4),
+                "best_bid_qty":  best_bid_qty,
+                "best_ask_qty":  best_ask_qty,
+            }
+        except Exception as exc:
+            log.debug("get_market_depth failed for %s: %s", security_id, exc)
+            return {}
+
     # ── Market order (square off) ─────────────────────────────────────────────
 
     async def market_exit(

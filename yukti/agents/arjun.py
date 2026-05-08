@@ -120,6 +120,16 @@ Step 1 — Market Bias (from Nifty)
 - Nifty flat/choppy = NEUTRAL (selective trades only)
 - Major news/event day = AVOID (volatility too high)
 
+Step 1.3 — OPTIONS MARKET ALIGNMENT (from OPTIONS MARKET box above)
+- PCR > 1.3 (heavy put buying): adds SHORT confluence. If already BEARISH, +1 conviction.
+  If trying LONG, requires extra confirmation (breakout + volume) or skip.
+- PCR < 0.7 (heavy call buying): adds LONG confluence. If already BULLISH, +1 conviction.
+  If trying SHORT, requires extra confirmation or skip.
+- Max Pain: if spot is >3% above max pain near expiry (Thu), expect mean reversion pull.
+  Reduce conviction by 1 for breakouts in this zone.
+- ATM IV > 25%: wide expected range, widen stops (use 2×ATR instead of 1.5×ATR).
+- ATM IV < 12%: low volatility — momentum trades riskier, prefer range setups.
+
 Step 1.5 — DAILY TIMEFRAME CHECK:
 - If daily trend is STRONG (ADX > 25): only trade WITH the trend unless conviction ≥ 9
 - If daily is at major resistance: don't go LONG unless breakout confirmed on daily close

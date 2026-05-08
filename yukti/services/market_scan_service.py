@@ -284,6 +284,26 @@ class MarketScanService:
                     record_skip("cooldown_preai")
                     return
 
+                # ── Liquidity gate: skip illiquid symbols before AI call ───
+                # Fail-open: depth API errors never block a trade.
+                try:
+                    depth = await broker.get_market_depth(security_id)
+                    if depth:
+                        if depth.get("spread_pct", 0) > 0.15:
+                            record_skip("illiquid_spread")
+                            log.info("MarketScanService: %s skipped — spread %.3f%% > 0.15%%", symbol, depth["spread_pct"])
+                            return
+                        top_of_book = min(
+                            depth.get("best_bid_qty", 999),
+                            depth.get("best_ask_qty", 999),
+                        )
+                        if top_of_book < 200:
+                            record_skip("illiquid_thin_book")
+                            log.info("MarketScanService: %s skipped — thin book qty=%d", symbol, top_of_book)
+                            return
+                except Exception:
+                    pass
+
                 # ── Memory retrieval (hybrid) ───────────────────────────
                 memory_setup = pattern.pattern_type if pattern else "unknown"
                 memory_dir   = "LONG" if macro.nifty_trend == "UP" else "SHORT" if macro.nifty_trend == "DOWN" else "LONG"

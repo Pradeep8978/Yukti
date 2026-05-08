@@ -25,12 +25,12 @@ import httpx
 log = logging.getLogger(__name__)
 
 # ── Redis key constants ───────────────────────────────────────────────────────
-_KEY_NIFTY_CHG   = "yukti:market:nifty_chg_pct"
-_KEY_NIFTY_TREND = "yukti:market:nifty_trend"
-_KEY_VIX         = "yukti:market:india_vix"
-_KEY_FII_NET     = "yukti:market:fii_net_cr"
-_KEY_DII_NET     = "yukti:market:dii_net_cr"
-_KEY_HEADLINES   = "yukti:market:headlines"
+_KEY_NIFTY_CHG      = "yukti:market:nifty_chg_pct"
+_KEY_NIFTY_TREND    = "yukti:market:nifty_trend"
+_KEY_VIX            = "yukti:market:india_vix"
+_KEY_FII_NET        = "yukti:market:fii_net_cr"
+_KEY_DII_NET        = "yukti:market:dii_net_cr"
+_KEY_HEADLINES      = "yukti:market:headlines"
 
 _TTL_NIFTY     = 600   # 10 min — Nifty + VIX
 _TTL_FII       = 3600  # 1 hour — FII/DII updates a few times per day
@@ -44,12 +44,17 @@ _NSE_FII_URL    = "https://www.nseindia.com/api/fiidiiTradeReact"
 @dataclass
 class MacroContext:
     """Snapshot of macro conditions passed to build_context() each cycle."""
-    nifty_chg_pct: float = 0.0
-    nifty_trend:   str   = "SIDEWAYS"
-    india_vix:     Optional[float] = None
-    fii_net_cr:    Optional[float] = None   # crores; negative = net selling
-    dii_net_cr:    Optional[float] = None
-    headlines:     list[str] = field(default_factory=list)
+    nifty_chg_pct:     float = 0.0
+    nifty_trend:       str   = "SIDEWAYS"
+    india_vix:         Optional[float] = None
+    fii_net_cr:        Optional[float] = None   # crores; negative = net selling
+    dii_net_cr:        Optional[float] = None
+    headlines:         list[str] = field(default_factory=list)
+    # Option chain sentiment (Nifty weekly)
+    nifty_pcr:         Optional[float] = None   # Put-Call Ratio
+    nifty_max_pain:    Optional[float] = None   # Max pain strike (₹)
+    nifty_atm_iv:      Optional[float] = None   # ATM implied volatility (%)
+    options_sentiment: str = "NEUTRAL"          # BULLISH_OPTIONS | BEARISH_OPTIONS | NEUTRAL
 
     # ── Derived labels used in context prompt ─────────────────────────────────
 
@@ -80,6 +85,16 @@ class MacroContext:
         sign = "+" if self.dii_net_cr >= 0 else ""
         direction = "buying — absorbing" if self.dii_net_cr >= 0 else "selling"
         return f"{sign}₹{self.dii_net_cr:,.0f} Cr ({direction})"
+
+    @property
+    def pcr_label(self) -> str:
+        if self.nifty_pcr is None:
+            return "N/A"
+        if self.nifty_pcr > 1.3:
+            return f"{self.nifty_pcr:.2f} (heavy put buying — bearish hedge)"
+        if self.nifty_pcr < 0.7:
+            return f"{self.nifty_pcr:.2f} (heavy call buying — bullish greed)"
+        return f"{self.nifty_pcr:.2f} (neutral)"
 
     @property
     def headlines_text(self) -> str:
@@ -293,11 +308,20 @@ async def fetch_macro_context(nifty_chg: float, nifty_trend: str) -> MacroContex
                         cached_dii = str(dii_net)
                         await r.set(_KEY_DII_NET, cached_dii, ex=_TTL_FII)
 
-    if need_headlines:
-        titles = await _fetch_headlines()
-        if titles:
-            cached_headlines = "||".join(titles)
-            await r.set(_KEY_HEADLINES, cached_headlines, ex=_TTL_HEADLINES)
+    # Headlines and option metrics fetched in parallel (both have their own Redis caches)
+    headlines_task = _fetch_headlines() if need_headlines else None
+    from yukti.services.option_metrics_service import fetch_nifty_option_metrics
+    option_task = fetch_nifty_option_metrics()
+
+    headlines_result, option_metrics = await asyncio.gather(
+        headlines_task if headlines_task else asyncio.sleep(0),
+        option_task,
+        return_exceptions=True,
+    )
+
+    if need_headlines and isinstance(headlines_result, list) and headlines_result:
+        cached_headlines = "||".join(headlines_result)
+        await r.set(_KEY_HEADLINES, cached_headlines, ex=_TTL_HEADLINES)
 
     # ── Populate context from cache ───────────────────────────────────────────
     if cached_vix:
@@ -321,9 +345,17 @@ async def fetch_macro_context(nifty_chg: float, nifty_trend: str) -> MacroContex
     if cached_headlines:
         ctx.headlines = [h.strip() for h in cached_headlines.split("||") if h.strip()]
 
+    # ── Option chain metrics ──────────────────────────────────────────────────
+    from yukti.services.option_metrics_service import OptionMetrics
+    if isinstance(option_metrics, OptionMetrics):
+        ctx.nifty_pcr         = option_metrics.pcr
+        ctx.nifty_max_pain    = option_metrics.max_pain
+        ctx.nifty_atm_iv      = option_metrics.atm_iv
+        ctx.options_sentiment = option_metrics.sentiment
+
     log.debug(
-        "MacroContext: Nifty %+.2f%% %s | VIX %s | FII %s | DII %s | %d headlines",
+        "MacroContext: Nifty %+.2f%% %s | VIX %s | FII %s | DII %s | PCR %s | %d headlines",
         ctx.nifty_chg_pct, ctx.nifty_trend, ctx.india_vix,
-        ctx.fii_net_cr, ctx.dii_net_cr, len(ctx.headlines),
+        ctx.fii_net_cr, ctx.dii_net_cr, ctx.nifty_pcr, len(ctx.headlines),
     )
     return ctx

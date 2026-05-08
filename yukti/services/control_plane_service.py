@@ -64,6 +64,16 @@ class ControlPlaneService:
         except Exception as exc:
             log.warning("ControlPlaneService: Scheduler startup failed: %s", exc)
 
+        # Start live WebSocket feed for real-time SL/target detection
+        try:
+            from yukti.execution.live_feed import get_feed_manager
+            from yukti.execution.monitor import _on_tick
+            feed = get_feed_manager()
+            await feed.start(_on_tick)
+            log.info("ControlPlaneService: live feed started")
+        except Exception as exc:
+            log.warning("ControlPlaneService: live feed startup failed (non-fatal): %s", exc)
+
     async def stop(self, reason: str = "") -> None:
         """Stop all services."""
         log.info("ControlPlaneService: stopping")
