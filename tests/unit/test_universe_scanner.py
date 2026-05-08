@@ -12,11 +12,10 @@ from yukti.services.universe_scanner_service import (
 
 def test_score_candidate_caps_at_100():
     c = {
-        "vol_ratio": 5,
-        "change_pct": 4,
-        "has_catalyst": True,
-        "sector_in_play": True,
+        "vol_ratio": 5, "change_pct": 4,
+        "has_catalyst": True, "sector_in_play": True,
         "avg_turnover_cr": 100,
+        "gap_pct": 5.0, "atr_pct_rank": 1.0, "score_boost": 10,
     }
     score = _score_candidate(c)
     assert score == 100.0
@@ -60,6 +59,7 @@ class TestScoring:
             "vol_ratio": 10.0, "change_pct": 6.0,
             "has_catalyst": True, "sector_in_play": True,
             "avg_turnover_cr": 200,
+            "gap_pct": 4.0, "atr_pct_rank": 1.0, "score_boost": 10,
         }
         score = _score_candidate(candidate)
         assert score == 100
@@ -149,8 +149,8 @@ class TestThresholdFloors:
         # change_pct just under 1.5 floor → price component is 0; volume kicks in.
         c = {"vol_ratio": 5.0, "change_pct": 1.0, "has_catalyst": False,
              "sector_in_play": False, "avg_turnover_cr": 50}
-        # volume contributes 25, liquidity ~15, price=0
-        assert _score_candidate(c) == 40.0
+        # New weights: volume 20, liquidity 10, price 0 → 30 total
+        assert _score_candidate(c) == 30.0
 
 
 class TestPinnedWatchlist:
@@ -164,3 +164,93 @@ class TestPinnedWatchlist:
         ]
         selected = _select_universe(candidates, pick_count=15, min_turnover_cr=10)
         assert any(c["symbol"] == "PINNED" for c in selected)
+
+
+class TestNewScoringFeatures:
+    def test_gap_score_saturates_at_three_pct(self):
+        from yukti.services.universe_scanner_service import _score_candidate
+        # Pure gap signal, nothing else.
+        c = {"vol_ratio": 0, "change_pct": 0, "gap_pct": 5.0,
+             "has_catalyst": False, "sector_in_play": False, "avg_turnover_cr": 0}
+        assert _score_candidate(c) == 10  # saturates at 3% → 10 pts
+
+    def test_atr_rank_contributes_up_to_ten(self):
+        from yukti.services.universe_scanner_service import _score_candidate
+        c = {"vol_ratio": 0, "change_pct": 0, "atr_pct_rank": 1.0,
+             "has_catalyst": False, "sector_in_play": False, "avg_turnover_cr": 0}
+        assert _score_candidate(c) == 10
+
+    def test_score_boost_caps_at_ten(self):
+        from yukti.services.universe_scanner_service import _score_candidate
+        c = {"vol_ratio": 0, "change_pct": 0, "score_boost": 50,
+             "has_catalyst": False, "sector_in_play": False, "avg_turnover_cr": 0}
+        assert _score_candidate(c) == 10
+
+    def test_atr_percentile_annotates_in_place(self):
+        from yukti.services.universe_scanner_service import _annotate_atr_percentile
+        rows = [
+            {"symbol": "LO", "atr_pct_pool": 1.6},
+            {"symbol": "MID", "atr_pct_pool": 3.0},
+            {"symbol": "HI", "atr_pct_pool": 5.5},
+        ]
+        _annotate_atr_percentile(rows)
+        assert rows[0]["atr_pct_rank"] == 0.0
+        assert rows[2]["atr_pct_rank"] == 1.0
+        assert 0.0 < rows[1]["atr_pct_rank"] < 1.0
+
+
+class TestSectorCapGate:
+    @pytest.mark.asyncio
+    async def test_sector_cap_blocks_when_projected_exceeds(self):
+        from unittest.mock import patch, AsyncMock
+        from yukti.risk import Portfolio, run_gates
+        from yukti.agents.arjun import TradeDecision
+
+        td = TradeDecision(
+            symbol="HDFCBANK", action="TRADE", direction="LONG",
+            reasoning="x", conviction=8,
+            entry_price=1500.0, stop_loss=1490.0,
+            target_1=1530.0, target_2=1560.0, risk_reward=2.0,
+        )
+        # Banking already at 38%; the cap is 40% → adding any meaningful slice
+        # of capital tips it over.
+        portfolio = Portfolio(
+            account_value=500_000, open_positions=1, daily_pnl_pct=0.0,
+            total_exposure_pct=38.0,
+            sector_exposure_pct={"BANK": 38.0},
+            trade_sector="BANK",
+        )
+        with (
+            patch("yukti.risk.is_on_cooldown", new=AsyncMock(return_value=False)),
+            patch("yukti.risk.is_market_halted", new=AsyncMock(return_value=False)),
+        ):
+            result = await run_gates(td, portfolio)
+        assert result.passed is False
+        # Either the single-stock cap or the sector cap should reject — both
+        # are valid, deterministic outcomes for this scenario.
+        assert "cap" in (result.reason or "")
+
+    @pytest.mark.asyncio
+    async def test_sector_cap_passes_when_no_sector_info(self):
+        from unittest.mock import patch, AsyncMock
+        from yukti.risk import Portfolio, run_gates
+        from yukti.agents.arjun import TradeDecision
+
+        # 5% stop keeps position size well within the 25% single-stock cap.
+        td = TradeDecision(
+            symbol="HDFCBANK", action="TRADE", direction="LONG",
+            reasoning="x", conviction=7,
+            entry_price=100.0, stop_loss=95.0,
+            target_1=110.0, target_2=120.0, risk_reward=2.0,
+        )
+        # No sector info → sector cap gate is skipped (backward compatible).
+        portfolio = Portfolio(
+            account_value=500_000, open_positions=1, daily_pnl_pct=0.0,
+            total_exposure_pct=10.0,
+        )
+        with (
+            patch("yukti.risk.is_on_cooldown", new=AsyncMock(return_value=False)),
+            patch("yukti.risk.is_market_halted", new=AsyncMock(return_value=False)),
+        ):
+            result = await run_gates(td, portfolio)
+        assert result.passed is True

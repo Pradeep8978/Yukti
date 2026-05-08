@@ -170,7 +170,7 @@ def calculate_levels(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  RISK GATES  — 8 deterministic checks run before every order hits DhanHQ
+#  RISK GATES  — 9 deterministic checks run before every order hits DhanHQ
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
@@ -179,6 +179,11 @@ class Portfolio:
     open_positions: int
     daily_pnl_pct: float
     total_exposure_pct: float  # sum of capital_pct across positions
+    # Optional per-sector exposure (capital_pct) and a sector hint for the
+    # incoming trade. Both default to "no info" so existing callers aren't
+    # forced to pass them; when present, they enable the sector-cap gate.
+    sector_exposure_pct: dict[str, float] | None = None
+    trade_sector: str | None = None
 
 
 @dataclass
@@ -192,7 +197,7 @@ async def run_gates(
     portfolio: Portfolio,
 ) -> GateResult:
     """
-    Run all 8 pre-trade risk checks in order. Return first failure.
+    Run up to 9 pre-trade risk checks in order. Return first failure.
     All checks are async because they may read Redis.
     """
     # 1. Daily loss limit not breached
@@ -246,7 +251,18 @@ async def run_gates(
             f"single_stock_cap: {position.capital_pct:.2f}% > {single_stock_cap_pct:.2f}%",
         )
 
-    # 8. No market halt / circuit breaker conditions
+    # 8. Sector concentration cap — only enforced when caller passed sector info.
+    if portfolio.trade_sector and portfolio.sector_exposure_pct is not None:
+        sector_cap_pct = Decimal(str(settings.max_sector_pct)) * Decimal("100")
+        existing = Decimal(str(portfolio.sector_exposure_pct.get(portfolio.trade_sector, 0.0)))
+        projected = existing + position.capital_pct
+        if projected > sector_cap_pct:
+            return GateResult(
+                False,
+                f"sector_cap[{portfolio.trade_sector}]: {projected:.2f}% > {sector_cap_pct:.2f}%",
+            )
+
+    # 9. No market halt / circuit breaker conditions
     if await is_market_halted():
         return GateResult(False, "market_halt: market is halted")
 

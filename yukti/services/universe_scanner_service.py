@@ -65,44 +65,62 @@ def _score_candidate(candidate: dict[str, Any]) -> float:
     """
     Score a discovery candidate 0-100.
 
-    Expected keys:
-        vol_ratio:       float  — today's volume / 20-day avg
-        change_pct:      float  — absolute close-to-close change %
-        has_catalyst:    bool   — news/event catalyst present
-        sector_in_play:  bool   — parent sector moving ±1.5%
-        avg_turnover_cr: float  — average daily turnover in crores
+    Recognised keys (all optional):
+        vol_ratio          float — today's volume / 20-day avg
+        change_pct         float — absolute close-to-close change %
+        has_catalyst       bool  — news/event catalyst present
+        sector_in_play     bool  — parent sector moving ±1.5%
+        avg_turnover_cr    float — avg daily turnover in crores
+        gap_pct            float — pre-market gap vs prev close (%)
+        atr_pct_rank       float — 0..1 percentile of atr_pct within pool
+        score_boost        float — additive boost (capped) from webhooks etc.
 
     The `volume_surge_threshold` and `price_move_threshold` settings act as
-    *floors* — values below the threshold contribute zero to that component
-    rather than a fractional score. This stops a name with a 1.1× volume blip
-    from quietly accumulating points.
+    *floors* — values below the threshold contribute zero to that component.
+    Component budget (totals 100, missing fields → 0):
+        vol(20) + price(15) + catalyst(15) + sector(10) + liq(10)
+        + gap(10) + atr_rank(10) + boost(10) = 100
     """
     vol_ratio = candidate.get("vol_ratio", 0)
     change_pct = abs(candidate.get("change_pct", 0))
     has_catalyst = candidate.get("has_catalyst", False)
     sector_in_play = candidate.get("sector_in_play", False)
     avg_turnover_cr = candidate.get("avg_turnover_cr", 0)
+    gap_pct = abs(candidate.get("gap_pct", 0) or 0)
+    atr_rank = float(candidate.get("atr_pct_rank", 0) or 0)
+    boost = float(candidate.get("score_boost", 0) or 0)
 
     vol_floor = float(getattr(settings, "volume_surge_threshold", 2.0))
     price_floor = float(getattr(settings, "price_move_threshold", 1.5))
 
-    # Volume surge: weight 25, caps at 5x; zero below the configured floor.
-    vol_score = min(vol_ratio / 5.0, 1.0) * 25 if vol_ratio >= vol_floor else 0
+    vol_score = min(vol_ratio / 5.0, 1.0) * 20 if vol_ratio >= vol_floor else 0
+    price_score = min(change_pct / 4.0, 1.0) * 15 if change_pct >= price_floor else 0
+    catalyst_score = 15 if has_catalyst else 0
+    sector_score = 10 if sector_in_play else 0
+    liq_score = min(avg_turnover_cr / 50.0, 1.0) * 10
+    gap_score = min(gap_pct / 3.0, 1.0) * 10            # 3% gap saturates
+    atr_score = max(0.0, min(atr_rank, 1.0)) * 10
+    boost_score = max(0.0, min(boost, 10.0))
 
-    # Price move: weight 25, caps at 4%; zero below the configured floor.
-    price_score = min(change_pct / 4.0, 1.0) * 25 if change_pct >= price_floor else 0
-
-    # Catalyst: weight 20, binary
-    catalyst_score = 20 if has_catalyst else 0
-
-    # Sector: weight 15, binary
-    sector_score = 15 if sector_in_play else 0
-
-    # Liquidity: weight 15, caps at 50 Cr
-    liq_score = min(avg_turnover_cr / 50.0, 1.0) * 15
-
-    total = vol_score + price_score + catalyst_score + sector_score + liq_score
+    total = (vol_score + price_score + catalyst_score + sector_score
+             + liq_score + gap_score + atr_score + boost_score)
     return min(round(total, 1), 100)
+
+
+def _annotate_atr_percentile(candidates: list[dict[str, Any]]) -> None:
+    """In-place: rank atr_pct within the batch and store as `atr_pct_rank` (0..1)."""
+    rows = [c for c in candidates if c.get("atr_pct_pool") is not None]
+    if not rows:
+        return
+    sorted_vals = sorted(c["atr_pct_pool"] for c in rows)
+    n = len(sorted_vals)
+    if n == 1:
+        rows[0]["atr_pct_rank"] = 1.0
+        return
+    for c in rows:
+        # Higher atr_pct → higher rank (humans want names that move).
+        idx = sorted_vals.index(c["atr_pct_pool"])
+        c["atr_pct_rank"] = idx / (n - 1)
 
 
 def _deduplicate_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -219,6 +237,52 @@ async def _enrich_with_catalysts(
         matches = filter_headlines_for_symbol(c["symbol"], headlines)
         if matches:
             c["has_catalyst"] = True
+
+
+async def _enrich_with_premarket_gap(candidates: list[dict[str, Any]]) -> None:
+    """Read the pre-market snapshot written by `job_premarket_rank` and annotate
+    each candidate with `gap_pct`. No-op if the cache is missing — the scanner
+    still runs; gap simply contributes zero."""
+    try:
+        from yukti.data.state import get_redis
+        r = await get_redis()
+        raw = await r.get("yukti:premarket:snapshot")
+        if not raw:
+            return
+        snap = json.loads(raw)
+    except Exception as exc:
+        log.debug("premarket snapshot unavailable: %s", exc)
+        return
+    for c in candidates:
+        sym_data = snap.get(c["symbol"])
+        if isinstance(sym_data, dict):
+            c["gap_pct"] = float(sym_data.get("gap_pct") or 0)
+
+
+async def _enrich_with_webhook_boosts(candidates: list[dict[str, Any]]) -> None:
+    """Read non-expired webhook score boosts from `yukti:scanner:boosts`.
+    Slice 5 wires the actual endpoint; this consumer is harmless when empty."""
+    try:
+        from yukti.data.state import get_redis
+        r = await get_redis()
+        keys = await r.hkeys("yukti:scanner:boosts")
+        if not keys:
+            return
+        for sym in keys:
+            raw = await r.hget("yukti:scanner:boosts", sym)
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            for c in candidates:
+                if c["symbol"] == sym:
+                    c["score_boost"] = float(payload.get("score_boost") or 0)
+                    c["boost_source"] = payload.get("source")
+                    break
+    except Exception as exc:
+        log.debug("webhook boost read failed: %s", exc)
 
 
 async def _enrich_with_sector_momentum(
@@ -360,6 +424,11 @@ class UniverseScannerService:
 
         # 3. Enrich with sector momentum
         await _enrich_with_sector_momentum(candidates)
+
+        # 3b. Pre-market gap + ATR percentile + webhook boosts.
+        await _enrich_with_premarket_gap(candidates)
+        _annotate_atr_percentile(candidates)
+        await _enrich_with_webhook_boosts(candidates)
 
         # 4. Deduplicate
         candidates = _deduplicate_candidates(candidates)

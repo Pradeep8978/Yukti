@@ -202,6 +202,79 @@ async def job_universe_scan() -> None:
     await scanner.run_with_fallback(is_refresh=False)
 
 
+async def job_premarket_pool_build() -> None:
+    """08:30 IST — rebuild yukti:candidate_pool from NIFTY 500 + filters."""
+    if not is_trading_day():
+        log.info("Premarket pool build skipped: non-trading day")
+        return
+    log.info("=== premarket candidate pool build ===")
+    try:
+        from scripts.universe_loader import build_candidate_pool, _save_candidate_pool_to_redis
+        band = getattr(settings, "universe_volatility_band_pct", (1.5, 6.0))
+        if isinstance(band, list):
+            band = tuple(band)
+        pool = await build_candidate_pool(
+            index=getattr(settings, "candidate_pool_index", "NIFTY 500"),
+            min_turnover_cr=settings.min_turnover_cr,
+            volatility_band_pct=band,
+        )
+        if pool:
+            await _save_candidate_pool_to_redis(pool)
+            log.info("Candidate pool rebuilt: %d symbols", len(pool))
+        else:
+            log.warning("Candidate pool build returned empty — keeping previous Redis snapshot")
+    except Exception as exc:
+        log.error("Premarket pool build failed: %s", exc)
+
+
+async def job_premarket_rank() -> None:
+    """09:10 IST — compute pre-market gap & open snapshot for the candidate pool.
+
+    Writes `yukti:premarket:snapshot` as `{symbol: {gap_pct, last, prev_close}}`
+    so the universe scanner can score gap as a feature.
+    """
+    if not is_trading_day():
+        log.info("Premarket rank skipped: non-trading day")
+        return
+    log.info("=== premarket rank (gap snapshot) ===")
+    try:
+        import json as _json
+        import redis.asyncio as aioredis
+        from yukti.execution.dhan_client import dhan
+        r = await aioredis.from_url(settings.redis_url, decode_responses=True)
+        raw = await r.get("yukti:candidate_pool")
+        if not raw:
+            log.warning("No candidate pool yet — skipping premarket rank")
+            await r.aclose()
+            return
+        pool = _json.loads(raw)
+        sec_ids = [p["security_id"] for p in pool]
+        snap = await dhan.quote_snapshot(sec_ids)
+
+        out: dict[str, dict] = {}
+        for entry in pool:
+            sid = str(entry["security_id"])
+            q = snap.get(sid)
+            if not q:
+                continue
+            try:
+                last = float(q.get("last_price") or q.get("LTP") or 0)
+                prev = float(q.get("close") or q.get("prev_close") or q.get("previousClose") or 0)
+                if last > 0 and prev > 0:
+                    out[entry["symbol"]] = {
+                        "gap_pct": (last - prev) / prev * 100,
+                        "last": last,
+                        "prev_close": prev,
+                    }
+            except Exception:
+                continue
+        await r.set("yukti:premarket:snapshot", _json.dumps(out), ex=6 * 3600)
+        await r.aclose()
+        log.info("Premarket snapshot: %d symbols with gap data", len(out))
+    except Exception as exc:
+        log.error("Premarket rank failed: %s", exc)
+
+
 async def job_universe_refresh() -> None:
     """Intraday universe refresh — add new movers, never remove."""
     log.info("=== universe refresh ===")
@@ -212,8 +285,12 @@ async def job_universe_refresh() -> None:
 
 def build_scheduler() -> AsyncIOScheduler:
     sched = AsyncIOScheduler(timezone="Asia/Kolkata")
-    sched.add_job(job_universe_scan,    "cron", hour=8,  minute=45)
-    sched.add_job(job_morning_prep,     "cron", hour=9,  minute=0)
+    sched.add_job(job_premarket_pool_build, "cron", hour=8,  minute=30,
+                  id="premarket_pool_build", replace_existing=True)
+    sched.add_job(job_universe_scan,        "cron", hour=8,  minute=45)
+    sched.add_job(job_morning_prep,         "cron", hour=9,  minute=0)
+    sched.add_job(job_premarket_rank,       "cron", hour=9,  minute=10,
+                  id="premarket_rank", replace_existing=True)
 
     # Intraday refresh slots (default ["10:00","12:00"]) come from config.
     refresh_times = getattr(settings, "intraday_refresh_times", ["10:00", "12:00"]) or []
