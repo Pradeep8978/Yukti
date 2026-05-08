@@ -1,13 +1,8 @@
 name: CD — Build & Deploy
 
-# Runs after PRs are merged to main: the Tests workflow runs on the merge commit,
-# and this workflow deploys only when that test run succeeds. Manual dispatch is
-# also supported (e.g. to redeploy without a code push).
+# Production deploys are manual-only so merges during trading hours do not
+# automatically restart the running app.
 on:
-  workflow_run:
-    workflows: ["Tests"]
-    branches: [main]
-    types: [completed]
   workflow_dispatch:
     inputs:
       mode:
@@ -16,7 +11,7 @@ on:
         default: "paper"
 
 # ── Required repository secrets ──────────────────────────────────────────────
-#  Deploy target is not hard-coded. A merge deploys to the VPS described by
+#  Deploy target is not hard-coded. Manual deploys use the VPS described by
 #  these production environment/repository secrets:
 #  VPS_HOST        — IP or hostname of your Ubuntu VPS
 #  VPS_USER        — SSH login user (e.g. ubuntu, root, yukti)
@@ -34,7 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── Guard: skip if triggered by a failed test run ─────────────────────────
+  # ── Guard: keep the old job boundary so dependent jobs stay simple ────────
   guard:
     name: Check upstream status
     runs-on: ubuntu-latest
