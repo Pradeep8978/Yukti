@@ -175,7 +175,10 @@ jobs:
 
             COMPOSE="docker compose -f docker-compose.yml -f docker-compose.deploy.yml"
 
-            # Rolling restart: only restart the yukti container; leave DB/Redis up
+            # Ensure dependencies exist on first deploy; keep DB/Redis stable on later deploys.
+            $COMPOSE up -d redis postgres prometheus grafana
+
+            # Rolling restart: recreate only the app container with the new image.
             $COMPOSE pull yukti
             $COMPOSE up -d --no-deps --force-recreate yukti
 
