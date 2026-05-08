@@ -19,21 +19,89 @@ from yukti.config import settings
 from yukti.data.state import get_all_positions, save_position, add_to_daily_pnl, get_redis
 from yukti.execution.order_sm import close_trade
 from yukti.execution.broker_factory import get_broker
+from yukti.execution.live_feed import get_feed_manager
 
 # Trail SL 1.5% behind the high-water mark after T1 partial exit
 TRAIL_PCT = 0.015
 
 log = logging.getLogger(__name__)
 
+# Symbols currently subscribed to the live WebSocket feed
+_feed_subscribed: set[str] = set()
+
 
 # ═══════════════════════════════════════════════════════════════
 #  POSITION MONITOR
 # ═══════════════════════════════════════════════════════════════
 
+async def _on_tick(symbol: str, ltp: float) -> None:
+    """
+    WebSocket LTP tick handler — checks SL/target instantly.
+    Called from the daemon feed thread via run_coroutine_threadsafe.
+    Duplicate-safe: get_position returns None after close_trade removes the position.
+    """
+    try:
+        r = await get_redis()
+        raw = await r.get(f"yukti:positions:{symbol}")
+        if not raw:
+            return
+        pos = json.loads(raw)
+        if pos.get("status") not in ("ARMED", "FILLED"):
+            return
+
+        is_long    = pos.get("direction") == "LONG"
+        stop_loss  = float(pos.get("stop_loss") or 0)
+        fill_price = float(pos.get("fill_price") or pos.get("entry_price") or 0)
+        target_1   = float(pos.get("target_1") or 0)
+        active_sl  = float(pos.get("trailing_sl") or stop_loss)
+
+        partial_done = (
+            (stop_loss >= fill_price) if is_long
+            else (fill_price > 0 and stop_loss <= fill_price)
+        )
+
+        closed = False
+        if is_long:
+            if ltp <= active_sl:
+                log.info("WS tick: SL hit for %s @ ₹%.2f (ltp=%.2f)", symbol, active_sl, ltp)
+                await close_trade(symbol, ltp, "stop_loss_hit")
+                closed = True
+            elif target_1 and ltp >= target_1:
+                if not partial_done:
+                    log.info("WS tick: T1 hit for %s @ ₹%.2f — partial exit", symbol, ltp)
+                    await _partial_exit_t1(symbol, pos, ltp)
+                else:
+                    log.info("WS tick: T2 hit for %s @ ₹%.2f", symbol, ltp)
+                    await close_trade(symbol, ltp, "target_2_hit")
+                    closed = True
+        else:
+            if ltp >= active_sl:
+                log.info("WS tick: SL hit (short) for %s @ ₹%.2f (ltp=%.2f)", symbol, active_sl, ltp)
+                await close_trade(symbol, ltp, "stop_loss_hit")
+                closed = True
+            elif target_1 and ltp <= target_1:
+                if not partial_done:
+                    log.info("WS tick: T1 hit (short) for %s @ ₹%.2f — partial exit", symbol, ltp)
+                    await _partial_exit_t1(symbol, pos, ltp)
+                else:
+                    log.info("WS tick: T2 hit (short) for %s @ ₹%.2f", symbol, ltp)
+                    await close_trade(symbol, ltp, "target_2_hit")
+                    closed = True
+
+        if closed:
+            _feed_subscribed.discard(symbol)
+            await get_feed_manager().unsubscribe(symbol)
+
+    except Exception as exc:
+        log.debug("WS tick handler error for %s: %s", symbol, exc)
+
+
 async def monitor_positions(poll_interval: int = 10) -> None:
     """
     Background loop that polls all open positions every N seconds.
     Detects SL hits, target hits, and triggers close_trade accordingly.
+    When the WebSocket feed is connected, ticks handle exits in <1s;
+    this loop acts as the heartbeat and fallback when the feed is down.
     Should run as an asyncio task alongside the main signal loop.
     """
     log.info("Position monitor started (poll every %ds)", poll_interval)
@@ -68,6 +136,22 @@ async def monitor_positions(poll_interval: int = 10) -> None:
                         pd_["trailing_sl"] = cached["trailing_sl"]
         except Exception as exc:
             log.debug("Monitor: trailing_sl Redis merge failed: %s", exc)
+
+        # ── Manage live feed subscriptions ────────────────────────────────
+        feed = get_feed_manager()
+        if feed.is_connected():
+            active_symbols = {
+                sym for sym, pd_ in positions.items()
+                if pd_.get("status") in ("ARMED", "FILLED")
+            }
+            for sym in active_symbols - _feed_subscribed:
+                sec_id = positions[sym].get("security_id", "")
+                if sec_id:
+                    await feed.subscribe(sym, sec_id)
+                    _feed_subscribed.add(sym)
+            for sym in _feed_subscribed - active_symbols:
+                await feed.unsubscribe(sym)
+                _feed_subscribed.discard(sym)
 
         for symbol, pos in positions.items():
             if pos.get("status") not in ("ARMED", "FILLED"):

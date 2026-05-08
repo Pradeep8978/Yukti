@@ -70,6 +70,29 @@ def build_context(
         else "(average)"
     )
 
+    # Options market section
+    if macro.nifty_atm_iv is not None:
+        if macro.nifty_atm_iv > 25:
+            iv_note = "widen stops — 2×ATR"
+        elif macro.nifty_atm_iv < 12:
+            iv_note = "prefer range setups"
+        else:
+            iv_note = "normal sizing"
+        atm_iv_str = f"{macro.nifty_atm_iv:.1f}%  ({iv_note})"
+    else:
+        atm_iv_str = "N/A"
+
+    max_pain_str = f"₹{macro.nifty_max_pain:.0f}  ← price gravity on expiry" if macro.nifty_max_pain else "N/A"
+
+    options_section = f"""
+╔══ OPTIONS MARKET (Nifty Weekly) ═══════════════════════════════╗
+  Put-Call Ratio   : {macro.pcr_label}
+  Max Pain Level   : {max_pain_str}
+  ATM IV           : {atm_iv_str}
+  Sentiment        : {macro.options_sentiment}
+╚════════════════════════════════════════════════════════════════╝
+"""
+
     rsi_note = (
         "← OVERBOUGHT — short bias" if snap.rsi_overbought()
         else "← OVERSOLD — long bias" if snap.rsi_oversold()
@@ -141,7 +164,7 @@ def build_context(
   Headlines        :
 {macro.headlines_text}
 ╚════════════════════════════════════════════════════════════════╝
-
+{options_section}
 ╔══ YOUR PERFORMANCE STATE ══════════════════════════════════════╗
   Consecutive losses : {perf["consecutive_losses"]}
   Today P&L          : {perf["daily_pnl_pct"]:+.2f}%
