@@ -200,6 +200,32 @@ def momentum_long(snap: IndicatorSnapshot) -> PatternSignal:
     return PatternSignal(True, "momentum", round(strength, 2), notes)
 
 
+def momentum_short(snap: IndicatorSnapshot) -> PatternSignal:
+    """
+    Strong bearish momentum: RSI oversold zone, MACD bearish, below VWAP/EMA20, volume surge.
+    Intraday only — swing shorts are blocked at the risk layer per NSE rules.
+    """
+    rsi_momentum  = 28 <= snap.rsi <= 42
+    macd_bear     = not snap.macd_bull and snap.macd_hist < 0
+    below_vwap    = not snap.above_vwap()
+    below_ema20   = not snap.above_ema20()
+    vol_surge     = snap.volume_ratio > 1.3
+    supertrend    = not snap.supertrend_bull
+
+    score = sum([rsi_momentum, macd_bear, below_vwap, below_ema20, vol_surge, supertrend])
+    if score < 4:
+        return PatternSignal(False, "momentum_short", 0.0, "")
+
+    strength = score / 6.0
+    notes = (
+        f"Momentum Short: RSI {snap.rsi:.1f}"
+        f" | MACD hist {snap.macd_hist:+.3f}"
+        f" | vol {snap.volume_ratio:.1f}×"
+        f" | {'below' if below_ema20 else 'above'} EMA20"
+    )
+    return PatternSignal(True, "momentum_short", round(strength, 2), notes)
+
+
 def orb_breakout(
     snap: IndicatorSnapshot,
     candles: pd.DataFrame | None = None,
@@ -404,6 +430,7 @@ def scan_all(
         reversal_long(snap),
         reversal_short(snap),
         momentum_long(snap),
+        momentum_short(snap),
         orb_breakout(snap, candles, current_time, indicators_daily),
         vwap_bounce(snap, candles, current_time, indicators_daily),
     ]

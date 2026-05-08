@@ -17,6 +17,7 @@ from yukti.agents.memory import retrieve_similar_trades, format_retrieved_journa
 from yukti.config import settings
 from yukti.data.state import (
     is_halted,
+    is_on_cooldown,
     get_performance_state,
     get_daily_pnl_pct,
     count_open_positions,
@@ -25,7 +26,7 @@ from yukti.data.state import (
 from yukti.execution.broker_factory import get_broker
 from yukti.execution.order_sm import open_trade
 from yukti.metrics import signals_scanned, scan_failures, record_skip, record_trade_opened
-from yukti.risk import calculate_levels, calculate_position, run_gates, Portfolio
+from yukti.risk import calculate_levels, calculate_position, run_gates, Portfolio, is_market_halted
 from yukti.scheduler.jobs import KOLKATA, is_trading_day, is_trading_hours
 from yukti.services.macro_context_service import MacroContext, fetch_macro_context, filter_headlines_for_symbol
 from yukti.signals.context import build_context
@@ -264,6 +265,24 @@ class MarketScanService:
 
                 # ── Pattern detection (updated with multi-timeframe) ──
                 pattern = best_pattern(snap, candles=pattern_df, indicators_daily=snap_daily, current_time=current_time)
+
+                # ── Pre-AI filter: skip expensive AI call when signal is absent ──
+                if pattern is None:
+                    record_skip("no_pattern")
+                    return
+
+                if await is_halted() or await is_market_halted():
+                    record_skip("market_halted_preai")
+                    return
+
+                _daily_pnl = await get_daily_pnl_pct()
+                if _daily_pnl <= -(settings.daily_loss_limit_pct * 100):
+                    record_skip("daily_loss_limit_preai")
+                    return
+
+                if await is_on_cooldown(symbol):
+                    record_skip("cooldown_preai")
+                    return
 
                 # ── Memory retrieval (hybrid) ───────────────────────────
                 memory_setup = pattern.pattern_type if pattern else "unknown"
