@@ -175,7 +175,7 @@ uv run python scripts/universe_loader.py --dynamic
 # Or use a specific index:
 # uv run python scripts/universe_loader.py --dynamic --index "NIFTY 100"
 
-# Run in paper mode (work in progress — expect partial functionality)
+# Run in paper mode
 uv run python -m yukti --mode paper
 ```
 
