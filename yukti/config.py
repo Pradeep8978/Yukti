@@ -156,6 +156,10 @@ class Settings(BaseSettings):
     news_lookback_hours: int = Field(default=24, ge=1, le=168)
     results_window_days: int = Field(default=2, ge=0, le=10)
 
+    # Universe signal webhook (slice 5)
+    enable_webhook_signals: bool = False
+    webhook_hmac_secret: str = ""
+
     # Trader hygiene & regime (slice 4)
     exclude_asm_gsm: bool = True
     exclude_fno_ban: bool = True

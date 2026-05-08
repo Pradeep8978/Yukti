@@ -132,6 +132,14 @@ def create_app() -> FastAPI:
     app.include_router(journal_router,   prefix="/api")
     app.include_router(control_router,   prefix="/api")
 
+    # Universe signal webhook (slice 5) — gated at handler level via
+    # settings.enable_webhook_signals; route stays mounted but 404s when off.
+    try:
+        from yukti.api.routes.universe_signal import universe_signal_router
+        app.include_router(universe_signal_router, prefix="/api")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("universe_signal_router not registered: %s", exc)
+
     # ── Core endpoints ─────────────────────────────────────────────────────────
 
     @app.get("/health")
