@@ -170,7 +170,7 @@ def calculate_levels(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  RISK GATES  — run before every order hits DhanHQ
+#  RISK GATES  — 8 deterministic checks run before every order hits DhanHQ
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
@@ -192,7 +192,7 @@ async def run_gates(
     portfolio: Portfolio,
 ) -> GateResult:
     """
-    Run all 7 pre-trade risk checks in order. Return first failure.
+    Run all 8 pre-trade risk checks in order. Return first failure.
     All checks are async because they may read Redis.
     """
     # 1. Daily loss limit not breached
@@ -207,17 +207,24 @@ async def run_gates(
     if trade_decision.conviction < settings.min_conviction:
         return GateResult(False, f"conviction_too_low: {trade_decision.conviction} < {settings.min_conviction}")
 
-    # 4. Reward:Risk ratio >= minimum — require explicit R:R from the model
+    # 4. Reward:Risk ratio >= minimum — verify against structural levels rather
+    # than blindly trusting the LLM's self-reported value.
     if trade_decision.risk_reward is None:
         return GateResult(False, "rr_missing")
-    if trade_decision.risk_reward < settings.min_rr:
-        return GateResult(False, f"rr_too_low: {trade_decision.risk_reward:.2f} < {settings.min_rr}")
+    structural_rr = _compute_structural_rr(trade_decision)
+    effective_rr = min(trade_decision.risk_reward, structural_rr) if structural_rr is not None else trade_decision.risk_reward
+    if effective_rr < settings.min_rr:
+        return GateResult(
+            False,
+            f"rr_too_low: effective={effective_rr:.2f} (claimed={trade_decision.risk_reward:.2f}, "
+            f"structural={structural_rr if structural_rr is None else f'{structural_rr:.2f}'}) < {settings.min_rr}",
+        )
 
     # 5. Cooldown period passed for the symbol
     if await is_on_cooldown(trade_decision.symbol):
         return GateResult(False, f"cooldown: {trade_decision.symbol} recently traded")
 
-    # 6. Position size fits within per-trade risk %
+    # 6. Position size fits within per-trade risk % and single-stock cap
     position = calculate_position(
         trade_decision.entry_price,
         trade_decision.stop_loss,
@@ -231,29 +238,71 @@ async def run_gates(
     if max_loss_pct > max_loss_cap_pct:
         return GateResult(False, f"max_loss_too_large: {max_loss_pct:.2f}% > {max_loss_cap_pct:.2f}%")
 
-    # 7. No market halt / circuit breaker conditions
+    # 7. Single-stock concentration cap (notional / account)
+    single_stock_cap_pct = Decimal(str(settings.max_single_stock_pct)) * Decimal("100")
+    if position.capital_pct > single_stock_cap_pct:
+        return GateResult(
+            False,
+            f"single_stock_cap: {position.capital_pct:.2f}% > {single_stock_cap_pct:.2f}%",
+        )
+
+    # 8. No market halt / circuit breaker conditions
     if await is_market_halted():
         return GateResult(False, "market_halt: market is halted")
 
     return GateResult(True)
 
 
-async def is_market_halted() -> bool:
+def _compute_structural_rr(td: TradeDecision) -> float | None:
+    """
+    Compute reward:risk from the decision's entry / SL / first target.
+    Returns None if data is insufficient. Uses target_1 as the primary target.
+    """
+    if td.entry_price is None or td.stop_loss is None or td.target_1 is None:
+        return None
+    entry = Decimal(str(td.entry_price))
+    sl = Decimal(str(td.stop_loss))
+    tgt = Decimal(str(td.target_1))
+    if td.direction == "LONG":
+        risk = entry - sl
+        reward = tgt - entry
+    else:
+        risk = sl - entry
+        reward = entry - tgt
+    if risk <= 0 or reward <= 0:
+        return None
+    return float(reward / risk)
+
+
+async def is_market_halted(*, fail_closed: bool | None = None) -> bool:
     """
     Check NSE circuit-breaker conditions based on cached Nifty 50 change.
     NSE halts trading at -5%, -10%, -20% intraday Nifty drops.
     The scanner writes 'yukti:market:nifty_chg_pct' each cycle.
+
+    Behaviour on missing data / Redis errors:
+      - paper / backtest: fail-open (return False) so dev loops aren't blocked.
+      - live / shadow:    fail-closed (return True) — refuse to trade when we
+                          can't verify market state.
+    Override with `fail_closed=True/False` for tests.
     """
     from yukti.data.state import get_redis
+
+    if fail_closed is None:
+        fail_closed = settings.mode in ("live", "shadow")
+
     try:
         r = await get_redis()
         raw = await r.get("yukti:market:nifty_chg_pct")
         if raw is None:
-            return False   # No data yet — don't block
+            if fail_closed:
+                log.warning("Circuit breaker: no Nifty data cached — failing closed (mode=%s)", settings.mode)
+            return fail_closed
         nifty_chg = float(raw)
         if nifty_chg <= -5.0:
             log.warning("Circuit breaker: Nifty %.2f%% — halting entries", nifty_chg)
             return True
+        return False
     except Exception as exc:
-        log.warning("is_market_halted check failed: %s", exc)
-    return False
+        log.warning("is_market_halted check failed: %s (fail_closed=%s)", exc, fail_closed)
+        return fail_closed

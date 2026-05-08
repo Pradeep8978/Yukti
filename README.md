@@ -156,7 +156,7 @@ Web Portal (React 18, real-time WebSocket)
 
 ```bash
 # Clone + install
-git clone https://github.com/pradeeprlck/Yukti.git
+git clone https://github.com/Pradeep8978/Yukti.git
 cd yukti
 uv sync
 
