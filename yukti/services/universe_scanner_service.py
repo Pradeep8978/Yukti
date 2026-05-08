@@ -293,27 +293,26 @@ async def _enrich_with_premarket_gap(candidates: list[dict[str, Any]]) -> None:
 
 
 async def _enrich_with_webhook_boosts(candidates: list[dict[str, Any]]) -> None:
-    """Read non-expired webhook score boosts from `yukti:scanner:boosts`.
-    Slice 5 wires the actual endpoint; this consumer is harmless when empty."""
+    """Read non-expired webhook score boosts. Each symbol's boost lives in its
+    own key (`yukti:scanner:boosts:{SYM}`) with an independent TTL — set by
+    the webhook handler — so reads use a single MGET keyed on candidate
+    symbols rather than scanning the full key space."""
+    if not candidates:
+        return
     try:
         from yukti.data.state import get_redis
         r = await get_redis()
-        keys = await r.hkeys("yukti:scanner:boosts")
-        if not keys:
-            return
-        for sym in keys:
-            raw = await r.hget("yukti:scanner:boosts", sym)
+        keys = [f"yukti:scanner:boosts:{c['symbol']}" for c in candidates]
+        raws = await r.mget(keys)
+        for c, raw in zip(candidates, raws):
             if not raw:
                 continue
             try:
                 payload = json.loads(raw)
             except Exception:
                 continue
-            for c in candidates:
-                if c["symbol"] == sym:
-                    c["score_boost"] = float(payload.get("score_boost") or 0)
-                    c["boost_source"] = payload.get("source")
-                    break
+            c["score_boost"] = float(payload.get("score_boost") or 0)
+            c["boost_source"] = payload.get("source")
     except Exception as exc:
         log.debug("webhook boost read failed: %s", exc)
 

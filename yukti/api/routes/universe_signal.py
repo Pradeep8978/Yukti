@@ -4,24 +4,33 @@ Inbound webhook for external scanner signals.
 
 `POST /api/universe/signal` accepts an HMAC-SHA256-authenticated payload
 from a TradingView alert / news provider / custom screener and parks a
-score boost in Redis (`yukti:scanner:boosts`) for the scanner's next
-cycle. Capped contribution (max 10) keeps a noisy webhook from
+score boost in Redis (`yukti:scanner:boosts:{symbol}`) for the scanner's
+next cycle. Capped contribution (max 10) keeps a noisy webhook from
 hijacking the deterministic score budget.
 
 Auth (HMAC):
-    Header `X-Yukti-Signature: sha256=<hex>` over the raw request body
-    using `settings.webhook_hmac_secret`. We compare with `compare_digest`
-    to avoid timing oracles.
+    Header `X-Yukti-Signature: sha256=<hex>` over `<timestamp>.<body>` using
+    `settings.webhook_hmac_secret`. Header `X-Yukti-Timestamp: <unix-seconds>`
+    must be within ±300s of server time. Comparison uses `compare_digest`.
+
+    Replay protection: each signed request must use a unique
+    `X-Yukti-Nonce` (any string ≤64 chars). Nonces are tracked in Redis
+    with a TTL matching the timestamp tolerance window.
 
 Gated by `settings.enable_webhook_signals` — when off, the route 404s.
 
+Storage:
+    One key per symbol: `yukti:scanner:boosts:{SYM}` with per-key TTL set
+    to the payload's `ttl_minutes`. Earlier high-TTL boosts are no longer
+    truncated by later low-TTL ones.
+
 Payload schema (JSON):
     {
-      "symbol":       "RELIANCE",     # required, will be uppercased
-      "score_boost":  10,             # 0..15, clamped to 10 by scanner
-      "ttl_minutes":  60,             # 1..240
-      "source":       "tradingview",  # free-form tag, logged for audit
-      "note":         "BO base"       # optional
+      "symbol":       "RELIANCE",
+      "score_boost":  10,
+      "ttl_minutes":  60,
+      "source":       "tradingview",
+      "note":         "BO base"
     }
 """
 from __future__ import annotations
@@ -42,6 +51,10 @@ log = logging.getLogger(__name__)
 
 universe_signal_router = APIRouter(prefix="/universe", tags=["universe"])
 
+_TIMESTAMP_TOLERANCE_SECONDS = 300
+_NONCE_TTL_SECONDS = _TIMESTAMP_TOLERANCE_SECONDS * 2  # cover the full window
+_BOOST_KEY_PREFIX = "yukti:scanner:boosts:"
+
 
 class UniverseSignal(BaseModel):
     symbol: str
@@ -59,17 +72,53 @@ class UniverseSignal(BaseModel):
         return v2
 
 
-def _verify_signature(raw_body: bytes, header_value: str | None) -> bool:
+def _verify_signature(
+    raw_body: bytes,
+    header_value: str | None,
+    timestamp: str | None,
+) -> bool:
+    """HMAC-SHA256 over `<timestamp>.<body>`. Both header and timestamp must
+    be present and in the expected formats."""
     secret = getattr(settings, "webhook_hmac_secret", "") or ""
-    if not secret:
+    if not secret or not header_value or not timestamp:
         return False
-    if not header_value or "=" not in header_value:
+    if "=" not in header_value:
         return False
     algo, _, hex_sig = header_value.partition("=")
     if algo.lower() != "sha256" or not hex_sig:
         return False
-    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    signed_payload = timestamp.encode() + b"." + raw_body
+    expected = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, hex_sig.lower())
+
+
+def _verify_timestamp(timestamp: str | None) -> bool:
+    if not timestamp:
+        return False
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        return False
+    return abs(int(time.time()) - ts) <= _TIMESTAMP_TOLERANCE_SECONDS
+
+
+async def _claim_nonce(nonce: str | None) -> bool:
+    """Return True if the nonce was previously unseen (and is now claimed),
+    False if it has been used recently (replay)."""
+    if not nonce or len(nonce) > 64:
+        return False
+    try:
+        from yukti.data.state import get_redis
+        r = await get_redis()
+        # SET key value NX EX <ttl> — atomic claim. Returns truthy on success.
+        ok = await r.set(f"yukti:webhook:nonce:{nonce}", "1",
+                         nx=True, ex=_NONCE_TTL_SECONDS)
+        return bool(ok)
+    except Exception as exc:
+        log.warning("Webhook nonce claim failed: %s", exc)
+        # Fail closed on Redis errors — a missing nonce store would let
+        # replays through silently.
+        return False
 
 
 @universe_signal_router.post("/signal")
@@ -79,8 +128,15 @@ async def submit_universe_signal(request: Request) -> dict[str, Any]:
 
     raw = await request.body()
     sig = request.headers.get("X-Yukti-Signature")
-    if not _verify_signature(raw, sig):
+    ts = request.headers.get("X-Yukti-Timestamp")
+    nonce = request.headers.get("X-Yukti-Nonce")
+
+    if not _verify_timestamp(ts):
+        raise HTTPException(status_code=401, detail="Invalid or expired timestamp")
+    if not _verify_signature(raw, sig, ts):
         raise HTTPException(status_code=401, detail="Invalid or missing signature")
+    if not await _claim_nonce(nonce):
+        raise HTTPException(status_code=401, detail="Missing or replayed nonce")
 
     try:
         payload = UniverseSignal.model_validate_json(raw)
@@ -96,10 +152,13 @@ async def submit_universe_signal(request: Request) -> dict[str, Any]:
     try:
         from yukti.data.state import get_redis
         r = await get_redis()
-        await r.hset("yukti:scanner:boosts", payload.symbol, blob)
-        # TTL is on the hash key as a whole — refresh on every signal so
-        # repeatedly-confirmed names persist; one-shot pings expire quickly.
-        await r.expire("yukti:scanner:boosts", payload.ttl_minutes * 60)
+        # Per-key TTL — each symbol's boost expires independently. A 5-min
+        # ping no longer truncates a 60-min boost on another symbol.
+        await r.set(
+            f"{_BOOST_KEY_PREFIX}{payload.symbol}",
+            blob,
+            ex=payload.ttl_minutes * 60,
+        )
     except Exception as exc:  # noqa: BLE001
         log.error("Webhook: Redis write failed: %s", exc)
         raise HTTPException(status_code=503, detail="Boost cache unavailable") from exc

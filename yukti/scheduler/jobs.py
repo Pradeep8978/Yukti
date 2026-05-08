@@ -442,8 +442,14 @@ async def job_renew_and_test_dhan() -> None:
             try:
                 tmp = p.with_suffix(".tmp")
                 tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+                # Set restrictive permissions BEFORE the rename so there is
+                # no window where the destination has world-readable mode.
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError as exc:
+                    log.warning("Failed to chmod 600 on %s: %s", tmp, exc)
                 tmp.replace(p)
-                log.info("Dhan token persisted to %s", p)
+                log.info("Dhan token persisted to %s (mode=600)", p)
             except Exception as exc:
                 log.error("Failed to persist Dhan token to %s: %s", p, exc)
 

@@ -290,18 +290,28 @@ def _compute_structural_rr(td: TradeDecision) -> float | None:
     return float(reward / risk)
 
 
+# Max age (seconds) the cached Nifty value is allowed to be when we trust it
+# for the circuit-breaker gate. The scan loop writes every cycle (~5 min) with
+# a 10-min TTL, so 8 min gives ~1.5 cycles of slack before we fail closed.
+_NIFTY_MAX_AGE_SECONDS = 8 * 60
+
+
 async def is_market_halted(*, fail_closed: bool | None = None) -> bool:
     """
     Check NSE circuit-breaker conditions based on cached Nifty 50 change.
     NSE halts trading at -5%, -10%, -20% intraday Nifty drops.
-    The scanner writes 'yukti:market:nifty_chg_pct' each cycle.
+    The scanner writes 'yukti:market:nifty_chg_pct' each cycle as JSON
+    `{"chg_pct": <float>, "ts": <unix_seconds>}`.
 
-    Behaviour on missing data / Redis errors:
+    Behaviour on missing or stale data / Redis errors:
       - paper / backtest: fail-open (return False) so dev loops aren't blocked.
       - live / shadow:    fail-closed (return True) — refuse to trade when we
                           can't verify market state.
     Override with `fail_closed=True/False` for tests.
     """
+    import json as _json
+    import time as _time
+
     from yukti.data.state import get_redis
 
     if fail_closed is None:
@@ -314,7 +324,24 @@ async def is_market_halted(*, fail_closed: bool | None = None) -> bool:
             if fail_closed:
                 log.warning("Circuit breaker: no Nifty data cached — failing closed (mode=%s)", settings.mode)
             return fail_closed
-        nifty_chg = float(raw)
+
+        # Accept new JSON form `{"chg_pct": ..., "ts": ...}` and the legacy
+        # plain-float form (during the cutover). Stale values fail closed.
+        try:
+            blob = _json.loads(raw)
+            nifty_chg = float(blob["chg_pct"])
+            age = int(_time.time()) - int(blob.get("ts") or 0)
+            if age > _NIFTY_MAX_AGE_SECONDS:
+                log.warning(
+                    "Circuit breaker: Nifty cache stale (age=%ds) — failing %s",
+                    age, "closed" if fail_closed else "open",
+                )
+                return fail_closed
+        except (ValueError, TypeError, KeyError):
+            # Legacy plain-float; no embedded timestamp, but the 10-min TTL
+            # on the key already guarantees freshness when the value exists.
+            nifty_chg = float(raw)
+
         if nifty_chg <= -5.0:
             log.warning("Circuit breaker: Nifty %.2f%% — halting entries", nifty_chg)
             return True
