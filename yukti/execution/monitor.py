@@ -55,6 +55,20 @@ async def monitor_positions(poll_interval: int = 10) -> None:
         if not positions:
             continue
 
+        # Merge Redis-only trailing_sl into each Postgres-sourced position dict.
+        # get_all_positions() reads Postgres (authoritative) which has no trailing_sl
+        # column; the field lives only in the Redis cache written by _update_trailing_sl.
+        try:
+            r = await get_redis()
+            for sym, pd_ in positions.items():
+                raw = await r.get(f"yukti:positions:{sym}")
+                if raw:
+                    cached = json.loads(raw)
+                    if cached.get("trailing_sl"):
+                        pd_["trailing_sl"] = cached["trailing_sl"]
+        except Exception as exc:
+            log.debug("Monitor: trailing_sl Redis merge failed: %s", exc)
+
         for symbol, pos in positions.items():
             if pos.get("status") not in ("ARMED", "FILLED"):
                 continue
@@ -152,14 +166,22 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
     fill_price   = float(pos.get("fill_price") or pos.get("entry_price", 0))
     exit_side    = "SELL" if is_long else "BUY"
 
-    # 1 — Place partial market exit
+    # 1 — Cancel T1 GTT BEFORE placing the partial market exit so the broker
+    #     cannot fill it for the full quantity concurrently with our half-exit.
+    if pos.get("target_gtt_id"):
+        try:
+            await get_broker().cancel_gtt(pos["target_gtt_id"])
+        except Exception as exc:
+            log.warning("Partial exit: cancel T1 GTT failed for %s: %s", symbol, exc)
+
+    # 2 — Place partial market exit
     try:
         await get_broker().market_exit(security_id, direction, half_qty, product_type)
     except Exception as exc:
         log.error("Partial exit order failed for %s: %s", symbol, exc)
         return
 
-    # 2 — Record partial P&L
+    # 3 — Record partial P&L
     partial_pnl = (
         (exit_price - fill_price) * half_qty if is_long
         else (fill_price - exit_price) * half_qty
@@ -167,7 +189,9 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
     orig_exposure = fill_price * qty
     await add_to_daily_pnl(partial_pnl / orig_exposure * 100 if orig_exposure else 0.0)
 
-    # 3 — Replace SL GTT: cancel full-qty one, arm breakeven GTT for remaining
+    # 4 — Replace SL GTT: cancel full-qty one, arm breakeven GTT for remaining.
+    #     If the new GTT cannot be armed, the remaining position has no broker-side
+    #     crash-stop — market-exit it immediately rather than leave it naked.
     if pos.get("sl_gtt_id"):
         try:
             await get_broker().cancel_gtt(pos["sl_gtt_id"])
@@ -192,12 +216,23 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
     except Exception as exc:
         log.warning("Partial exit: breakeven SL GTT failed for %s: %s", symbol, exc)
 
-    # 4 — Cancel T1 GTT (already exited at T1 via market order above)
-    if pos.get("target_gtt_id"):
+    if not new_sl_gtt_id:
+        log.error("Partial exit: no breakeven SL GTT for %s — safety-exiting remaining %d shares", symbol, remaining)
         try:
-            await get_broker().cancel_gtt(pos["target_gtt_id"])
-        except Exception:
-            pass
+            await get_broker().market_exit(security_id, direction, remaining, product_type)
+            await close_trade(symbol, exit_price, "partial_no_sl_gtt_safety_exit")
+        except Exception as safety_exc:
+            log.critical("Partial exit safety exit also failed for %s: %s", symbol, safety_exc)
+            try:
+                from yukti.telegram.bot import alert
+                await alert(
+                    f"🚨 *CRITICAL — {symbol}*\n"
+                    f"{remaining} shares have no SL protection and safety exit failed.\n"
+                    f"*MANUAL INTERVENTION REQUIRED.*"
+                )
+            except Exception:
+                pass
+        return
 
     # 5 — Update position record; promote T2 → T1 for next monitor check
     old_t2 = float(pos.get("target_2") or 0)
