@@ -11,7 +11,13 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pathlib import Path
 import os
+import stat
 import subprocess
+
+# Owner read+write (0o600). Used for both `.env` and `.env.deploy` after the
+# Dhan token renew job persists fresh credentials. Owner retains write so the
+# next renew cycle can rewrite the file; group/other have no access.
+_ENV_FILE_MODE = stat.S_IRUSR | stat.S_IWUSR
 
 log = logging.getLogger(__name__)
 from yukti.config import settings
@@ -446,14 +452,30 @@ async def job_renew_and_test_dhan() -> None:
             try:
                 tmp = p.with_suffix(".tmp")
                 tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
-                # Set restrictive permissions BEFORE the rename so there is
-                # no window where the destination has world-readable mode.
+                # Restrict perms BEFORE the rename so the destination is never
+                # briefly world-readable; re-chmod AFTER the rename in case the
+                # platform's atomic rename does not preserve mode (rare, but
+                # cheap to be defensive). 0o600 = owner read+write — the renew
+                # job needs write to rewrite the file on the next cycle.
                 try:
-                    os.chmod(tmp, 0o600)
+                    os.chmod(tmp, _ENV_FILE_MODE)
                 except OSError as exc:
                     log.warning("Failed to chmod 600 on %s: %s", tmp, exc)
                 tmp.replace(p)
-                log.info("Dhan token persisted to %s (mode=600)", p)
+                try:
+                    os.chmod(p, _ENV_FILE_MODE)
+                except OSError as exc:
+                    log.warning("Failed to chmod 600 on %s: %s", p, exc)
+
+                # Verify the file is owner-writable so a regression here would
+                # be loud rather than silently breaking the next renew cycle.
+                if not os.access(p, os.W_OK):
+                    log.error(
+                        "Token persist verification failed: %s is not writable "
+                        "by the running user — next renew will fail", p,
+                    )
+                else:
+                    log.info("Dhan token persisted to %s (mode=600, writable)", p)
             except Exception as exc:
                 log.error("Failed to persist Dhan token to %s: %s", p, exc)
 
