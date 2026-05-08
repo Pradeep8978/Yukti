@@ -74,3 +74,6 @@ doppler.json
 # Temp
 .tmp/
 .cache/
+
+# Local GitHub Actions runner install
+actions-runner/
