@@ -13,8 +13,13 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # Read `.env` first, then `.env.deploy` so deploy-specific overrides
+    # take precedence. Process env vars (set by docker-compose `env_file`,
+    # Doppler, k8s, …) override both. This matches how docker-compose.full
+    # injects `.env.deploy` and how scheduler/jobs.py persists renewed
+    # Dhan tokens to both files.
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", ".env.deploy"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
