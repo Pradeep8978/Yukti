@@ -45,6 +45,35 @@ class MarketScanService:
         self.max_concurrent = 5
         self.sem = asyncio.Semaphore(self.max_concurrent)
 
+    async def _get_cycle_universe(self) -> list[tuple[str, str]]:
+        """Limit each AI scan cycle to a small deterministic shortlist.
+
+        Open positions are always included first, then the remaining startup
+        universe is filled in original order until the configured cap.
+        """
+        universe_items = list(self.universe.items())
+        max_symbols = max(1, min(settings.max_symbols_per_scan_cycle, len(universe_items)))
+
+        positions = await get_all_positions()
+        selected: list[tuple[str, str]] = []
+        seen_symbols: set[str] = set()
+
+        for symbol, security_id in universe_items:
+            if symbol in positions and symbol not in seen_symbols:
+                selected.append((symbol, security_id))
+                seen_symbols.add(symbol)
+                if len(selected) >= max_symbols:
+                    return selected
+
+        for symbol, security_id in universe_items:
+            if symbol in seen_symbols:
+                continue
+            selected.append((symbol, security_id))
+            if len(selected) >= max_symbols:
+                break
+
+        return selected
+
     async def run_single_scan(self) -> None:
         """Run one complete scan cycle (for paper mode)."""
         log.info("MarketScanService: starting single scan cycle")
@@ -52,7 +81,9 @@ class MarketScanService:
         macro = await self._get_macro_context()
         perf = await get_performance_state()
 
-        for symbol, security_id in self.universe.items():
+        cycle_universe = await self._get_cycle_universe()
+
+        for symbol, security_id in cycle_universe:
             if await is_halted():
                 log.info("MarketScanService: halted, stopping scan")
                 break
@@ -79,12 +110,13 @@ class MarketScanService:
             try:
                 macro = await self._get_macro_context()
                 perf = await get_performance_state()
+                cycle_universe = await self._get_cycle_universe()
 
                 tasks = [
                     self._scan_symbol(symbol, security_id, macro, perf)
-                    for symbol, security_id in self.universe.items()
+                    for symbol, security_id in cycle_universe
                 ]
-                symbols_list = list(self.universe.keys())
+                symbols_list = [symbol for symbol, _ in cycle_universe]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 failed_scans = 0
                 for sym, result in zip(symbols_list, results):
@@ -93,7 +125,7 @@ class MarketScanService:
                         scan_failures.labels(symbol=sym).inc()
                         log.error("MarketScanService: scan failed for %s: %s", sym, result, exc_info=result)
                 if failed_scans > 0:
-                    log.warning("MarketScanService: cycle completed with %d/%d failed scans", failed_scans, len(self.universe))
+                    log.warning("MarketScanService: cycle completed with %d/%d failed scans", failed_scans, len(cycle_universe))
 
                 heartbeat()
 
@@ -231,6 +263,11 @@ class MarketScanService:
                     or_high=or_high,
                     or_low=or_low,
                 )
+
+                if not is_trading_day() or not is_trading_hours():
+                    record_skip("outside_trading_hours")
+                    log.info("MarketScanService: skipping AI call for %s outside trading hours", symbol)
+                    return
 
                 decision = await arjun.safe_decide(context)
                 reasoning_excerpt = " ".join((decision.reasoning or "").split())

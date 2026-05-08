@@ -139,6 +139,7 @@ class Settings(BaseSettings):
 
     # ── Universe scanner ─────────────────────────────
     scanner_pick_count: int = Field(default=15, ge=5, le=50)
+    max_symbols_per_scan_cycle: int = Field(default=5, ge=1, le=50)
     min_turnover_cr: float = Field(default=10, gt=0)
     volume_surge_threshold: float = Field(default=2.0, gt=0)
     price_move_threshold: float = Field(default=1.5, gt=0)
