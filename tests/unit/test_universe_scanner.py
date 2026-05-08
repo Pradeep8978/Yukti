@@ -1,3 +1,8 @@
+"""tests/unit/test_universe_scanner.py — tests for scanner scoring and selection logic."""
+from __future__ import annotations
+
+import pytest
+
 from yukti.services.universe_scanner_service import (
     _score_candidate,
     _deduplicate_candidates,
@@ -32,10 +37,6 @@ def test_select_universe_includes_existing_positions():
     ]
     selected = _select_universe(candidates, pick_count=1, min_turnover_cr=10, existing_positions=["B"])
     assert any(c["symbol"] == "B" for c in selected)
-"""tests/unit/test_universe_scanner.py — tests for scanner scoring and selection logic."""
-from __future__ import annotations
-
-import pytest
 
 
 class TestScoring:
@@ -133,3 +134,33 @@ class TestScoring:
         deduped = _deduplicate_candidates(candidates)
         assert len(deduped) == 1
         assert deduped[0]["symbol"] == "RELIANCE"
+
+
+class TestThresholdFloors:
+    def test_volume_below_floor_scores_zero_for_volume(self):
+        from yukti.services.universe_scanner_service import _score_candidate
+        # vol_ratio just under default 2.0 floor → volume component must be 0
+        c = {"vol_ratio": 1.5, "change_pct": 0, "has_catalyst": False,
+             "sector_in_play": False, "avg_turnover_cr": 0}
+        assert _score_candidate(c) == 0
+
+    def test_price_below_floor_scores_zero_for_price(self):
+        from yukti.services.universe_scanner_service import _score_candidate
+        # change_pct just under 1.5 floor → price component is 0; volume kicks in.
+        c = {"vol_ratio": 5.0, "change_pct": 1.0, "has_catalyst": False,
+             "sector_in_play": False, "avg_turnover_cr": 50}
+        # volume contributes 25, liquidity ~15, price=0
+        assert _score_candidate(c) == 40.0
+
+
+class TestPinnedWatchlist:
+    def test_pinned_bypasses_liquidity_floor(self):
+        from yukti.services.universe_scanner_service import _select_universe
+        candidates = [
+            {"symbol": "PINNED", "security_id": "1", "pinned": True,
+             "vol_ratio": 0, "change_pct": 0,
+             "has_catalyst": False, "sector_in_play": False,
+             "avg_turnover_cr": 1},  # well below default 10 Cr floor
+        ]
+        selected = _select_universe(candidates, pick_count=15, min_turnover_cr=10)
+        assert any(c["symbol"] == "PINNED" for c in selected)

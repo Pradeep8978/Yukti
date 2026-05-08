@@ -51,10 +51,14 @@ async def _load_universe() -> dict[str, str]:
         import redis.asyncio as aioredis
         r   = await aioredis.from_url(settings.redis_url, decode_responses=True)
         raw = await r.get("yukti:universe")
+        if not raw:
+            raw = await r.get("yukti:candidate_pool")
+            if raw:
+                log.info("Universe key empty — falling back to yukti:candidate_pool")
         await r.aclose()
         if raw:
-            universe_list = json.loads(raw)
-            return {u["symbol"]: u["security_id"] for u in universe_list}
+            entries = json.loads(raw)
+            return {u["symbol"]: u["security_id"] for u in entries}
     except Exception as exc:
         log.warning("Universe load from Redis failed: %s — falling back", exc)
 

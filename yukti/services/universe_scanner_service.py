@@ -71,6 +71,11 @@ def _score_candidate(candidate: dict[str, Any]) -> float:
         has_catalyst:    bool   — news/event catalyst present
         sector_in_play:  bool   — parent sector moving ±1.5%
         avg_turnover_cr: float  — average daily turnover in crores
+
+    The `volume_surge_threshold` and `price_move_threshold` settings act as
+    *floors* — values below the threshold contribute zero to that component
+    rather than a fractional score. This stops a name with a 1.1× volume blip
+    from quietly accumulating points.
     """
     vol_ratio = candidate.get("vol_ratio", 0)
     change_pct = abs(candidate.get("change_pct", 0))
@@ -78,11 +83,14 @@ def _score_candidate(candidate: dict[str, Any]) -> float:
     sector_in_play = candidate.get("sector_in_play", False)
     avg_turnover_cr = candidate.get("avg_turnover_cr", 0)
 
-    # Volume surge: weight 25, caps at 5x
-    vol_score = min(vol_ratio / 5.0, 1.0) * 25
+    vol_floor = float(getattr(settings, "volume_surge_threshold", 2.0))
+    price_floor = float(getattr(settings, "price_move_threshold", 1.5))
 
-    # Price move: weight 25, caps at 4%
-    price_score = min(change_pct / 4.0, 1.0) * 25
+    # Volume surge: weight 25, caps at 5x; zero below the configured floor.
+    vol_score = min(vol_ratio / 5.0, 1.0) * 25 if vol_ratio >= vol_floor else 0
+
+    # Price move: weight 25, caps at 4%; zero below the configured floor.
+    price_score = min(change_pct / 4.0, 1.0) * 25 if change_pct >= price_floor else 0
 
     # Catalyst: weight 20, binary
     catalyst_score = 20 if has_catalyst else 0
@@ -121,8 +129,11 @@ def _select_universe(
     Apply liquidity floor, sort by score, pick top N.
     Always includes stocks with existing open positions.
     """
-    # Liquidity filter
-    qualified = [c for c in candidates if c.get("avg_turnover_cr", 0) >= min_turnover_cr]
+    # Liquidity filter — pinned (watchlist) names skip the floor.
+    qualified = [
+        c for c in candidates
+        if c.get("pinned") or c.get("avg_turnover_cr", 0) >= min_turnover_cr
+    ]
 
     # Score and sort
     scored = sorted(qualified, key=lambda c: _score_candidate(c), reverse=True)
@@ -130,12 +141,20 @@ def _select_universe(
     # Pick top N
     selected = scored[:pick_count]
 
-    # Ensure existing positions are included
+    selected_symbols = {c["symbol"] for c in selected}
+
+    # Always include pinned watchlist entries, regardless of score.
+    for c in qualified:
+        if c.get("pinned") and c["symbol"] not in selected_symbols:
+            selected.append(c)
+            selected_symbols.add(c["symbol"])
+
+    # Ensure existing positions are included.
     if existing_positions:
-        selected_symbols = {c["symbol"] for c in selected}
         for c in qualified:
             if c["symbol"] in existing_positions and c["symbol"] not in selected_symbols:
                 selected.append(c)
+                selected_symbols.add(c["symbol"])
 
     return selected
 
@@ -232,6 +251,65 @@ async def _enrich_with_sector_momentum(
 #  MAIN SCANNER SERVICE
 # ═══════════════════════════════════════════════════════════════
 
+async def _load_candidate_pool() -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Read the daily candidate pool from Redis (`yukti:candidate_pool`) and
+    pin any symbols listed in `settings.watchlist`.
+
+    Returns:
+        symbols  — `{symbol: security_id}` to pass to data fetchers.
+        meta     — `{symbol: {sector, turnover_cr, atr_pct, pinned}}` for
+                   downstream scoring / hygiene gates.
+
+    Falls back to the hardcoded `NIFTY_100_POOL` only if Redis has no entry —
+    paper-mode developers shouldn't be blocked, but live/shadow operators are
+    expected to populate the pool via the scheduler / CLI.
+    """
+    symbols: dict[str, str] = {}
+    meta: dict[str, dict[str, Any]] = {}
+
+    try:
+        from yukti.data.state import get_redis
+        r = await get_redis()
+        raw = await r.get("yukti:candidate_pool")
+        if raw:
+            pool = json.loads(raw)
+            for entry in pool:
+                sym = entry["symbol"]
+                symbols[sym] = entry["security_id"]
+                meta[sym] = {
+                    "sector":      entry.get("sector", "Unknown"),
+                    "turnover_cr": entry.get("turnover_cr"),
+                    "atr_pct":     entry.get("atr_pct"),
+                    "pinned":      False,
+                }
+            log.info("UniverseScanner: loaded candidate pool (%d symbols) from Redis", len(symbols))
+    except Exception as exc:
+        log.warning("UniverseScanner: could not read yukti:candidate_pool: %s", exc)
+
+    if not symbols:
+        log.warning(
+            "UniverseScanner: candidate pool empty — falling back to built-in NIFTY_100_POOL "
+            "(run `scripts/universe_loader.py --candidate-pool` to populate)"
+        )
+        symbols = dict(NIFTY_100_POOL)
+
+    # Pin watchlist entries — they always make the pool, even with no metadata.
+    for sym in (getattr(settings, "watchlist", []) or []):
+        sym_u = sym.strip().upper()
+        if not sym_u:
+            continue
+        if sym_u not in symbols:
+            sec_id = NIFTY_100_POOL.get(sym_u, "")
+            if not sec_id:
+                log.warning("UniverseScanner: watchlist symbol %s not in pool/master — skipping", sym_u)
+                continue
+            symbols[sym_u] = sec_id
+        meta.setdefault(sym_u, {"sector": "Unknown", "turnover_cr": None, "atr_pct": None})
+        meta[sym_u]["pinned"] = True
+
+    return symbols, meta
+
+
 class UniverseScannerService:
     """
     Discovers stocks to trade. Runs at 08:45 (primary) and intraday refresh at 10:00, 12:00.
@@ -239,7 +317,8 @@ class UniverseScannerService:
     """
 
     def __init__(self) -> None:
-        self._pool = NIFTY_100_POOL
+        self._pool: dict[str, str] = {}
+        self._pool_meta: dict[str, dict[str, Any]] = {}
 
     async def run_scan(self, is_refresh: bool = False) -> list[dict[str, str]]:
         """
@@ -253,9 +332,21 @@ class UniverseScannerService:
         """
         log.info("UniverseScanner: starting %s scan", "refresh" if is_refresh else "primary")
 
+        # 0. Refresh the candidate pool (daily build via scheduler / CLI; cached in Redis).
+        self._pool, self._pool_meta = await _load_candidate_pool()
+
         # 1. Fetch volume + price data for the pool
         candidates = await _fetch_volume_and_price_data(self._pool)
         log.info("UniverseScanner: fetched data for %d symbols", len(candidates))
+
+        # Carry sector/atr metadata from the pool through to candidates so the
+        # rest of the pipeline (and downstream prompts) can see it.
+        for c in candidates:
+            m = self._pool_meta.get(c["symbol"])
+            if m:
+                c.setdefault("sector", m.get("sector"))
+                c.setdefault("atr_pct_pool", m.get("atr_pct"))
+                c["pinned"] = bool(m.get("pinned"))
 
         # 2. Enrich with catalysts
         try:

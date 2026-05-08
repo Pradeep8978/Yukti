@@ -287,6 +287,94 @@ class DhanClient:
 
         return data
 
+    async def quote_snapshot(
+        self,
+        security_ids: list[str],
+        chunk_size: int = 100,
+    ) -> dict[str, dict[str, Any]]:
+        """Bulk LTP / OHLC / volume snapshot for many securities.
+
+        Returns a dict keyed by security_id. Uses the dhanhq SDK's quote_data
+        endpoint when available; chunks the request to stay within DhanHQ's
+        per-call limit. Falls back to per-symbol intraday candles if quote_data
+        is unavailable on the installed SDK version.
+        """
+        if not security_ids:
+            return {}
+
+        out: dict[str, dict[str, Any]] = {}
+        quote_fn = getattr(self._dhan, "quote_data", None) or getattr(self._dhan, "ohlc_data", None)
+        for i in range(0, len(security_ids), chunk_size):
+            batch = security_ids[i : i + chunk_size]
+            if quote_fn is not None:
+                try:
+                    payload = {"NSE_EQ": [int(s) for s in batch if str(s).isdigit()]}
+                    res = await self._call(quote_fn, securities=payload)
+                    data = res.get("data", {}) if isinstance(res, dict) else {}
+                    nse_block = data.get("data", {}).get("NSE_EQ") if isinstance(data, dict) else None
+                    if nse_block is None and isinstance(data, dict):
+                        nse_block = data.get("NSE_EQ")
+                    if isinstance(nse_block, dict):
+                        for sid, q in nse_block.items():
+                            out[str(sid)] = q if isinstance(q, dict) else {"raw": q}
+                    continue
+                except Exception as exc:
+                    log.warning("quote_snapshot batch failed (%d ids): %s — falling back", len(batch), exc)
+
+            for sid in batch:
+                try:
+                    today = date.today().isoformat()
+                    raw = await self.get_candles(sid, "1", today, today)
+                    if raw:
+                        last = raw[-1]
+                        out[str(sid)] = {
+                            "last_price": float(last.get("close", 0)),
+                            "open":       float(last.get("open", 0)),
+                            "high":       float(last.get("high", 0)),
+                            "low":        float(last.get("low", 0)),
+                            "volume":     int(last.get("volume", 0)),
+                        }
+                except Exception as exc:
+                    log.debug("quote_snapshot fallback failed for %s: %s", sid, exc)
+        return out
+
+    async def historical_daily(
+        self,
+        security_id: str,
+        days: int = 60,
+        symbol: str = "",
+    ) -> list[dict[str, Any]]:
+        """Daily OHLCV for the last `days` sessions. Replaces yfinance for
+        volatility / RS calculations when DhanHQ's daily endpoint is available.
+        """
+        from datetime import datetime, timedelta
+
+        to_d = datetime.now().date()
+        from_d = to_d - timedelta(days=int(days * 1.6) + 5)  # cushion for weekends/holidays
+
+        daily_fn = getattr(self._dhan, "historical_daily_data", None)
+        if daily_fn is not None:
+            try:
+                res = await self._call(
+                    daily_fn,
+                    security_id      = security_id,
+                    exchange_segment = "NSE_EQ",
+                    instrument_type  = "EQUITY",
+                    from_date        = from_d.isoformat(),
+                    to_date          = to_d.isoformat(),
+                )
+                rows = res.get("data", []) if isinstance(res, dict) else []
+                if rows and isinstance(rows, list):
+                    return rows[-days:]
+            except Exception as exc:
+                log.warning("historical_daily DhanHQ call failed for %s: %s — using get_candles fallback", security_id, exc)
+
+        return await self.get_candles(
+            security_id, interval="1",
+            from_date=from_d.isoformat(), to_date=to_d.isoformat(),
+            symbol=symbol,
+        )
+
     # ── Market order (square off) ─────────────────────────────────────────────
 
     async def market_exit(

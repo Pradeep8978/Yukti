@@ -145,6 +145,10 @@ class Settings(BaseSettings):
     price_move_threshold: float = Field(default=1.5, gt=0)
     intraday_refresh_times: list[str] = Field(default_factory=lambda: ["10:00", "12:00"])
 
+    # Dynamic candidate pool (daily build, replaces hardcoded NIFTY_100_POOL)
+    candidate_pool_index: str = "NIFTY 500"
+    universe_volatility_band_pct: tuple[float, float] = (1.5, 6.0)
+
     # ── Daily candle (multi-timeframe) ────────────────
     daily_candle_history: int = Field(default=60, ge=20, le=200)
     daily_cache_ttl: int = Field(default=3600 * 8, ge=3600)

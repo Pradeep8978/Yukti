@@ -189,10 +189,88 @@ async def fetch_dynamic_universe(index: str = "NIFTY 50") -> list[dict]:
     return universe
 
 
+async def build_candidate_pool(
+    index: str = "NIFTY 500",
+    min_turnover_cr: float = 10.0,
+    volatility_band_pct: tuple[float, float] = (1.5, 6.0),
+    lookback_days: int = 30,
+) -> list[dict]:
+    """Build the daily *candidate pool* the dynamic scanner draws from.
+
+    Pipeline:
+      1. NSE index constituents ∩ DhanHQ scrip master  (full sectorized list).
+      2. For each symbol, fetch ~30 daily candles and compute:
+           - 20-day average turnover (Cr).
+           - 20-day realized ATR/price as a percentage.
+      3. Drop names with turnover < `min_turnover_cr`.
+      4. Drop names whose ATR-pct falls outside `volatility_band_pct`
+         (default 1.5% – 6.0% — excludes both dead-flat and explosive names).
+
+    Returns: `[{symbol, security_id, sector, turnover_cr, atr_pct}, ...]`.
+    """
+    base = await fetch_dynamic_universe(index)
+    if not base:
+        return []
+
+    # Late import to avoid pulling DhanHQ SDK at module import time
+    from yukti.execution.dhan_client import dhan
+    import pandas as pd
+
+    pool: list[dict] = []
+    lo_band, hi_band = volatility_band_pct
+    for entry in base:
+        sym = entry["symbol"]
+        sid = entry["security_id"]
+        try:
+            raw = await dhan.historical_daily(sid, days=lookback_days, symbol=sym)
+            if not raw or len(raw) < 20:
+                continue
+            df = pd.DataFrame(raw).astype(
+                {c: float for c in ("open", "high", "low", "close", "volume") if c in raw[0]}
+            )
+            if any(c not in df.columns for c in ("high", "low", "close", "volume")):
+                continue
+
+            tr = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
+            close = df["close"].iloc[-1]
+            atr_pct = float(tr / close * 100) if close > 0 else 0.0
+
+            turnover_cr = float((df["close"] * df["volume"]).rolling(20).mean().iloc[-1] / 1e7)
+
+            if turnover_cr < min_turnover_cr:
+                continue
+            if not (lo_band <= atr_pct <= hi_band):
+                continue
+
+            pool.append({
+                "symbol":      sym,
+                "security_id": sid,
+                "sector":      entry.get("sector", "Unknown"),
+                "turnover_cr": round(turnover_cr, 2),
+                "atr_pct":     round(atr_pct, 2),
+            })
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️  candidate_pool: skipping {sym}: {exc}")
+
+    print(f"  ✅ candidate pool: {len(pool)} / {len(base)} symbols passed filters")
+    return pool
+
+
+async def _save_candidate_pool_to_redis(pool: list[dict], ttl_seconds: int = 24 * 3600) -> None:
+    import redis.asyncio as aioredis
+    from yukti.config import settings
+
+    r = await aioredis.from_url(settings.redis_url, decode_responses=True)
+    await r.set("yukti:candidate_pool", json.dumps(pool), ex=ttl_seconds)
+    await r.aclose()
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Yukti universe loader")
     parser.add_argument("--dynamic", action="store_true", help="Fetch universe from NSE + DhanHQ master (recommended)")
     parser.add_argument("--index",   default="NIFTY 50",   help="NSE index to use with --dynamic (default: 'NIFTY 50')")
+    parser.add_argument("--candidate-pool", action="store_true",
+                        help="Build the daily candidate pool (NIFTY 500 + liquidity + vol band) into yukti:candidate_pool")
     parser.add_argument("--file",    type=Path,             help="Path to universe CSV")
     parser.add_argument("--sample",  action="store_true",   help="Load built-in sample universe (fallback)")
     parser.add_argument("--print",   action="store_true",   help="Print current universe from Redis")
@@ -211,6 +289,21 @@ async def main() -> None:
         print(f"\nCurrent universe ({len(universe)} symbols):\n")
         for u in universe:
             print(f"  {u['symbol']:15s} id={u['security_id']:8s} sector={u['sector']}")
+        return
+
+    if args.candidate_pool:
+        from yukti.config import settings
+        index = args.index if args.index != "NIFTY 50" else getattr(settings, "candidate_pool_index", "NIFTY 500")
+        band = getattr(settings, "universe_volatility_band_pct", (1.5, 6.0))
+        if isinstance(band, list):
+            band = tuple(band)
+        pool = await build_candidate_pool(
+            index=index,
+            min_turnover_cr=settings.min_turnover_cr,
+            volatility_band_pct=band,
+        )
+        await _save_candidate_pool_to_redis(pool)
+        print(f"✅ candidate pool: {len(pool)} symbols → yukti:candidate_pool (TTL 24h)")
         return
 
     if args.dynamic:

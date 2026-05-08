@@ -214,8 +214,18 @@ def build_scheduler() -> AsyncIOScheduler:
     sched = AsyncIOScheduler(timezone="Asia/Kolkata")
     sched.add_job(job_universe_scan,    "cron", hour=8,  minute=45)
     sched.add_job(job_morning_prep,     "cron", hour=9,  minute=0)
-    sched.add_job(job_universe_refresh, "cron", hour=10, minute=0)
-    sched.add_job(job_universe_refresh, "cron", hour=12, minute=0)
+
+    # Intraday refresh slots (default ["10:00","12:00"]) come from config.
+    refresh_times = getattr(settings, "intraday_refresh_times", ["10:00", "12:00"]) or []
+    for slot in refresh_times:
+        try:
+            hh, mm = (int(p) for p in slot.split(":"))
+        except Exception:
+            log.warning("Bad intraday_refresh_times entry %r — skipping", slot)
+            continue
+        sched.add_job(job_universe_refresh, "cron", hour=hh, minute=mm,
+                      id=f"universe_refresh_{hh:02d}{mm:02d}", replace_existing=True)
+
     sched.add_job(job_eod_squareoff,    "cron", hour=15, minute=10)
     sched.add_job(job_daily_reset,      "cron", hour=16, minute=0)
     sched.add_job(job_daily_report,     "cron", hour=16, minute=30)
