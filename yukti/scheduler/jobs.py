@@ -205,6 +205,117 @@ async def job_universe_scan() -> None:
     await scanner.run_with_fallback(is_refresh=False)
 
 
+async def job_exclusions_refresh() -> None:
+    """08:15 IST — pull NSE exclusion lists (F&O ban / ASM / GSM)."""
+    if not is_trading_day():
+        log.info("Exclusions refresh skipped: non-trading day")
+        return
+    log.info("=== exclusions refresh ===")
+    try:
+        from yukti.services.exclusions_service import refresh
+        excl = await refresh()
+        log.info("Exclusions: fno_ban=%d asm=%d gsm=%d",
+                 len(excl.fno_ban), len(excl.asm), len(excl.gsm))
+    except Exception as exc:
+        log.error("Exclusions refresh failed: %s", exc)
+
+
+async def job_catalyst_refresh() -> None:
+    """08:00 IST — pull NSE announcements + earnings calendar."""
+    if not is_trading_day():
+        log.info("Catalyst refresh skipped: non-trading day")
+        return
+    log.info("=== catalyst refresh ===")
+    try:
+        from yukti.services.catalyst_service import refresh
+        summary = await refresh()
+        log.info("Catalysts: %s", summary)
+    except Exception as exc:
+        log.error("Catalyst refresh failed: %s", exc)
+
+
+async def job_premarket_pool_build() -> None:
+    """08:30 IST — rebuild yukti:candidate_pool from NIFTY 500 + filters."""
+    if not is_trading_day():
+        log.info("Premarket pool build skipped: non-trading day")
+        return
+    log.info("=== premarket candidate pool build ===")
+    try:
+        from scripts.universe_loader import build_candidate_pool, _save_candidate_pool_to_redis
+        band = getattr(settings, "universe_volatility_band_pct", (1.5, 6.0))
+        if isinstance(band, list):
+            band = tuple(band)
+        pool = await build_candidate_pool(
+            index=getattr(settings, "candidate_pool_index", "NIFTY 500"),
+            min_turnover_cr=settings.min_turnover_cr,
+            volatility_band_pct=band,
+        )
+        if pool:
+            await _save_candidate_pool_to_redis(pool)
+            log.info("Candidate pool rebuilt: %d symbols", len(pool))
+        else:
+            log.warning("Candidate pool build returned empty — keeping previous Redis snapshot")
+    except Exception as exc:
+        log.error("Premarket pool build failed: %s", exc)
+
+
+async def job_premarket_rank() -> None:
+    """09:10 IST — compute pre-market gap & open snapshot for the candidate pool.
+
+    Writes `yukti:premarket:snapshot` as `{symbol: {gap_pct, last, prev_close}}`
+    so the universe scanner can score gap as a feature.
+    """
+    if not is_trading_day():
+        log.info("Premarket rank skipped: non-trading day")
+        return
+    log.info("=== premarket rank (gap snapshot) ===")
+    try:
+        import json as _json
+        import redis.asyncio as aioredis
+        from yukti.execution.dhan_client import dhan
+        r = await aioredis.from_url(settings.redis_url, decode_responses=True)
+        raw = await r.get("yukti:candidate_pool")
+        if not raw:
+            log.warning("No candidate pool yet — skipping premarket rank")
+            await r.aclose()
+            return
+        pool = _json.loads(raw)
+        sec_ids = [p["security_id"] for p in pool]
+        snap = await dhan.quote_snapshot(sec_ids)
+
+        out: dict[str, dict] = {}
+        for entry in pool:
+            sid = str(entry["security_id"])
+            q = snap.get(sid)
+            if not q:
+                continue
+            try:
+                last = float(q.get("last_price") or q.get("LTP") or 0)
+                prev = float(q.get("close") or q.get("prev_close") or q.get("previousClose") or 0)
+                if last > 0 and prev > 0:
+                    out[entry["symbol"]] = {
+                        "gap_pct": (last - prev) / prev * 100,
+                        "last": last,
+                        "prev_close": prev,
+                    }
+            except Exception:
+                continue
+        await r.set("yukti:premarket:snapshot", _json.dumps(out), ex=6 * 3600)
+        await r.aclose()
+        log.info("Premarket snapshot: %d symbols with gap data", len(out))
+
+        # Tag at-circuit names from the same snapshot before the scanner runs.
+        try:
+            from yukti.services.exclusions_service import annotate_at_circuit_from_snapshot
+            at_circ = await annotate_at_circuit_from_snapshot()
+            if at_circ:
+                log.info("At-circuit tagged: %d symbols", len(at_circ))
+        except Exception as exc:
+            log.debug("at-circuit annotation skipped: %s", exc)
+    except Exception as exc:
+        log.error("Premarket rank failed: %s", exc)
+
+
 async def job_universe_refresh() -> None:
     """Intraday universe refresh — add new movers, never remove."""
     log.info("=== universe refresh ===")
@@ -215,10 +326,28 @@ async def job_universe_refresh() -> None:
 
 def build_scheduler() -> AsyncIOScheduler:
     sched = AsyncIOScheduler(timezone="Asia/Kolkata")
-    sched.add_job(job_universe_scan,    "cron", hour=8,  minute=45)
-    sched.add_job(job_morning_prep,     "cron", hour=9,  minute=0)
-    sched.add_job(job_universe_refresh, "cron", hour=10, minute=0)
-    sched.add_job(job_universe_refresh, "cron", hour=12, minute=0)
+    sched.add_job(job_catalyst_refresh,     "cron", hour=8,  minute=0,
+                  id="catalyst_refresh", replace_existing=True)
+    sched.add_job(job_exclusions_refresh,   "cron", hour=8,  minute=15,
+                  id="exclusions_refresh", replace_existing=True)
+    sched.add_job(job_premarket_pool_build, "cron", hour=8,  minute=30,
+                  id="premarket_pool_build", replace_existing=True)
+    sched.add_job(job_universe_scan,        "cron", hour=8,  minute=45)
+    sched.add_job(job_morning_prep,         "cron", hour=9,  minute=0)
+    sched.add_job(job_premarket_rank,       "cron", hour=9,  minute=10,
+                  id="premarket_rank", replace_existing=True)
+
+    # Intraday refresh slots (default ["10:00","12:00"]) come from config.
+    refresh_times = getattr(settings, "intraday_refresh_times", ["10:00", "12:00"]) or []
+    for slot in refresh_times:
+        try:
+            hh, mm = (int(p) for p in slot.split(":"))
+        except Exception:
+            log.warning("Bad intraday_refresh_times entry %r — skipping", slot)
+            continue
+        sched.add_job(job_universe_refresh, "cron", hour=hh, minute=mm,
+                      id=f"universe_refresh_{hh:02d}{mm:02d}", replace_existing=True)
+
     sched.add_job(job_eod_squareoff,    "cron", hour=15, minute=10)
     sched.add_job(job_daily_reset,      "cron", hour=16, minute=0)
     sched.add_job(job_daily_report,     "cron", hour=16, minute=30)

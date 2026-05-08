@@ -7,8 +7,14 @@ Providers:
     gemini  → Google Gemini 2.0 Flash  (native JSON mode, free tier)
     ab_test → calls both, executes primary, logs secondary for comparison
 
-Provider is set via AI_PROVIDER env var (default: gemini).
-Switch at any time without code changes — restart the agent.
+Provider is set via `settings.ai_provider` (default: gemini).
+
+IMPORTANT — Gemini quota policy:
+    Arjun is the ONLY component in Yukti that may use the Gemini API.
+    All other AI calls (journal writing, quality reports, embeddings, …)
+    use `settings.journal_ai_provider` which is restricted to claude/openai.
+    This keeps Gemini's free-tier quota exclusively for high-value trade
+    decisions and avoids unexpected cost spikes from ancillary tasks.
 """
 from __future__ import annotations
 

@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     watchlist: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # ── AI provider ───────────────────────────────────
+    # Arjun (trade decisions) — the ONLY component allowed to use Gemini.
     # "claude"  → Anthropic Claude Sonnet 4.6  ($3/$15 per MTok)
     # "gemini"  → Google Gemini 2.0 Flash      (free ≤15 rpm, then $0.075/MTok)
     # "ab_test" → run both per call, log comparison, execute the primary
@@ -84,6 +85,11 @@ class Settings(BaseSettings):
     # ab_primary is executed for real; ab_secondary is called in background and logged only
     ab_primary: Literal["claude", "gemini"] = "gemini"
     ab_secondary: Literal["claude", "gemini"] = "claude"
+
+    # Non-decision AI tasks (journal writing, quality reports, …) use this
+    # provider exclusively.  Gemini is intentionally excluded to avoid
+    # burning free-tier quota on ancillary tasks.
+    journal_ai_provider: Literal["claude", "openai"] = "claude"
 
     # Voyage AI (journal embeddings)
     voyage_api_key: str = ""
@@ -149,6 +155,29 @@ class Settings(BaseSettings):
     volume_surge_threshold: float = Field(default=2.0, gt=0)
     price_move_threshold: float = Field(default=1.5, gt=0)
     intraday_refresh_times: list[str] = Field(default_factory=lambda: ["10:00", "12:00"])
+
+    # Dynamic candidate pool (daily build, replaces hardcoded NIFTY_100_POOL)
+    candidate_pool_index: str = "NIFTY 500"
+    universe_volatility_band_pct: tuple[float, float] = (1.5, 6.0)
+
+    # Catalyst / news enrichment (slice 3)
+    enable_news_enrichment: bool = True
+    news_provider: Literal["nse_only", "marketaux", "newsapi"] = "nse_only"
+    news_provider_api_key: str = ""
+    news_lookback_hours: int = Field(default=24, ge=1, le=168)
+    results_window_days: int = Field(default=2, ge=0, le=10)
+
+    # Universe signal webhook (slice 5)
+    enable_webhook_signals: bool = False
+    webhook_hmac_secret: str = ""
+
+    # Trader hygiene & regime (slice 4)
+    exclude_asm_gsm: bool = True
+    exclude_fno_ban: bool = True
+    exclude_at_circuit: bool = True
+    vix_regime_buckets: list[float] = Field(default_factory=lambda: [12.0, 18.0, 25.0])
+    intraday_dd_throttle_pct: float = Field(default=0.01, gt=0, le=0.10)
+    event_days: list[str] = Field(default_factory=list)
 
     # ── Daily candle (multi-timeframe) ────────────────
     daily_candle_history: int = Field(default=60, ge=20, le=200)

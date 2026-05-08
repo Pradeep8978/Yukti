@@ -65,36 +65,66 @@ def _score_candidate(candidate: dict[str, Any]) -> float:
     """
     Score a discovery candidate 0-100.
 
-    Expected keys:
-        vol_ratio:       float  — today's volume / 20-day avg
-        change_pct:      float  — absolute close-to-close change %
-        has_catalyst:    bool   — news/event catalyst present
-        sector_in_play:  bool   — parent sector moving ±1.5%
-        avg_turnover_cr: float  — average daily turnover in crores
+    Recognised keys (all optional):
+        vol_ratio          float — today's volume / 20-day avg
+        change_pct         float — absolute close-to-close change %
+        has_catalyst       bool  — news/event catalyst present
+        sector_in_play     bool  — parent sector moving ±1.5%
+        avg_turnover_cr    float — avg daily turnover in crores
+        gap_pct            float — pre-market gap vs prev close (%)
+        atr_pct_rank       float — 0..1 percentile of atr_pct within pool
+        score_boost        float — additive boost (capped) from webhooks etc.
+
+    The `volume_surge_threshold` and `price_move_threshold` settings act as
+    *floors* — values below the threshold contribute zero to that component.
+    Component budget (totals 100, missing fields → 0):
+        vol(20) + price(15) + catalyst(15) + sector(10) + liq(10)
+        + gap(10) + atr_rank(10) + boost(10) = 100
     """
     vol_ratio = candidate.get("vol_ratio", 0)
     change_pct = abs(candidate.get("change_pct", 0))
     has_catalyst = candidate.get("has_catalyst", False)
+    catalyst_pts_override = candidate.get("catalyst_pts")  # 0..15 graded score
     sector_in_play = candidate.get("sector_in_play", False)
     avg_turnover_cr = candidate.get("avg_turnover_cr", 0)
+    gap_pct = abs(candidate.get("gap_pct", 0) or 0)
+    atr_rank = float(candidate.get("atr_pct_rank", 0) or 0)
+    boost = float(candidate.get("score_boost", 0) or 0)
 
-    # Volume surge: weight 25, caps at 5x
-    vol_score = min(vol_ratio / 5.0, 1.0) * 25
+    vol_floor = float(getattr(settings, "volume_surge_threshold", 2.0))
+    price_floor = float(getattr(settings, "price_move_threshold", 1.5))
 
-    # Price move: weight 25, caps at 4%
-    price_score = min(change_pct / 4.0, 1.0) * 25
+    vol_score = min(vol_ratio / 5.0, 1.0) * 20 if vol_ratio >= vol_floor else 0
+    price_score = min(change_pct / 4.0, 1.0) * 15 if change_pct >= price_floor else 0
+    if catalyst_pts_override is not None:
+        catalyst_score = max(0.0, min(float(catalyst_pts_override), 15.0))
+    else:
+        catalyst_score = 15 if has_catalyst else 0
+    sector_score = 10 if sector_in_play else 0
+    liq_score = min(avg_turnover_cr / 50.0, 1.0) * 10
+    gap_score = min(gap_pct / 3.0, 1.0) * 10            # 3% gap saturates
+    atr_score = max(0.0, min(atr_rank, 1.0)) * 10
+    boost_score = max(0.0, min(boost, 10.0))
 
-    # Catalyst: weight 20, binary
-    catalyst_score = 20 if has_catalyst else 0
-
-    # Sector: weight 15, binary
-    sector_score = 15 if sector_in_play else 0
-
-    # Liquidity: weight 15, caps at 50 Cr
-    liq_score = min(avg_turnover_cr / 50.0, 1.0) * 15
-
-    total = vol_score + price_score + catalyst_score + sector_score + liq_score
+    total = (vol_score + price_score + catalyst_score + sector_score
+             + liq_score + gap_score + atr_score + boost_score)
     return min(round(total, 1), 100)
+
+
+def _annotate_atr_percentile(candidates: list[dict[str, Any]]) -> None:
+    """In-place: rank atr_pct within the batch and store as `atr_pct_rank` (0..1)."""
+    rows = [c for c in candidates if c.get("atr_pct_pool") is not None]
+    if not rows:
+        return
+    sorted_vals = sorted(c["atr_pct_pool"] for c in rows)
+    n = len(sorted_vals)
+    if n == 1:
+        rows[0]["atr_pct_rank"] = 1.0
+        return
+    for c in rows:
+        # Higher atr_pct → higher rank (humans want names that move).
+        idx = sorted_vals.index(c["atr_pct_pool"])
+        c["atr_pct_rank"] = idx / (n - 1)
 
 
 def _deduplicate_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -121,8 +151,11 @@ def _select_universe(
     Apply liquidity floor, sort by score, pick top N.
     Always includes stocks with existing open positions.
     """
-    # Liquidity filter
-    qualified = [c for c in candidates if c.get("avg_turnover_cr", 0) >= min_turnover_cr]
+    # Liquidity filter — pinned (watchlist) names skip the floor.
+    qualified = [
+        c for c in candidates
+        if c.get("pinned") or c.get("avg_turnover_cr", 0) >= min_turnover_cr
+    ]
 
     # Score and sort
     scored = sorted(qualified, key=lambda c: _score_candidate(c), reverse=True)
@@ -130,12 +163,20 @@ def _select_universe(
     # Pick top N
     selected = scored[:pick_count]
 
-    # Ensure existing positions are included
+    selected_symbols = {c["symbol"] for c in selected}
+
+    # Always include pinned watchlist entries, regardless of score.
+    for c in qualified:
+        if c.get("pinned") and c["symbol"] not in selected_symbols:
+            selected.append(c)
+            selected_symbols.add(c["symbol"])
+
+    # Ensure existing positions are included.
     if existing_positions:
-        selected_symbols = {c["symbol"] for c in selected}
         for c in qualified:
             if c["symbol"] in existing_positions and c["symbol"] not in selected_symbols:
                 selected.append(c)
+                selected_symbols.add(c["symbol"])
 
     return selected
 
@@ -193,13 +234,88 @@ async def _enrich_with_catalysts(
     candidates: list[dict[str, Any]],
     headlines: list[str],
 ) -> None:
-    """Mark candidates that have news catalysts (in-place)."""
-    from yukti.services.macro_context_service import filter_headlines_for_symbol
+    """Mark candidates that have news catalysts (in-place).
 
+    Two paths:
+      1. If the catalyst service is enabled, prefer per-symbol Redis cache
+         (graded 0..15 score via NSE announcements + earnings calendar).
+      2. Otherwise fall back to the legacy broad-market headline filter.
+    """
+    enabled = bool(getattr(settings, "enable_news_enrichment", True))
+    if enabled:
+        try:
+            from yukti.services.catalyst_service import (
+                get_items_for_symbol,
+                is_pre_results,
+                score_catalyst_for_symbol,
+            )
+            for c in candidates:
+                items = await get_items_for_symbol(c["symbol"])
+                pre_res = await is_pre_results(c["symbol"])
+                pts = score_catalyst_for_symbol(c["symbol"], items, in_results_window=pre_res)
+                if pts > 0:
+                    c["catalyst_pts"] = pts
+                    c["has_catalyst"] = True
+                    if items:
+                        c["catalyst_categories"] = sorted({i.category for i in items})
+                    if pre_res:
+                        c["pre_results"] = True
+            return
+        except Exception as exc:
+            log.warning("Graded catalyst enrichment failed (%s) — using headline fallback", exc)
+
+    # Legacy broad-market headline matching
+    from yukti.services.macro_context_service import filter_headlines_for_symbol
     for c in candidates:
         matches = filter_headlines_for_symbol(c["symbol"], headlines)
         if matches:
             c["has_catalyst"] = True
+
+
+async def _enrich_with_premarket_gap(candidates: list[dict[str, Any]]) -> None:
+    """Read the pre-market snapshot written by `job_premarket_rank` and annotate
+    each candidate with `gap_pct`. No-op if the cache is missing — the scanner
+    still runs; gap simply contributes zero."""
+    try:
+        from yukti.data.state import get_redis
+        r = await get_redis()
+        raw = await r.get("yukti:premarket:snapshot")
+        if not raw:
+            return
+        snap = json.loads(raw)
+    except Exception as exc:
+        log.debug("premarket snapshot unavailable: %s", exc)
+        return
+    for c in candidates:
+        sym_data = snap.get(c["symbol"])
+        if isinstance(sym_data, dict):
+            c["gap_pct"] = float(sym_data.get("gap_pct") or 0)
+
+
+async def _enrich_with_webhook_boosts(candidates: list[dict[str, Any]]) -> None:
+    """Read non-expired webhook score boosts from `yukti:scanner:boosts`.
+    Slice 5 wires the actual endpoint; this consumer is harmless when empty."""
+    try:
+        from yukti.data.state import get_redis
+        r = await get_redis()
+        keys = await r.hkeys("yukti:scanner:boosts")
+        if not keys:
+            return
+        for sym in keys:
+            raw = await r.hget("yukti:scanner:boosts", sym)
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            for c in candidates:
+                if c["symbol"] == sym:
+                    c["score_boost"] = float(payload.get("score_boost") or 0)
+                    c["boost_source"] = payload.get("source")
+                    break
+    except Exception as exc:
+        log.debug("webhook boost read failed: %s", exc)
 
 
 async def _enrich_with_sector_momentum(
@@ -232,6 +348,65 @@ async def _enrich_with_sector_momentum(
 #  MAIN SCANNER SERVICE
 # ═══════════════════════════════════════════════════════════════
 
+async def _load_candidate_pool() -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Read the daily candidate pool from Redis (`yukti:candidate_pool`) and
+    pin any symbols listed in `settings.watchlist`.
+
+    Returns:
+        symbols  — `{symbol: security_id}` to pass to data fetchers.
+        meta     — `{symbol: {sector, turnover_cr, atr_pct, pinned}}` for
+                   downstream scoring / hygiene gates.
+
+    Falls back to the hardcoded `NIFTY_100_POOL` only if Redis has no entry —
+    paper-mode developers shouldn't be blocked, but live/shadow operators are
+    expected to populate the pool via the scheduler / CLI.
+    """
+    symbols: dict[str, str] = {}
+    meta: dict[str, dict[str, Any]] = {}
+
+    try:
+        from yukti.data.state import get_redis
+        r = await get_redis()
+        raw = await r.get("yukti:candidate_pool")
+        if raw:
+            pool = json.loads(raw)
+            for entry in pool:
+                sym = entry["symbol"]
+                symbols[sym] = entry["security_id"]
+                meta[sym] = {
+                    "sector":      entry.get("sector", "Unknown"),
+                    "turnover_cr": entry.get("turnover_cr"),
+                    "atr_pct":     entry.get("atr_pct"),
+                    "pinned":      False,
+                }
+            log.info("UniverseScanner: loaded candidate pool (%d symbols) from Redis", len(symbols))
+    except Exception as exc:
+        log.warning("UniverseScanner: could not read yukti:candidate_pool: %s", exc)
+
+    if not symbols:
+        log.warning(
+            "UniverseScanner: candidate pool empty — falling back to built-in NIFTY_100_POOL "
+            "(run `scripts/universe_loader.py --candidate-pool` to populate)"
+        )
+        symbols = dict(NIFTY_100_POOL)
+
+    # Pin watchlist entries — they always make the pool, even with no metadata.
+    for sym in (getattr(settings, "watchlist", []) or []):
+        sym_u = sym.strip().upper()
+        if not sym_u:
+            continue
+        if sym_u not in symbols:
+            sec_id = NIFTY_100_POOL.get(sym_u, "")
+            if not sec_id:
+                log.warning("UniverseScanner: watchlist symbol %s not in pool/master — skipping", sym_u)
+                continue
+            symbols[sym_u] = sec_id
+        meta.setdefault(sym_u, {"sector": "Unknown", "turnover_cr": None, "atr_pct": None})
+        meta[sym_u]["pinned"] = True
+
+    return symbols, meta
+
+
 class UniverseScannerService:
     """
     Discovers stocks to trade. Runs at 08:45 (primary) and intraday refresh at 10:00, 12:00.
@@ -239,7 +414,8 @@ class UniverseScannerService:
     """
 
     def __init__(self) -> None:
-        self._pool = NIFTY_100_POOL
+        self._pool: dict[str, str] = {}
+        self._pool_meta: dict[str, dict[str, Any]] = {}
 
     async def run_scan(self, is_refresh: bool = False) -> list[dict[str, str]]:
         """
@@ -253,9 +429,21 @@ class UniverseScannerService:
         """
         log.info("UniverseScanner: starting %s scan", "refresh" if is_refresh else "primary")
 
+        # 0. Refresh the candidate pool (daily build via scheduler / CLI; cached in Redis).
+        self._pool, self._pool_meta = await _load_candidate_pool()
+
         # 1. Fetch volume + price data for the pool
         candidates = await _fetch_volume_and_price_data(self._pool)
         log.info("UniverseScanner: fetched data for %d symbols", len(candidates))
+
+        # Carry sector/atr metadata from the pool through to candidates so the
+        # rest of the pipeline (and downstream prompts) can see it.
+        for c in candidates:
+            m = self._pool_meta.get(c["symbol"])
+            if m:
+                c.setdefault("sector", m.get("sector"))
+                c.setdefault("atr_pct_pool", m.get("atr_pct"))
+                c["pinned"] = bool(m.get("pinned"))
 
         # 2. Enrich with catalysts
         try:
@@ -270,6 +458,22 @@ class UniverseScannerService:
         # 3. Enrich with sector momentum
         await _enrich_with_sector_momentum(candidates)
 
+        # 3b. Pre-market gap + ATR percentile + webhook boosts.
+        await _enrich_with_premarket_gap(candidates)
+        _annotate_atr_percentile(candidates)
+        await _enrich_with_webhook_boosts(candidates)
+
+        # 3c. Hard exclusions (F&O ban / ASM / GSM / at-circuit).
+        try:
+            from yukti.services.exclusions_service import load_today, filter_candidates
+            excl = await load_today()
+            kept, drops = filter_candidates(candidates, excl)
+            if drops:
+                log.info("Exclusions dropped: %s", drops)
+            candidates = kept
+        except Exception as exc:
+            log.warning("Exclusions filter skipped: %s", exc)
+
         # 4. Deduplicate
         candidates = _deduplicate_candidates(candidates)
 
@@ -282,10 +486,24 @@ class UniverseScannerService:
         except Exception:
             pass
 
-        # 6. Select
+        # 6. Apply regime shortlist depth.
+        try:
+            from yukti.services.regime_service import compute as compute_regime
+            regime = await compute_regime()
+            depth = max(0.1, min(1.0, regime.shortlist_depth))
+            effective_pick = max(3, int(round(settings.scanner_pick_count * depth)))
+            log.info(
+                "Regime: bucket=%s vix=%s depth=%.2f → pick_count %d→%d (preservation=%s, event=%s)",
+                regime.bucket, regime.vix, depth, settings.scanner_pick_count,
+                effective_pick, regime.preservation, regime.event_day,
+            )
+        except Exception as exc:
+            log.debug("Regime compute skipped: %s", exc)
+            effective_pick = settings.scanner_pick_count
+
         selected = _select_universe(
             candidates,
-            pick_count=settings.scanner_pick_count,
+            pick_count=effective_pick,
             min_turnover_cr=settings.min_turnover_cr,
             existing_positions=existing_positions,
         )
