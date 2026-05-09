@@ -131,6 +131,11 @@ class Settings(BaseSettings):
 
     # ── Risk gates ────────────────────────────────────
     daily_loss_limit_pct: float = Field(default=0.02, gt=0)
+    # Warning tier: between -warn and -limit, only conviction >= 8 trades
+    # are accepted. Below -limit, all trades are halted for the day. Lets
+    # the system push through a small drawdown on strong setups instead of
+    # locking out the rest of the day after a single loss.
+    daily_loss_warn_pct: float = Field(default=0.012, gt=0)
     min_rr: float = Field(default=1.8, gt=0)
     min_conviction: int = Field(default=5, ge=1, le=10)
     max_loss_cap_pct: float = Field(default=0.015, gt=0)

@@ -411,7 +411,7 @@ async def close_trade(
         except Exception:
             pass
 
-    await set_cooldown(symbol)
+    await set_cooldown(symbol, conviction=pos.get("conviction"))
     await delete_position(symbol)
 
     log.info(

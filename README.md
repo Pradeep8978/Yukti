@@ -317,6 +317,59 @@ uv run python -m yukti.services.learning_loop_service
 
 ---
 
+## Known TODOs / deferred work
+
+Identified during audit but deferred. Each item needs design input or
+carries enough risk that it should be done deliberately rather than as
+part of a sweeping change.
+
+### Trading-policy refinements
+
+- **Liquidity gate inside `run_gates`** — universe scanner already filters by
+  turnover; risk gates currently don't enforce a per-trade liquidity floor.
+  Adding one would harden the entry path against universe-list staleness.
+- **ATM IV context for Arjun** — the Arjun prompt mentions IV-based stop
+  widening but the runtime context block doesn't inject IV data. Either
+  fetch ATM IV per symbol from the option chain and pass it in, or strip
+  the IV references from the prompt to avoid hallucination on missing data.
+
+### Architectural / migration-needed
+
+- **Persist `trailing_sl` to Postgres**
+  (`yukti/data/models.py`, `yukti/execution/monitor.py:_update_trailing_sl`).
+  Today the trail lives only in Redis; a Redis wipe loses it and the
+  position falls back to the breakeven SL stored in Postgres. Adds a
+  schema migration.
+- **Trail SL on every WebSocket tick, not just the 10s REST cycle**
+  (`yukti/execution/monitor.py:_on_tick`). Faster trail tightening on
+  fast moves, but needs care on choppy ticks to avoid thrash.
+- **Skip REST poller when WS feed is connected**
+  (`yukti/execution/monitor.py:monitor_positions`). Saves DhanHQ API calls
+  but introduces a silent-feed risk — needs a tick-staleness watchdog
+  first that flips back to REST polling if no tick arrives in N seconds
+  while `feed.is_connected()` returns True.
+- **Update broker GTT to track the trailed SL** — currently the breakeven
+  SL GTT at the broker stays fixed; only our process enforces the trail.
+  If the process dies after T1 and price reverses, the broker exits at
+  breakeven, not the trailed level. Periodically replacing the GTT with
+  the trailed trigger price would close that gap.
+
+### Edge-case follow-ups
+
+- **EOD squareoff vs in-flight partial exit race**
+  (`yukti/scheduler/jobs.py`). Skip symbols whose `status == "PARTIAL_EXITING"`
+  in the squareoff iteration so an in-flight partial exit isn't double-acted on.
+- **Per-symbol `asyncio.Lock`** to replace the cooperative `_closing_symbols`
+  set in `yukti/execution/monitor.py`. Tightens the tick-handler vs
+  REST-poller race so two coroutines can't act on the same close together.
+- **Reconcile partial-success metrics** — `recover_from_crash` returns a
+  stats dict but `bootstrap_service` doesn't compare expected vs recovered
+  position counts. Add a metric and halt if `recovered < expected * 0.8`
+  so a quietly-failed reconciliation doesn't allow trading on unknown
+  state.
+
+---
+
 ## Disclaimer
 
 Trading involves real financial risk. Understand India's SEBI regulations on algorithmic trading before deploying live capital. Never trade with money you cannot afford to lose.

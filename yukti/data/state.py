@@ -172,10 +172,22 @@ async def count_open_positions() -> int:
 
 # ── Cooldown registry ─────────────────────────────────────────────────────────
 
-async def set_cooldown(symbol: str, candle_interval_seconds: int = 300) -> None:
-    """Block a symbol for N cycles after a trade."""
+async def set_cooldown(
+    symbol: str,
+    candle_interval_seconds: int = 300,
+    conviction: int | None = None,
+) -> None:
+    """Block a symbol for N cycles after a trade.
+
+    High-conviction setups (≥ 8) get half the cooldown so the system can
+    re-enter quickly when a strong pattern continues. Below 8 keeps the
+    full cooldown to avoid over-trading marginal setups.
+    """
     r = await get_redis()
-    ttl = settings.cooldown_cycles * candle_interval_seconds
+    cycles = settings.cooldown_cycles
+    if conviction is not None and conviction >= 8:
+        cycles = max(1, cycles // 2)
+    ttl = cycles * candle_interval_seconds
     await r.set(f"yukti:cooldown:{symbol}", "1", ex=ttl)
 
 
