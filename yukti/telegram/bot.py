@@ -47,7 +47,14 @@ def get_app() -> Application:
 # ── Auth guard ────────────────────────────────────────────────────────────────
 
 def _authorized(update: Update) -> bool:
-    return str(update.effective_chat.id) == settings.telegram_chat_id
+    incoming = str(update.effective_chat.id)
+    if incoming != settings.telegram_chat_id:
+        log.warning(
+            "Telegram command from unauthorized chat_id=%s (expected %s) — ignoring",
+            incoming, settings.telegram_chat_id or "<unset>",
+        )
+        return False
+    return True
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
