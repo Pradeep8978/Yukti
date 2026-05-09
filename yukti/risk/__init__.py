@@ -34,17 +34,20 @@ class PositionResult:
     risk_amount:           Decimal   # ₹ risked
     stop_distance:         Decimal   # ₹ per share
     max_loss:              Decimal   # ₹ total max loss
-    capital_deployed:      Decimal   # ₹ notional
-    capital_pct:           Decimal   # % of account deployed
+    capital_deployed:      Decimal   # ₹ notional (qty × entry)
+    capital_pct:           Decimal   # margin / account_value × 100 (leverage-adjusted)
+    leverage:              float = 1.0
+    margin_deployed:       Decimal = Decimal("0")   # capital_deployed / leverage
 
 
 def calculate_position(
-    entry_price: float,
-    stop_loss:   float,
-    direction:   str,
-    conviction:  int,
+    entry_price:   float,
+    stop_loss:     float,
+    direction:     str,
+    conviction:    int,
     account_value: float | None = None,
     risk_pct:      float | None = None,
+    leverage:      float = 1.0,
 ) -> PositionResult:
     """
     ATR / risk-first position sizing with conviction multiplier.
@@ -91,7 +94,10 @@ def calculate_position(
     final_qty   = int(Decimal(base_qty) * mult)
     capital_dep = Decimal(final_qty) * entry_d
 
-    quant = Decimal("0.01")
+    quant   = Decimal("0.01")
+    lev_d   = Decimal(str(max(1.0, leverage)))
+    margin  = (capital_dep / lev_d).quantize(quant, rounding=ROUND_HALF_UP)
+    cap_pct = (margin / acct * Decimal("100")).quantize(quant, rounding=ROUND_HALF_UP)
 
     return PositionResult(
         quantity              = final_qty,
@@ -101,7 +107,9 @@ def calculate_position(
         stop_distance         = (stop_dist).quantize(quant, rounding=ROUND_HALF_UP),
         max_loss              = (Decimal(final_qty) * stop_dist).quantize(quant, rounding=ROUND_HALF_UP),
         capital_deployed      = (capital_dep).quantize(quant, rounding=ROUND_HALF_UP),
-        capital_pct           = (capital_dep / acct * Decimal("100")).quantize(quant, rounding=ROUND_HALF_UP),
+        capital_pct           = cap_pct,
+        leverage              = max(1.0, leverage),
+        margin_deployed       = margin,
     )
 
 
@@ -253,12 +261,14 @@ async def run_gates(
         return GateResult(False, f"cooldown: {trade_decision.symbol} recently traded")
 
     # 6. Position size fits within per-trade risk % and single-stock cap
+    _gate_leverage = settings.intraday_leverage if trade_decision.holding_period == "intraday" else 1.0
     position = calculate_position(
         trade_decision.entry_price,
         trade_decision.stop_loss,
         trade_decision.direction,
         trade_decision.conviction,
         portfolio.account_value,
+        leverage=_gate_leverage,
     )
     account_value = Decimal(str(portfolio.account_value))
     max_loss_cap_pct = Decimal(str(settings.max_loss_cap_pct)) * Decimal("100")

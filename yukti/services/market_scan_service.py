@@ -360,12 +360,18 @@ class MarketScanService:
                     decision.target_2 = decision.target_2 or levels.target_2
                     decision.risk_reward = decision.risk_reward or levels.risk_reward
 
-                # Compute total exposure as sum(entry_price * quantity) / account_value
+                # Compute total exposure as margin-adjusted sum (notional / leverage per position)
                 all_positions = await get_all_positions()
                 total_notional = 0.0
                 for p in all_positions.values():
                     try:
-                        total_notional += float(p.get("entry_price", 0)) * int(p.get("quantity", 0))
+                        p_leverage = (
+                            settings.intraday_leverage
+                            if p.get("holding_period") == "intraday"
+                            else 1.0
+                        )
+                        notional = float(p.get("entry_price", 0)) * int(p.get("quantity", 0))
+                        total_notional += notional / p_leverage
                     except Exception:
                         continue
 
@@ -401,7 +407,14 @@ class MarketScanService:
                     log.info("MarketScanService: risk gate failed for %s: %s", symbol, gate.reason)
                     return
 
-                position = calculate_position(decision.entry_price or snap.close, decision.stop_loss, decision.direction or "LONG", decision.conviction)
+                _leverage = settings.intraday_leverage if decision.holding_period == "intraday" else 1.0
+                position = calculate_position(
+                    decision.entry_price or snap.close,
+                    decision.stop_loss,
+                    decision.direction or "LONG",
+                    decision.conviction,
+                    leverage=_leverage,
+                )
                 pos = await open_trade(symbol, security_id, decision, position)
                 if pos:
                     record_trade_opened(decision.direction or "LONG", decision.setup_type or "unknown")
