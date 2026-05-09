@@ -253,6 +253,7 @@ async def get_performance_state() -> dict[str, Any]:
         "consecutive_losses": abs(streak) if streak < 0 else 0,
         "daily_pnl_pct":      float(pnl_raw)  if pnl_raw    else 0.0,
         "win_rate_last_10":   sum(wins) / len(wins) if wins  else 0.5,
+        "win_rate_last_10_count": len(wins),
         "trades_today":       int(trades_raw)   if trades_raw else 0,
     }
 
