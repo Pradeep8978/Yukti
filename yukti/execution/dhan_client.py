@@ -539,6 +539,23 @@ class DhanClient:
             log.debug("get_market_depth failed for %s: %s", security_id, exc)
             return {}
 
+    # ── Account funds ────────────────────────────────────────────────────────
+
+    async def get_fund_limits(self) -> dict[str, Any]:
+        """
+        Fetch account fund limits from DhanHQ (available balance, used margin, etc).
+        Returns raw SDK response. Never raises — returns {} on any failure.
+        """
+        try:
+            fn = getattr(self._dhan, "get_fund_limits", None)
+            if fn is None:
+                log.debug("DhanClient: get_fund_limits not available in installed SDK")
+                return {}
+            return await self._call(fn)
+        except Exception as exc:
+            log.debug("get_fund_limits failed: %s", exc)
+            return {}
+
     # ── Market order (square off) ─────────────────────────────────────────────
 
     async def market_exit(

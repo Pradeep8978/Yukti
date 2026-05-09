@@ -28,6 +28,7 @@ from yukti.execution.order_sm import open_trade
 from yukti.metrics import signals_scanned, scan_failures, record_skip, record_trade_opened
 from yukti.risk import calculate_levels, calculate_position, run_gates, Portfolio, is_market_halted
 from yukti.scheduler.jobs import KOLKATA, is_trading_day, is_trading_hours
+from yukti.services.balance_service import fetch_available_balance
 from yukti.services.macro_context_service import MacroContext, fetch_macro_context, filter_headlines_for_symbol
 from yukti.signals.context import build_context
 from yukti.signals.indicators import compute
@@ -360,6 +361,9 @@ class MarketScanService:
                     decision.target_2 = decision.target_2 or levels.target_2
                     decision.risk_reward = decision.risk_reward or levels.risk_reward
 
+                # Fetch live account balance (cached 2 min); falls back to config value
+                live_account_value = await fetch_available_balance()
+
                 # Compute total exposure as margin-adjusted sum (notional / leverage per position)
                 all_positions = await get_all_positions()
                 total_notional = 0.0
@@ -376,8 +380,8 @@ class MarketScanService:
                         continue
 
                 total_exposure_pct = (
-                    round(total_notional / settings.account_value * 100, 2)
-                    if settings.account_value
+                    round(total_notional / live_account_value * 100, 2)
+                    if live_account_value
                     else 0.0
                 )
 
@@ -392,7 +396,7 @@ class MarketScanService:
                 sector_exposure_pct, trade_sector = self._sector_exposure(all_positions, symbol)
 
                 portfolio = Portfolio(
-                    account_value=settings.account_value,
+                    account_value=live_account_value,
                     open_positions=await count_open_positions(),
                     daily_pnl_pct=await get_daily_pnl_pct(),
                     total_exposure_pct=total_exposure_pct,
@@ -413,6 +417,7 @@ class MarketScanService:
                     decision.stop_loss,
                     decision.direction or "LONG",
                     decision.conviction,
+                    account_value=live_account_value,
                     leverage=_leverage,
                 )
                 pos = await open_trade(symbol, security_id, decision, position)
