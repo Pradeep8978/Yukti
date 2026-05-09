@@ -64,10 +64,34 @@ async def recover_from_crash() -> dict[str, int]:
     #    between cancelling the T1 GTT and arming the new breakeven SL, the
     #    remaining shares may sit naked at the broker. Force-flatten any
     #    quantity the broker still holds for these symbols.
+    #
+    #    IMPORTANT: reconcile_positions() can be scheduled CONCURRENTLY from
+    #    monitor_positions() when an unrelated symbol disappears from the
+    #    broker. If we naively force-flatten anything in PARTIAL_EXITING, we
+    #    can clobber a live partial exit that's mid-flight (~0.5s window per
+    #    call). The partial_exit_started_at timestamp lets us distinguish a
+    #    truly stuck position (old) from one in active flight (fresh). Only
+    #    act on entries that have been in PARTIAL_EXITING for > 60s.
+    PARTIAL_EXIT_STUCK_THRESHOLD_SECS = 60
     all_positions = await get_all_positions()
     for symbol, pos in all_positions.items():
         if pos.get("status") != "PARTIAL_EXITING":
             continue
+
+        started = pos.get("partial_exit_started_at")
+        if started:
+            try:
+                elapsed = (datetime.utcnow() - datetime.fromisoformat(started)).total_seconds()
+            except (TypeError, ValueError):
+                # Malformed timestamp — treat as old to be safe (the alternative
+                # is leaving a possibly-naked position uncovered indefinitely).
+                elapsed = float("inf")
+            if elapsed < PARTIAL_EXIT_STUCK_THRESHOLD_SECS:
+                log.info(
+                    "Skipping PARTIAL_EXITING recovery for %s — %ss old, likely in flight",
+                    symbol, int(elapsed),
+                )
+                continue
 
         log.warning("Position %s stuck in PARTIAL_EXITING — force-flattening", symbol)
         direction    = (pos.get("direction") or "LONG").upper()

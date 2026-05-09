@@ -295,7 +295,12 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
     #     whatever remains so the position never sits naked. Status is also
     #     outside ("ARMED","FILLED"), so the tick handler and REST poller skip
     #     this symbol — no concurrent re-entry into _partial_exit_t1.
+    #     The timestamp lets reconcile distinguish "stuck after crash" (old)
+    #     from "in flight right now" (fresh) so a reconcile triggered
+    #     concurrently from monitor_positions doesn't force-flatten a live
+    #     partial exit.
     pos["status"] = "PARTIAL_EXITING"
+    pos["partial_exit_started_at"] = datetime.utcnow().isoformat()
     await save_position(symbol, pos)
 
     # 1 — Cancel T1 GTT BEFORE placing the partial market exit so the broker
@@ -348,6 +353,7 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
         # T1 GTT (cancelled in step 1). Restore status so monitor can re-attempt
         # on the next tick if T1 is still being touched.
         pos["status"] = "ARMED"
+        pos.pop("partial_exit_started_at", None)
         await save_position(symbol, pos)
         return
 
@@ -412,6 +418,7 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
     # 5 — Update position record; promote T2 → T1 for next monitor check
     old_t2 = float(pos.get("target_2") or 0)
     pos["status"]        = "ARMED"            # clear PARTIAL_EXITING marker set in step 0
+    pos.pop("partial_exit_started_at", None)  # in-flight marker no longer relevant
     pos["quantity"]      = remaining
     pos["stop_loss"]     = fill_price          # breakeven — crash-safe "partial done" marker
     pos["target_1"]      = old_t2             # 0 if no T2 → monitor's "target_1 and ..." skips it
