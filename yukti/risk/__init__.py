@@ -248,22 +248,29 @@ async def run_gates(
     # Three layers:
     #   (a) base       — regime override or static settings.min_conviction
     #   (b) loss-tier  — between -warn% and -limit% pnl, force min ≥ 8 so we
-    #                    only push through drawdown on very strong setups
+    #                    only push through drawdown on very strong setups.
+    #                    This floor is *sticky*: win-rate easing must not
+    #                    cross it back down, otherwise a hot streak in a
+    #                    drawdown silently relaxes the safety intent.
     #   (c) win-rate   — bump up on cold streaks (<40%), ease one notch on
     #                    hot streaks (>60%); only applied with ≥5 sample size
     min_conviction = portfolio.min_conviction_override or settings.min_conviction
+    loss_tier_floor = 0  # 0 = no loss-tier floor active
 
     daily_loss_warn_pct = settings.daily_loss_warn_pct * 100
     if portfolio.daily_pnl_pct <= -daily_loss_warn_pct:
-        min_conviction = max(min_conviction, 8)
+        loss_tier_floor = 8
+        min_conviction = max(min_conviction, loss_tier_floor)
 
     if portfolio.win_rate_last_10 is not None and portfolio.win_rate_last_10_count >= 5:
         if portfolio.win_rate_last_10 < 0.40:
             min_conviction += 2
         elif portfolio.win_rate_last_10 > 0.60:
-            # Never ease below the configured static floor — regime/loss-tier
-            # already protected; this is just rewarding a hot streak.
-            min_conviction = max(settings.min_conviction, min_conviction - 1)
+            # Never ease below the static floor or the loss-tier floor (if
+            # active). Easing past the loss-tier floor would silently undo
+            # the drawdown protection.
+            ease_floor = max(settings.min_conviction, loss_tier_floor)
+            min_conviction = max(ease_floor, min_conviction - 1)
 
     min_conviction = min(10, max(1, min_conviction))
     if trade_decision.conviction < min_conviction:
