@@ -20,7 +20,7 @@ class ControlPlaneService:
     def __init__(self, mode: str) -> None:
         self.mode = mode
         self.api_server = None
-        self.tg_task = None
+        self.tg = None
         self.watchdog_task = None
         self.scheduler = None
 
@@ -67,10 +67,15 @@ class ControlPlaneService:
         log.info("ControlPlaneService: API server started on :8000")
 
         # Start Telegram bot
+        # PTB v20+ lifecycle: initialize() → start() → updater.start_polling().
+        # Without start(), the dispatcher never consumes updates from the queue,
+        # so /status (and every other command) silently goes unanswered.
         try:
             tg = tg_app()
             await tg.initialize()
-            self.tg_task = asyncio.create_task(tg.updater.start_polling())
+            await tg.start()
+            await tg.updater.start_polling()
+            self.tg = tg
             await alert_agent_started(self.mode)
             log.info("ControlPlaneService: Telegram bot active")
         except Exception as exc:
@@ -115,8 +120,14 @@ class ControlPlaneService:
 
         if self.watchdog_task:
             self.watchdog_task.cancel()
-        if self.tg_task:
-            self.tg_task.cancel()
+        if self.tg is not None:
+            try:
+                if self.tg.updater and self.tg.updater.running:
+                    await self.tg.updater.stop()
+                await self.tg.stop()
+                await self.tg.shutdown()
+            except Exception as exc:
+                log.warning("ControlPlaneService: Telegram shutdown failed: %s", exc)
         if self.scheduler:
             try:
                 self.scheduler.shutdown(wait=False)
