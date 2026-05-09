@@ -18,7 +18,7 @@ depends_on = None
 def upgrade() -> None:
     op.add_column(
         "journal_entries",
-        sa.Column("quality_score", sa.Integer(), nullable=True),
+        sa.Column("quality_score", sa.Float(), nullable=True),
     )
     op.add_column(
         "journal_entries",

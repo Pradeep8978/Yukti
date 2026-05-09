@@ -46,6 +46,9 @@ class MarketScanService:
         self.interval_secs = 300  # 5 min
         self.max_concurrent = 5
         self.sem = asyncio.Semaphore(self.max_concurrent)
+        # Serialises the check-then-open step so concurrent scans can't both
+        # pass the MAX_OPEN_POSITIONS gate and double-enter the same cycle.
+        self._open_lock = asyncio.Lock()
 
     async def _get_cycle_universe(self) -> list[tuple[str, str]]:
         """Limit each AI scan cycle to a small deterministic shortlist.
@@ -148,6 +151,16 @@ class MarketScanService:
                     pass
 
             elapsed = asyncio.get_event_loop().time() - cycle_start
+            try:
+                _open = await count_open_positions()
+                _pnl  = await get_daily_pnl_pct()
+                _tt   = int((await get_performance_state()).get("trades_today", 0) or 0)
+                log.info(
+                    "CYCLE | symbols=%d elapsed=%.1fs | open=%d trades_today=%d daily_pnl=%.2f%%",
+                    len(cycle_universe), elapsed, _open, _tt, _pnl,
+                )
+            except Exception:
+                pass
             await asyncio.sleep(max(5, self.interval_secs - elapsed))
 
     async def _get_macro_context(self) -> MacroContext:
@@ -247,6 +260,16 @@ class MarketScanService:
                 df.sort_index(inplace=True)
                 df = df.astype({c: float for c in ["open","high","low","close","volume"]})
                 snap = compute(df, timeframe="5m")
+                log.info(
+                    "SNAP %s | close=%.2f vwap=%.2f ema20=%.2f ema50=%.2f "
+                    "rsi=%.1f macd_hist=%.4f atr=%.2f vol_ratio=%.2fx "
+                    "trend=%s st=%s bb_pos=%.0f%%",
+                    symbol,
+                    snap.close, snap.vwap, snap.ema20, snap.ema50,
+                    snap.rsi, snap.macd_hist, snap.atr, snap.volume_ratio,
+                    snap.trend, "BULL" if snap.supertrend_bull else "BEAR",
+                    (snap.close - snap.bb_lower) / max(snap.bb_upper - snap.bb_lower, 0.01) * 100,
+                )
 
                 # ── Daily candles (new — multi-timeframe) ─────────────
                 snap_daily = None
@@ -271,8 +294,10 @@ class MarketScanService:
 
                 # ── Pre-AI filter: skip expensive AI call when signal is absent ──
                 if pattern is None:
+                    log.info("PATTERN %s | no signal (trend=%s rsi=%.1f vol_ratio=%.2fx)", symbol, snap.trend, snap.rsi, snap.volume_ratio)
                     record_skip("no_pattern")
                     return
+                log.info("PATTERN %s | %s strength=%.2f | %s", symbol, pattern.pattern_type, pattern.strength, pattern.notes)
 
                 if await is_halted() or await is_market_halted():
                     record_skip("market_halted_preai")
@@ -335,6 +360,15 @@ class MarketScanService:
                 if not is_trading_day() or not is_trading_hours():
                     record_skip("outside_trading_hours")
                     log.info("MarketScanService: skipping AI call for %s outside trading hours", symbol)
+                    return
+
+                # Block new entries < 20 min before EOD squareoff
+                # A trade at 14:56 has only 19 minutes before forced close — not enough.
+                eod_h, eod_m = (int(p) for p in settings.eod_squareoff.split(":"))
+                _eod_dt = now_ist.replace(hour=eod_h, minute=eod_m, second=0, microsecond=0)
+                _entry_cutoff = (_eod_dt - timedelta(minutes=20)).time()
+                if current_time >= _entry_cutoff:
+                    record_skip("too_close_to_eod")
                     return
 
                 decision = await arjun.safe_decide(context)
@@ -424,7 +458,23 @@ class MarketScanService:
                     account_value=live_account_value,
                     leverage=_leverage,
                 )
-                pos = await open_trade(symbol, security_id, decision, position)
+                log.info(
+                    "SIZING %s | qty=%d (base=%d ×%.1f) risk=₹%.0f stop=₹%.2f "
+                    "capital=₹%.0f margin=₹%.0f (%.1f%% of acct) leverage=%.0fx",
+                    symbol,
+                    position.quantity, position.base_quantity, position.conviction_multiplier,
+                    float(position.risk_amount), float(position.stop_distance),
+                    float(position.capital_deployed), float(position.margin_deployed),
+                    float(position.capital_pct), _leverage,
+                )
+                # Hold the lock while opening so concurrent scans that all passed
+                # gates on the same stale position count can't all enter at once.
+                async with self._open_lock:
+                    if await count_open_positions() >= settings.max_open_positions:
+                        record_skip("max_positions_race")
+                        log.info("MarketScanService: %s skipped — position slot taken by concurrent scan", symbol)
+                        return
+                    pos = await open_trade(symbol, security_id, decision, position)
                 if pos:
                     record_trade_opened(decision.direction or "LONG", decision.setup_type or "unknown")
                     try:

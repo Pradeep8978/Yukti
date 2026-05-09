@@ -92,9 +92,13 @@ def compute(df: pd.DataFrame, swing_lookback: int = 20, timeframe: str = "5m") -
     try:
         df["vwap"] = ta.vwap(df["high"], df["low"], df["close"], df["volume"])
     except Exception:
-        # Fallback: simple (H+L+C)/3 × volume weighted avg
+        # Fallback: per-day cumulative VWAP (resets each trading day, same as ta.vwap)
         df["tp"] = (df["high"] + df["low"] + df["close"]) / 3
-        df["vwap"] = (df["tp"] * df["volume"]).cumsum() / df["volume"].cumsum()
+        date_groups = df.index.date
+        df["vwap"] = (
+            df.groupby(date_groups)["tp"].transform(lambda s: (s * df.loc[s.index, "volume"]).cumsum())
+            / df.groupby(date_groups)["volume"].transform("cumsum")
+        )
 
     # ── Supertrend ───────────────────────────────────────────────────
     st = ta.supertrend(df["high"], df["low"], df["close"], length=7, multiplier=3.0)
@@ -158,10 +162,10 @@ def compute(df: pd.DataFrame, swing_lookback: int = 20, timeframe: str = "5m") -
             adx_val = adx_series["ADX_14"].iloc[-1]
             adx_value = float(adx_val) if pd.notna(adx_val) else 0.0
 
-        # Daily S/R — swing highs/lows from last 20 sessions
+        # Daily S/R — highest high / lowest low of last 20 sessions
         sr_window = df.tail(20)
-        daily_resistance_val = float(sr_window["high"].nlargest(3).mean())
-        daily_support_val = float(sr_window["low"].nsmallest(3).mean())
+        daily_resistance_val = float(sr_window["high"].max())
+        daily_support_val    = float(sr_window["low"].min())
 
     # ── Fill NaN with forward fill then zero ────────────────────────
     df.ffill(inplace=True)

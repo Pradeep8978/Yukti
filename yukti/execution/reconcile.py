@@ -217,8 +217,14 @@ async def reconcile_positions() -> bool:
     # Always run crash recovery first
     await recover_from_crash()
 
-    # Reset daily state
-    await reset_daily_pnl()
+    # Reset daily P&L only before market opens (before 09:15 IST).
+    # Resetting mid-day on a crash-restart would wipe morning losses and
+    # let the agent bypass the daily loss-limit gate for the rest of the day.
+    from datetime import datetime, time as dt_time
+    from yukti.scheduler.calendar import KOLKATA
+    now_ist = datetime.now(KOLKATA).time()
+    if now_ist < dt_time(9, 15):
+        await reset_daily_pnl()
 
     redis_positions: dict[str, Any] = await get_all_positions()
 

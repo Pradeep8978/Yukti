@@ -77,7 +77,7 @@ class ControlPlaneService:
             log.warning("ControlPlaneService: Telegram startup failed: %s", exc)
 
         # Start watchdog
-        self.watchdog_task = asyncio.create_task(watchdog_loop(check_interval=60, timeout_multiplier=3, auto_halt=True))
+        self.watchdog_task = asyncio.create_task(watchdog_loop(check_interval=60, timeout_multiplier=2, auto_halt=True))
         log.info("ControlPlaneService: watchdog running")
 
         # Start scheduler (registered cron jobs)

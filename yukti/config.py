@@ -193,7 +193,7 @@ class Settings(BaseSettings):
     # ── Scheduler times (IST) ─────────────────────────
     market_open:    str = "09:15"
     morning_prep:   str = "09:00"
-    eod_squareoff:  str = "15:10"
+    eod_squareoff:  str = "15:15"
     daily_journal:  str = "16:00"
     # Time to generate daily meta-lessons summary (defaults to 5 minutes after journal)
     daily_journal_summary_time: str = "16:05"

@@ -310,6 +310,19 @@ async def run_gates(
     if await is_market_halted():
         return GateResult(False, "market_halt: market is halted")
 
+    log.info(
+        "GATES PASS | %s %s conv=%d rr=%.2f qty=%d max_loss=₹%.0f (%.1f%%) "
+        "margin=%.1f%% exp=%.1f%%",
+        trade_decision.symbol,
+        trade_decision.direction,
+        trade_decision.conviction,
+        effective_rr if effective_rr is not None else 0.0,
+        position.quantity,
+        float(position.max_loss),
+        float(max_loss_pct),
+        float(position.capital_pct),
+        float(projected_total_exposure),
+    )
     return GateResult(True)
 
 

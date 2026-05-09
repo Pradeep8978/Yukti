@@ -83,9 +83,25 @@ async def job_eod_squareoff() -> None:
             for gtt in [pos.get("sl_gtt_id"), pos.get("target_gtt_id")]:
                 if gtt:
                     await broker.cancel_gtt(gtt)
-            await broker.market_exit(sec, dirn, qty, "INTRADAY")
-            await close_trade(symbol, float(pos.get("entry_price", 0)), "eod_squareoff")
-            log.info("EOD closed %s", symbol)
+            exit_resp = await broker.market_exit(sec, dirn, qty, "INTRADAY")
+            exit_price = float(pos.get("entry_price", 0))
+            # Poll once for the actual fill price — market orders typically fill in <2s
+            order_id = None
+            if isinstance(exit_resp, dict):
+                order_id = exit_resp.get("orderId") or (exit_resp.get("data") or {}).get("orderId")
+            if order_id:
+                import asyncio as _asyncio
+                await _asyncio.sleep(3)
+                try:
+                    status = await broker.get_order_status(order_id)
+                    data = status.get("data", status)
+                    fill = float(data.get("averagePrice", 0) or 0)
+                    if fill > 0:
+                        exit_price = fill
+                except Exception as poll_exc:
+                    log.warning("EOD: fill price poll failed for %s: %s", symbol, poll_exc)
+            await close_trade(symbol, exit_price, "eod_squareoff")
+            log.info("EOD closed %s @ ₹%.2f", symbol, exit_price)
         except Exception as exc:
             log.error("EOD squareoff failed %s: %s", symbol, exc)
             try:
@@ -378,7 +394,9 @@ def build_scheduler() -> AsyncIOScheduler:
         sched.add_job(job_universe_refresh, "cron", hour=hh, minute=mm,
                       id=f"universe_refresh_{hh:02d}{mm:02d}", replace_existing=True)
 
-    sched.add_job(job_eod_squareoff,    "cron", hour=15, minute=10)
+    eod_h, eod_m = (int(p) for p in settings.eod_squareoff.split(":"))
+    sched.add_job(job_eod_squareoff, "cron", hour=eod_h, minute=eod_m,
+                  id="eod_squareoff", replace_existing=True)
     sched.add_job(job_daily_reset,      "cron", hour=16, minute=0)
     sched.add_job(job_daily_report,     "cron", hour=16, minute=30)
 

@@ -131,7 +131,11 @@ def reversal_long(snap: IndicatorSnapshot) -> PatternSignal:
     High risk / high reward — requires high conviction from Claude.
     """
     oversold      = snap.rsi < 36
-    macd_turning  = snap.macd_hist > snap.macd_hist * 0.0  # hist > 0 or improving
+    # Histogram improving = less negative than -30% of the MACD line magnitude.
+    # In oversold conditions MACD is negative; we want it "turning up", not
+    # requiring it to be positive already (that would never trigger when oversold).
+    macd_ref      = abs(snap.macd) if snap.macd != 0 else 1.0
+    macd_turning  = snap.macd_hist > -(macd_ref * 0.3)
     at_bb_lower   = snap.close < snap.bb_lower * 1.005     # near/below BB lower
     near_swing_lo = abs(snap.close - snap.nearest_swing_low) / snap.nearest_swing_low < 0.01
     candle_green  = snap.close > snap.open  # current candle is green

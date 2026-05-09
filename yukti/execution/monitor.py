@@ -529,23 +529,6 @@ async def job_morning_prep() -> None:
     await reconcile_positions()
 
 
-async def job_eod_squareoff() -> None:
-    """15:10 — force close all intraday positions at market."""
-    log.info("=== EOD squareoff ===")
-    positions = await get_all_positions()
-    for symbol, pos in positions.items():
-        if pos.get("holding_period") == "intraday" and pos.get("status") in ("ARMED", "FILLED"):
-            security_id  = pos.get("security_id", "")
-            direction    = pos.get("direction", "LONG")
-            qty          = int(pos.get("quantity", 0))
-            try:
-                result = await get_broker().market_exit(security_id, direction, qty, "INTRADAY")
-                exit_p = float(pos.get("entry_price", 0))  # will be updated by monitor
-                await close_trade(symbol, exit_p, "eod_squareoff")
-                log.info("EOD squareoff: %s %d shares", symbol, qty)
-            except Exception as exc:
-                log.error("EOD squareoff failed for %s: %s", symbol, exc)
-
 
 async def job_daily_journal(closed_trades: list[dict[str, Any]]) -> None:
     """16:00 — write journal entries and embed them for memory."""

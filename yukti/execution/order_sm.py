@@ -268,6 +268,11 @@ async def _wait_for_fill(
             log.warning("Order status poll error %s: %s", order_id, exc)
             continue
 
+        log.info(
+            "FILL POLL %s | elapsed=%ds status=%s filled=%d/%d price=%.2f",
+            order_id, elapsed, order_status, filled_qty, expected_qty, fill_price,
+        )
+
         if order_status in ("TRADED", "PART_TRADED") and filled_qty >= expected_qty:
             return fill_price, filled_qty
         if order_status in ("REJECTED", "CANCELLED"):
@@ -320,6 +325,7 @@ async def _arm_gtts(
             sl_id = gtt_sl.get("gttOrderId") or (gtt_sl.get("data") or {}).get("gttOrderId")
         if not sl_id:
             return False, "", None, "sl_gtt_no_id_returned"
+        log.info("GTT SL  | %s %d @ trigger=₹%.2f → id=%s", exit_side, quantity, stop_loss, sl_id)
     except Exception as exc:
         return False, "", None, f"sl_gtt_failed: {exc}"
 
@@ -340,6 +346,8 @@ async def _arm_gtts(
                 log.warning("Target GTT API error (non-fatal): %s", gtt_t1)
             else:
                 t1_id = gtt_t1.get("gttOrderId") or (gtt_t1.get("data") or {}).get("gttOrderId")
+                if t1_id:
+                    log.info("GTT T1  | %s %d @ trigger=₹%.2f → id=%s", exit_side, quantity, target_1, t1_id)
         except Exception as exc:
             log.warning("Target GTT failed (non-fatal): %s", exc)
 

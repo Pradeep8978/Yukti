@@ -237,9 +237,24 @@ async def squareoff_all(request: Request) -> dict[str, Any]:
         qty   = int(pos.get("quantity", 0))
         ptype = "INTRADAY" if pos.get("holding_period") == "intraday" else "DELIVERY"
         try:
-            await get_broker().market_exit(sec, dirn, qty, ptype)
-            await close_trade(symbol, float(pos.get("entry_price", 0)), "api_squareoff")
-            results.append({"symbol": symbol, "ok": True})
+            exit_resp  = await get_broker().market_exit(sec, dirn, qty, ptype)
+            exit_price = float(pos.get("entry_price", 0))
+            order_id   = None
+            if isinstance(exit_resp, dict):
+                order_id = exit_resp.get("orderId") or (exit_resp.get("data") or {}).get("orderId")
+            if order_id:
+                import asyncio as _asyncio
+                await _asyncio.sleep(3)
+                try:
+                    status = await get_broker().get_order_status(order_id)
+                    data = status.get("data", status)
+                    fill = float(data.get("averagePrice", 0) or 0)
+                    if fill > 0:
+                        exit_price = fill
+                except Exception:
+                    pass
+            await close_trade(symbol, exit_price, "api_squareoff")
+            results.append({"symbol": symbol, "ok": True, "exit_price": exit_price})
         except Exception as exc:
             results.append({"symbol": symbol, "ok": False, "error": str(exc)})
 

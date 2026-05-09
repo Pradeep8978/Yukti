@@ -173,7 +173,7 @@ Step 5 — Conviction (1-10)
 1-4: Definitely skip
 
 Step 6 — Holding Period
-INTRADAY: Close by 15:10 IST. No overnight equity shorts.
+INTRADAY: Close by 15:15 IST. No overnight equity shorts.
 SWING: 2-5 days. Only LONG in delivery.
 
 ━━━ ORB RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -351,21 +351,16 @@ class ClaudeProvider(BaseProvider):
         loop = asyncio.get_event_loop()
         t0   = time.monotonic()
 
-        # Audit: record each Gemini invocation (helps verify gating/runtime usage)
         try:
             _audit_symbol = self._extract_symbol(context)
         except Exception:
             _audit_symbol = "UNKNOWN"
-        try:
-            log.info(
-                "GeminiProvider: invoking model=%s symbol=%s time=%s",
-                self._model,
-                _audit_symbol,
-                datetime.utcnow().isoformat(),
-            )
-        except Exception:
-            # Keep provider resilient to logging failures
-            pass
+        log.info(
+            "ClaudeProvider: invoking model=%s symbol=%s time=%s",
+            settings.claude_model,
+            _audit_symbol,
+            datetime.utcnow().isoformat(),
+        )
 
         # Run synchronous SDK call in thread pool
         response = await loop.run_in_executor(
@@ -399,7 +394,7 @@ class ClaudeProvider(BaseProvider):
             output_tokens = out_tokens,
             cost_usd     = cost,
         )
-        log.debug(meta.log_line())
+        log.info(meta.log_line())
         return decision, meta
 
 
@@ -511,7 +506,7 @@ class GeminiProvider(BaseProvider):
             output_tokens = out_tokens,
             cost_usd      = cost,
         )
-        log.debug(meta.log_line())
+        log.info(meta.log_line())
         return decision, meta
 
 
