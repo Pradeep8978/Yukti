@@ -383,6 +383,11 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
                 gtt_resp.get("gttOrderId")
                 or (gtt_resp.get("data") or {}).get("gttOrderId")
             )
+            if not new_sl_gtt_id:
+                log.warning(
+                    "Partial exit %s: breakeven SL GTT response had no gttOrderId — payload: %r",
+                    symbol, gtt_resp,
+                )
     except Exception as exc:
         log.warning("Partial exit: breakeven SL GTT failed for %s: %s", symbol, exc)
 
@@ -456,7 +461,7 @@ async def _update_trailing_sl(
 
     pos["trailing_sl"] = candidate
     r = await get_redis()
-    await r.set(f"yukti:positions:{symbol}", json.dumps(pos))
+    await r.set(f"yukti:positions:{symbol}", json.dumps(pos), ex=86_400)
     log.debug("Trailing SL %s: ₹%.2f → ₹%.2f", symbol, current, candidate)
 
 

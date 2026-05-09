@@ -73,9 +73,11 @@ async def save_position(symbol: str, data: dict[str, Any]) -> None:
             db.add(pos)
         await db.commit()
 
-    # Save to Redis (cache)
+    # Save to Redis (cache). 24h TTL is a safety net for crash-leftover keys —
+    # a live position re-saves on every state change so the TTL never reaches 0
+    # in normal operation. delete_position() removes both stores on close.
     r = await get_redis()
-    await r.set(f"yukti:positions:{symbol}", json.dumps(data))
+    await r.set(f"yukti:positions:{symbol}", json.dumps(data), ex=86_400)
 
 
 async def get_position(symbol: str) -> dict[str, Any] | None:

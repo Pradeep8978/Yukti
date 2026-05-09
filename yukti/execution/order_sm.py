@@ -324,6 +324,9 @@ async def _arm_gtts(
         if isinstance(gtt_sl, dict):
             sl_id = gtt_sl.get("gttOrderId") or (gtt_sl.get("data") or {}).get("gttOrderId")
         if not sl_id:
+            # Log full response so a broker schema change shows up in postmortem
+            # logs instead of an opaque "sl_gtt_no_id_returned".
+            log.error("SL GTT response had no gttOrderId — payload: %r", gtt_sl)
             return False, "", None, "sl_gtt_no_id_returned"
         log.info("GTT SL  | %s %d @ trigger=₹%.2f → id=%s", exit_side, quantity, stop_loss, sl_id)
     except Exception as exc:
@@ -348,6 +351,8 @@ async def _arm_gtts(
                 t1_id = gtt_t1.get("gttOrderId") or (gtt_t1.get("data") or {}).get("gttOrderId")
                 if t1_id:
                     log.info("GTT T1  | %s %d @ trigger=₹%.2f → id=%s", exit_side, quantity, target_1, t1_id)
+                else:
+                    log.warning("T1 GTT response had no gttOrderId — payload: %r", gtt_t1)
         except Exception as exc:
             log.warning("Target GTT failed (non-fatal): %s", exc)
 
