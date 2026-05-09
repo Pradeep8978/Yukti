@@ -28,6 +28,7 @@ from yukti.execution.order_sm import open_trade
 from yukti.metrics import signals_scanned, scan_failures, record_skip, record_trade_opened
 from yukti.risk import calculate_levels, calculate_position, run_gates, Portfolio, is_market_halted
 from yukti.scheduler.jobs import KOLKATA, is_trading_day, is_trading_hours
+from yukti.services.balance_service import fetch_available_balance
 from yukti.services.macro_context_service import MacroContext, fetch_macro_context, filter_headlines_for_symbol
 from yukti.signals.context import build_context
 from yukti.signals.indicators import compute
@@ -81,6 +82,7 @@ class MarketScanService:
 
         macro = await self._get_macro_context()
         perf = await get_performance_state()
+        live_account_value = await fetch_available_balance()
 
         cycle_universe = await self._get_cycle_universe()
 
@@ -88,7 +90,7 @@ class MarketScanService:
             if await is_halted():
                 log.info("MarketScanService: halted, stopping scan")
                 break
-            await self._scan_symbol(symbol, security_id, macro, perf)
+            await self._scan_symbol(symbol, security_id, macro, perf, live_account_value)
 
         log.info("MarketScanService: single scan cycle complete")
 
@@ -111,10 +113,11 @@ class MarketScanService:
             try:
                 macro = await self._get_macro_context()
                 perf = await get_performance_state()
+                live_account_value = await fetch_available_balance()
                 cycle_universe = await self._get_cycle_universe()
 
                 tasks = [
-                    self._scan_symbol(symbol, security_id, macro, perf)
+                    self._scan_symbol(symbol, security_id, macro, perf, live_account_value)
                     for symbol, security_id in cycle_universe
                 ]
                 symbols_list = [symbol for symbol, _ in cycle_universe]
@@ -223,7 +226,7 @@ class MarketScanService:
             log.warning("Failed to fetch daily candles for %s: %s", symbol, exc)
             return None
 
-    async def _scan_symbol(self, symbol: str, security_id: str, macro: MacroContext, perf: dict) -> None:
+    async def _scan_symbol(self, symbol: str, security_id: str, macro: MacroContext, perf: dict, live_account_value: float = 0.0) -> None:
         """Scan one symbol with daily + 5-min multi-timeframe analysis."""
         async with self.sem:
             signals_scanned.inc()
@@ -360,18 +363,29 @@ class MarketScanService:
                     decision.target_2 = decision.target_2 or levels.target_2
                     decision.risk_reward = decision.risk_reward or levels.risk_reward
 
-                # Compute total exposure as sum(entry_price * quantity) / account_value
+                # Guard: zero balance means no funds available — skip sizing
+                if live_account_value == 0:
+                    record_skip("zero_balance")
+                    return
+
+                # Compute total exposure as margin-adjusted sum (notional / leverage per position)
                 all_positions = await get_all_positions()
                 total_notional = 0.0
                 for p in all_positions.values():
                     try:
-                        total_notional += float(p.get("entry_price", 0)) * int(p.get("quantity", 0))
+                        p_leverage = (
+                            settings.intraday_leverage
+                            if p.get("holding_period") == "intraday"
+                            else 1.0
+                        )
+                        notional = float(p.get("entry_price", 0)) * int(p.get("quantity", 0))
+                        total_notional += notional / p_leverage
                     except Exception:
                         continue
 
                 total_exposure_pct = (
-                    round(total_notional / settings.account_value * 100, 2)
-                    if settings.account_value
+                    round(total_notional / live_account_value * 100, 2)
+                    if live_account_value
                     else 0.0
                 )
 
@@ -383,10 +397,10 @@ class MarketScanService:
                 except Exception as exc:
                     log.debug("Regime load skipped for gates: %s", exc)
 
-                sector_exposure_pct, trade_sector = self._sector_exposure(all_positions, symbol)
+                sector_exposure_pct, trade_sector = self._sector_exposure(all_positions, symbol, live_account_value)
 
                 portfolio = Portfolio(
-                    account_value=settings.account_value,
+                    account_value=live_account_value,
                     open_positions=await count_open_positions(),
                     daily_pnl_pct=await get_daily_pnl_pct(),
                     total_exposure_pct=total_exposure_pct,
@@ -401,7 +415,15 @@ class MarketScanService:
                     log.info("MarketScanService: risk gate failed for %s: %s", symbol, gate.reason)
                     return
 
-                position = calculate_position(decision.entry_price or snap.close, decision.stop_loss, decision.direction or "LONG", decision.conviction)
+                _leverage = settings.intraday_leverage if decision.holding_period == "intraday" else 1.0
+                position = calculate_position(
+                    decision.entry_price or snap.close,
+                    decision.stop_loss,
+                    decision.direction or "LONG",
+                    decision.conviction,
+                    account_value=live_account_value,
+                    leverage=_leverage,
+                )
                 pos = await open_trade(symbol, security_id, decision, position)
                 if pos:
                     record_trade_opened(decision.direction or "LONG", decision.setup_type or "unknown")
@@ -419,13 +441,15 @@ class MarketScanService:
     def _sector_exposure(
         positions: dict[str, dict],
         incoming_symbol: str,
+        account_value: float = 0.0,
     ) -> tuple[dict[str, float], str | None]:
-        """Approximate sector exposure using the scanner's sector map."""
+        """Approximate sector exposure using margin-adjusted notional (consistent with exposure gates)."""
         try:
             from yukti.services.universe_scanner_service import SECTOR_STOCKS
         except Exception:
             return {}, None
 
+        denom = account_value or settings.account_value
         symbol_to_sector = {
             symbol: sector
             for sector, members in SECTOR_STOCKS.items()
@@ -437,10 +461,16 @@ class MarketScanService:
             if not sector:
                 continue
             try:
+                p_leverage = (
+                    settings.intraday_leverage
+                    if pos.get("holding_period") == "intraday"
+                    else 1.0
+                )
                 notional = float(pos.get("entry_price", 0)) * int(pos.get("quantity", 0))
+                margin = notional / p_leverage
             except Exception:
                 continue
-            pct = notional / settings.account_value * 100 if settings.account_value else 0.0
+            pct = margin / denom * 100 if denom else 0.0
             exposure[sector] = exposure.get(sector, 0.0) + pct
 
         return exposure, symbol_to_sector.get(incoming_symbol)

@@ -124,7 +124,10 @@ class Settings(BaseSettings):
 
     # ── Account ───────────────────────────────────────
     account_value: float = Field(default=500_000.0, gt=0)
-    risk_pct: float = Field(default=0.01, gt=0, le=0.05)
+    risk_pct: float = Field(default=0.01, gt=0, le=0.10)
+    intraday_leverage: float = Field(default=5.0, ge=1.0, le=10.0)
+    # Exposure gates compare margin (notional / intraday_leverage) against account_value.
+    # DELIVERY positions always use leverage=1.0 (full notional).
     max_open_positions: int = Field(default=5, ge=1, le=20)
     max_trades_per_day: int = Field(default=8, ge=1, le=50)
     max_single_stock_pct: float = Field(default=0.25, gt=0, le=1.0)

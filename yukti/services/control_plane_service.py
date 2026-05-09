@@ -26,6 +26,37 @@ class ControlPlaneService:
 
     async def start(self) -> None:
         """Start all control plane services."""
+        from yukti.config import settings
+
+        # Log all critical trading parameters at every startup for audit trail
+        log.info(
+            "Trading config: mode=%s account=₹%.0f risk=%.1f%% leverage=%.0fx "
+            "max_pos=%d daily_loss=%.1f%% max_loss_cap=%.1f%%",
+            settings.mode,
+            settings.account_value,
+            settings.risk_pct * 100,
+            settings.intraday_leverage,
+            settings.max_open_positions,
+            settings.daily_loss_limit_pct * 100,
+            settings.max_loss_cap_pct * 100,
+        )
+
+        # Validate live-mode prerequisites — fail fast rather than fail mid-trade
+        if settings.mode == "live":
+            if not settings.dhan_client_id:
+                raise RuntimeError("LIVE MODE requires DHAN_CLIENT_ID to be set in .env")
+            if not settings.dhan_access_token:
+                raise RuntimeError("LIVE MODE requires DHAN_ACCESS_TOKEN to be set in .env")
+            if not settings.control_api_key:
+                log.warning("LIVE MODE: CONTROL_API_KEY is empty — /control/* endpoints are unprotected")
+            if settings.risk_pct > settings.max_loss_cap_pct * 0.6:
+                log.warning(
+                    "CONFIG WARNING: risk_pct=%.1f%% is close to max_loss_cap=%.1f%% — "
+                    "high-conviction trades (1.5× multiplier) may be blocked by gate 7",
+                    settings.risk_pct * 100,
+                    settings.max_loss_cap_pct * 100,
+                )
+
         log.info("ControlPlaneService: starting for mode=%s", self.mode)
 
         # Start API server
