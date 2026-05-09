@@ -2,9 +2,9 @@
 
 > *Sanskrit: strategy, skill, clever reasoning*
 
-Yukti is an AI-powered intraday trading agent for the Indian stock market (NSE). It thinks like a disciplined human trader, sizes positions based on conviction, learns from every trade it closes, and never places a live order without passing 8 deterministic risk checks.
+Yukti is an AI-powered intraday trading agent for the Indian stock market (NSE). It thinks like a disciplined human trader, sizes positions based on conviction, learns from every trade it closes, and never places a live order without passing 9 deterministic risk checks.
 
-**Status:** Beta — paper and shadow modes are stable. Validate for 4+ weeks before promoting to live.
+**Status:** Beta — paper and shadow modes stable. Live trading active on NSE (₹500k account).
 
 ---
 
@@ -25,8 +25,8 @@ Yukti runs on a fixed schedule, gated so nothing fires on weekends, NSE holidays
 09:15  Signal loop starts  — Scans active universe every 5 minutes
 10:00  Universe refresh    — Pull in new movers, keep the list live
 12:00  Universe refresh    — Midday refresh
-       ─────────────────────────────────── Market close ─ 15:10 IST ───
-15:10  EOD square-off      — Force-close any open intraday positions at market
+       ─────────────────────────────────── Market close ─ 15:15 IST ───
+15:15  EOD square-off      — Force-close any open intraday positions at market
        ─────────────────────────────────── Post-market ───
 16:00  Daily reset         — Reset counters, write trade journals
 16:05  Meta-lessons        — Aggregate key lessons across all closed trades
@@ -55,9 +55,9 @@ Every 5 minutes, for each symbol in the active universe:
    — Reads: price action, indicators, macro context (VIX, FII/DII), past 3 similar trades
    — Outputs: TradeDecision JSON with direction, entry, stop-loss, target, conviction (1–10)
         ↓
-4. Risk gates (8 deterministic checks)
-   — Daily loss limit, position count, min R:R, conviction floor,
-     NSE circuit breaker, cooldown, duplicate position, kill switch
+4. Risk gates (9 deterministic checks)
+   — Daily loss limit, max positions, max trades/day, min R:R, conviction floor,
+     position size cap, single-stock/sector concentration, NSE circuit breaker, cooldown
         ↓  [only if all 8 pass]
 5. Order placed via DhanHQ
    — Entry market order + GTT stop-loss + GTT target, atomically
@@ -112,8 +112,8 @@ The agent improves over time without any manual retraining — it just reads its
 |---|---|
 | Daily loss limit | Auto-halts all new trades if account drops 2% in a day |
 | Max positions | No more than 5 concurrent open positions |
-| Conviction floor | Skips if AI conviction < 5 (on a 1–10 scale) |
-| Risk:reward minimum | Skips if R:R < 1.8 (risk more than you can win) |
+| Conviction floor | Skips if AI conviction < 6 (on a 1–10 scale) |
+| Risk:reward minimum | Skips if R:R < 2.0 (accounts for NSE slippage) |
 | Symbol cooldown | Blacklists a symbol for 3 scan cycles after closing a trade |
 | NSE circuit breaker | Halts new entries if Nifty drops ≥ 5% intraday |
 | Kill switch | `/halt` Telegram command stops all new entries immediately |
@@ -147,7 +147,7 @@ Key things to check:
 
 - **Skip rate** — should be 70–85%. If lower, the pre-filter isn't working. If higher, the watchlist is too quiet.
 - **Win rate by conviction** — conviction 8–10 should outperform 5–6. If not, the AI prompt needs work.
-- **R:R achieved** — average actual reward:risk should be ≥ 1.8.
+- **R:R achieved** — average actual reward:risk should be ≥ 2.0.
 - **Conviction signal** — the report labels this "strong_predictive", "no_signal", or "inverted". Don't go live with "inverted".
 
 ---
@@ -156,7 +156,7 @@ Key things to check:
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.12+
 - PostgreSQL 16 with TimescaleDB and pgvector extensions
 - Redis 7
 - DhanHQ broker account (free — [dhan.co](https://dhan.co))
@@ -192,6 +192,35 @@ uv run python -m yukti --mode paper
 
 The web portal is at **http://localhost:8000** — live P&L, open positions, trade log, journal browser, and the kill switch.
 
+### DhanHQ token renewal
+
+DhanHQ access tokens expire every 24 hours. A host-side cron script handles renewal automatically:
+
+```bash
+# Runs on the host (not inside Docker) — registered by setup
+crontab -l
+# 30 2  * * *  /opt/yukti/scripts/renew_dhan_token.sh   # 08:00 IST daily
+# 0  12 * * *  /opt/yukti/scripts/renew_dhan_token.sh   # 17:30 IST daily
+```
+
+The script calls `/RenewToken`, writes the new token to `.env`, force-recreates the container, and sends a Telegram alert (✅ success or 🚨 failure).
+
+To add the cron entries on a fresh machine:
+
+```bash
+(crontab -l 2>/dev/null; \
+ echo "30 2  * * *  /opt/yukti/scripts/renew_dhan_token.sh >> /opt/yukti/logs/renew.log 2>&1"; \
+ echo "0  12 * * *  /opt/yukti/scripts/renew_dhan_token.sh >> /opt/yukti/logs/renew.log 2>&1") \
+| crontab -
+```
+
+If renewal fails (token already expired), generate a new one from the [DhanHQ developer portal](https://dhanhq.co) and run:
+
+```bash
+sed -i 's|^DHAN_ACCESS_TOKEN=.*|DHAN_ACCESS_TOKEN=<new_token>|' /opt/yukti/.env
+docker compose up -d --force-recreate yukti
+```
+
 ### Key config options (`.env`)
 
 ```env
@@ -207,7 +236,7 @@ ANTHROPIC_API_KEY=your_key
 # Account
 ACCOUNT_VALUE=500000             # ₹ — used for position sizing
 RISK_PCT=0.01                    # 1% of account at risk per trade
-MODE=paper                       # paper | shadow | live | backtest
+MODE=live                        # live | paper | shadow | backtest
 
 # Universe
 CANDLE_INTERVAL=5                # minutes

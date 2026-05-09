@@ -37,7 +37,7 @@ services:
       - redis
       - postgres
     env_file:
-      - .env.deploy
+      - .env
     command: ["uv", "run", "python", "-m", "yukti"]
 
   redis_exporter:

@@ -10,13 +10,9 @@ from datetime import date, datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pathlib import Path
 import os
-import stat
 import subprocess
 
-# Owner read+write (0o600). Used for both `.env` and `.env.deploy` after the
-# Dhan token renew job persists fresh credentials. Owner retains write so the
-# next renew cycle can rewrite the file; group/other have no access.
-_ENV_FILE_MODE = stat.S_IRUSR | stat.S_IWUSR
+
 
 log = logging.getLogger(__name__)
 from yukti.config import settings
@@ -437,116 +433,29 @@ def build_scheduler() -> AsyncIOScheduler:
 
 
 async def job_renew_and_test_dhan() -> None:
-    """Renew the Dhan access token, persist it to .env files, and test the API.
+    """Periodic DhanHQ token health check.
 
-    This job renews the access token via the in-process `dhan` client, writes
-    the updated token to `.env` and `.env.deploy`, and verifies `/profile`.
-    If configured, it will attempt a best-effort restart of the `yukti` container.
+    Token renewal is handled by the HOST-side cron script:
+        scripts/renew_dhan_token.sh  (runs at 08:00 and 17:30 IST on weekdays)
+
+    This job only verifies the current token is still accepted and alerts via
+    Telegram if it has gone stale between scheduled renewal runs.
     """
-    from yukti.execution.dhan_client import dhan
-    try:
-        log.info("Dhan renew job: starting")
-        renewed = await dhan._renew_access_token()
-        new_token = getattr(dhan, "_access_token", None)
-        if not renewed and not new_token:
-            log.warning("Dhan renew job: no new token obtained")
-            return
-
-        token_to_use = new_token or settings.dhan_access_token
-        client_id = getattr(dhan, "_cid", settings.dhan_client_id)
-        base = getattr(dhan, "_base", settings.dhan_base_url).rstrip("/")
-
-        # Test profile endpoint
+    ok = await job_test_dhan_api()
+    if not ok:
+        log.warning("Dhan periodic check: token invalid — renewal script should handle this")
         try:
-            import httpx
-            profile_url = f"{base}/profile"
-            async with httpx.AsyncClient(timeout=10.0) as _hx:
-                r = await _hx.get(
-                    profile_url,
-                    headers={"access-token": token_to_use, "dhanClientId": client_id},
-                )
-            if r.status_code == 200:
-                log.info("Dhan renew job: profile OK after renew")
-            else:
-                log.warning("Dhan renew job: profile check failed status=%s body=%s", r.status_code, r.text[:200])
-        except Exception as exc:
-            log.warning("Dhan renew job: profile test failed: %s", exc)
-
-        # Persist to .env and .env.deploy in repo root
-        repo_root = Path(__file__).resolve().parents[2]
-        for fname in (".env", ".env.deploy"):
-            p = repo_root / fname
-            try:
-                lines = p.read_text(encoding="utf-8").splitlines()
-            except FileNotFoundError:
-                lines = []
-            out = []
-            replaced_token = False
-            replaced_cid = False
-            for l in lines:
-                if l.strip().startswith("DHAN_ACCESS_TOKEN="):
-                    out.append(f"DHAN_ACCESS_TOKEN={token_to_use}")
-                    replaced_token = True
-                elif l.strip().startswith("DHAN_CLIENT_ID="):
-                    out.append(f"DHAN_CLIENT_ID={settings.dhan_client_id}")
-                    replaced_cid = True
-                else:
-                    out.append(l)
-            if not replaced_token:
-                out.append(f"DHAN_ACCESS_TOKEN={token_to_use}")
-            if not replaced_cid:
-                out.append(f"DHAN_CLIENT_ID={settings.dhan_client_id}")
-            try:
-                tmp = p.with_suffix(".tmp")
-                tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
-                # Restrict perms BEFORE the rename so the destination is never
-                # briefly world-readable; re-chmod AFTER the rename in case the
-                # platform's atomic rename does not preserve mode (rare, but
-                # cheap to be defensive). 0o600 = owner read+write — the renew
-                # job needs write to rewrite the file on the next cycle.
-                try:
-                    os.chmod(tmp, _ENV_FILE_MODE)
-                except OSError as exc:
-                    log.warning("Failed to chmod 600 on %s: %s", tmp, exc)
-                tmp.replace(p)
-                try:
-                    os.chmod(p, _ENV_FILE_MODE)
-                except OSError as exc:
-                    log.warning("Failed to chmod 600 on %s: %s", p, exc)
-
-                # Verify the file is owner-writable so a regression here would
-                # be loud rather than silently breaking the next renew cycle.
-                if not os.access(p, os.W_OK):
-                    log.error(
-                        "Token persist verification failed: %s is not writable "
-                        "by the running user — next renew will fail", p,
-                    )
-                else:
-                    log.info("Dhan token persisted to %s (mode=600, writable)", p)
-            except Exception as exc:
-                log.error("Failed to persist Dhan token to %s: %s", p, exc)
-
-        # Optionally attempt a best-effort container restart if configured
-        if getattr(settings, "dhan_auto_restart_on_renew", False):
-            try:
-                if os.path.exists("/var/run/docker.sock"):
-                    try:
-                        out = subprocess.check_output(["sh", "-c", "docker ps -q -f name=yukti | head -n1"], stderr=subprocess.STDOUT).decode().strip()
-                        if out:
-                            subprocess.check_call(["docker", "restart", out])
-                            log.info("Restarted docker container %s after token update", out)
-                        else:
-                            log.warning("No 'yukti' container found to restart")
-                    except Exception as exc:
-                        log.warning("Container restart attempt failed: %s", exc)
-                else:
-                    log.info("Docker socket not present; skipping container restart")
-            except Exception as exc:
-                log.warning("Auto-restart after renew failed: %s", exc)
-
-        log.info("Dhan renew job: completed")
-    except Exception as exc:
-        log.exception("Dhan renew job failed: %s", exc)
+            from yukti.telegram.bot import alert
+            await alert(
+                "🚨 *Yukti: DhanHQ token check FAILED* (scheduled verify).\n"
+                "The host renewal script will attempt renewal at 08:00 / 17:30 IST.\n"
+                "If this is outside those windows, run manually:\n"
+                "`bash /opt/yukti/scripts/renew_dhan_token.sh`"
+            )
+        except Exception:
+            pass
+    else:
+        log.info("Dhan periodic check: token OK")
 
 
 async def job_test_dhan_api() -> bool:
@@ -569,6 +478,14 @@ async def job_test_dhan_api() -> bool:
             log.info("Dhan API startup check: profile OK")
             return True
         log.warning("Dhan API startup check: status=%s body=%s", r.status_code, r.text[:200])
+        try:
+            from yukti.telegram.bot import alert
+            await alert(
+                f"🚨 *DhanHQ token INVALID* on startup (HTTP {r.status_code}).\n"
+                f"Generate a new token at dhanhq.co and update `.env`, then restart."
+            )
+        except Exception:
+            pass
     except Exception as exc:
         log.exception("Dhan API startup check failed: %s", exc)
     return False
