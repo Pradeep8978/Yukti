@@ -442,6 +442,8 @@ class MarketScanService:
                     min_conviction_override=regime_min_conviction,
                     sector_exposure_pct=sector_exposure_pct,
                     trade_sector=trade_sector,
+                    win_rate_last_10=perf.get("win_rate_last_10"),
+                    win_rate_last_10_count=int(perf.get("win_rate_last_10_count", 0) or 0),
                 )
                 gate = await run_gates(decision, portfolio)
                 if not gate.passed:

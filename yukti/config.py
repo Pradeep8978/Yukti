@@ -8,7 +8,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -131,6 +131,11 @@ class Settings(BaseSettings):
 
     # ── Risk gates ────────────────────────────────────
     daily_loss_limit_pct: float = Field(default=0.02, gt=0)
+    # Warning tier: between -warn and -limit, only conviction >= 8 trades
+    # are accepted. Below -limit, all trades are halted for the day. Lets
+    # the system push through a small drawdown on strong setups instead of
+    # locking out the rest of the day after a single loss.
+    daily_loss_warn_pct: float = Field(default=0.012, gt=0)
     min_rr: float = Field(default=1.8, gt=0)
     min_conviction: int = Field(default=5, ge=1, le=10)
     max_loss_cap_pct: float = Field(default=0.015, gt=0)
@@ -219,6 +224,18 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return [s.strip().upper() for s in v.split(",") if s.strip()]
         return [s.upper() for s in v]
+
+    @model_validator(mode="after")
+    def _check_loss_tier_ordering(self) -> "Settings":
+        # Warn must trigger before the hard halt; otherwise the warning tier
+        # is dead code and the operator gets no early signal.
+        if self.daily_loss_warn_pct >= self.daily_loss_limit_pct:
+            raise ValueError(
+                f"daily_loss_warn_pct ({self.daily_loss_warn_pct}) must be strictly less than "
+                f"daily_loss_limit_pct ({self.daily_loss_limit_pct}) — otherwise the warning "
+                f"tier never fires before the hard halt."
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

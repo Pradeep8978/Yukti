@@ -61,29 +61,35 @@ async def watchdog_loop(
         await asyncio.sleep(check_interval)
         elapsed = seconds_since_heartbeat()
 
-        if elapsed > timeout:
-            # Suppress duplicate alerts — at most 1 per 15 min
-            now = time.time()
-            if _last_alert_sent and (now - _last_alert_sent) < 900:
-                continue
-            _last_alert_sent = now
+        if elapsed <= timeout:
+            # Loop is healthy. Clear any stale alert-suppression marker so a
+            # subsequent failure within the 900s suppression window still alerts
+            # (recovered → failed-again deserves a fresh notification).
+            _last_alert_sent = None
+            continue
 
-            log.critical(
-                "WATCHDOG TRIPPED: signal loop silent for %.0fs (threshold %ds)",
-                elapsed, timeout,
+        # Suppress duplicate alerts — at most 1 per 15 min
+        now = time.time()
+        if _last_alert_sent and (now - _last_alert_sent) < 900:
+            continue
+        _last_alert_sent = now
+
+        log.critical(
+            "WATCHDOG TRIPPED: signal loop silent for %.0fs (threshold %ds)",
+            elapsed, timeout,
+        )
+
+        try:
+            from yukti.telegram.bot import alert
+            msg = (
+                f"🚨 *Yukti Watchdog Alert*\n\n"
+                f"Signal loop has not heartbeat for *{elapsed:.0f}s*.\n"
+                f"The agent process is alive but the loop may be deadlocked."
             )
-
-            try:
-                from yukti.telegram.bot import alert
-                msg = (
-                    f"🚨 *Yukti Watchdog Alert*\n\n"
-                    f"Signal loop has not heartbeat for *{elapsed:.0f}s*.\n"
-                    f"The agent process is alive but the loop may be deadlocked."
-                )
-                if auto_halt:
-                    from yukti.data.state import set_halt
-                    await set_halt(True)
-                    msg += "\n\nAgent has been *auto-halted* for safety.\nUse /resume after investigating."
-                await alert(msg)
-            except Exception as exc:
-                log.error("Watchdog alert failed: %s", exc)
+            if auto_halt:
+                from yukti.data.state import set_halt
+                await set_halt(True)
+                msg += "\n\nAgent has been *auto-halted* for safety.\nUse /resume after investigating."
+            await alert(msg)
+        except Exception as exc:
+            log.error("Watchdog alert failed: %s", exc)

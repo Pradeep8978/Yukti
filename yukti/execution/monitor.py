@@ -53,7 +53,7 @@ async def _on_tick(symbol: str, ltp: float) -> None:
         if pos.get("status") not in ("ARMED", "FILLED"):
             return
 
-        is_long    = pos.get("direction") == "LONG"
+        is_long    = (pos.get("direction") or "").upper() == "LONG"
         stop_loss  = float(pos.get("stop_loss") or 0)
         fill_price = float(pos.get("fill_price") or pos.get("entry_price") or 0)
         target_1   = float(pos.get("target_1") or 0)
@@ -202,7 +202,7 @@ async def monitor_positions(poll_interval: int = 10) -> None:
                 log.warning("Monitor: failed to fetch price for %s: %s", symbol, exc)
                 continue
 
-            is_long    = pos.get("direction") == "LONG"
+            is_long    = (pos.get("direction") or "").upper() == "LONG"
             stop_loss  = float(pos.get("stop_loss", 0))
             fill_price = float(pos.get("fill_price") or pos.get("entry_price", 0))
             target_1   = float(pos.get("target_1") or 0)
@@ -282,26 +282,79 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
         log.warning("Partial exit %s: quantity %d too small to split", symbol, qty)
         return
 
-    direction    = pos.get("direction", "LONG")
+    direction    = (pos.get("direction") or "LONG").upper()
     is_long      = direction == "LONG"
     security_id  = pos.get("security_id", "")
     product_type = "INTRADAY" if pos.get("holding_period") == "intraday" else "DELIVERY"
     fill_price   = float(pos.get("fill_price") or pos.get("entry_price", 0))
     exit_side    = "SELL" if is_long else "BUY"
 
+    # 0 — Persist a PARTIAL_EXITING marker BEFORE any broker call.
+    #     If the process dies anywhere in steps 1-4, recover_from_crash() will
+    #     find this status on restart, query broker net qty, and force-flatten
+    #     whatever remains so the position never sits naked. Status is also
+    #     outside ("ARMED","FILLED"), so the tick handler and REST poller skip
+    #     this symbol — no concurrent re-entry into _partial_exit_t1.
+    #     The timestamp lets reconcile distinguish "stuck after crash" (old)
+    #     from "in flight right now" (fresh) so a reconcile triggered
+    #     concurrently from monitor_positions doesn't force-flatten a live
+    #     partial exit.
+    pos["status"] = "PARTIAL_EXITING"
+    pos["partial_exit_started_at"] = datetime.utcnow().isoformat()
+    await save_position(symbol, pos)
+
     # 1 — Cancel T1 GTT BEFORE placing the partial market exit so the broker
     #     cannot fill it for the full quantity concurrently with our half-exit.
+    #     If the cancel fails (network error, broker rejection), the GTT may
+    #     still be live — proceeding to market_exit half could net to a 1.5x
+    #     exit (broker fires full GTT + we sell another half). Force-flatten
+    #     the entire position instead; we lose the trail upside but stay safe.
     if pos.get("target_gtt_id"):
         try:
             await get_broker().cancel_gtt(pos["target_gtt_id"])
         except Exception as exc:
-            log.warning("Partial exit: cancel T1 GTT failed for %s: %s", symbol, exc)
+            log.error(
+                "Partial exit %s: T1 GTT cancel failed (%s) — force-flattening "
+                "full position to avoid double-exit",
+                symbol, exc,
+            )
+            try:
+                await get_broker().market_exit(security_id, direction, qty, product_type)
+                # close_trade only cancels one GTT based on reason; cancel the
+                # SL GTT explicitly here since both GTTs are now orphaned.
+                if pos.get("sl_gtt_id"):
+                    try:
+                        await get_broker().cancel_gtt(pos["sl_gtt_id"])
+                    except Exception:
+                        pass
+                await close_trade(symbol, exit_price, "partial_t1_cancel_failed")
+            except Exception as flat_exc:
+                log.critical(
+                    "Partial exit %s: full force-flatten after T1 cancel failure ALSO failed: %s",
+                    symbol, flat_exc,
+                )
+                try:
+                    from yukti.telegram.bot import alert
+                    await alert(
+                        f"🚨 *CRITICAL — {symbol}*\n"
+                        f"T1 GTT cancel failed and force-flatten also failed.\n"
+                        f"Position may be open with stale T1 GTT. *MANUAL INTERVENTION REQUIRED.*"
+                    )
+                except Exception:
+                    pass
+            return
 
     # 2 — Place partial market exit
     try:
         await get_broker().market_exit(security_id, direction, half_qty, product_type)
     except Exception as exc:
         log.error("Partial exit order failed for %s: %s", symbol, exc)
+        # Half-exit didn't fire; full position is still open with SL GTT but no
+        # T1 GTT (cancelled in step 1). Restore status so monitor can re-attempt
+        # on the next tick if T1 is still being touched.
+        pos["status"] = "ARMED"
+        pos.pop("partial_exit_started_at", None)
+        await save_position(symbol, pos)
         return
 
     # 3 — Record partial P&L
@@ -336,6 +389,11 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
                 gtt_resp.get("gttOrderId")
                 or (gtt_resp.get("data") or {}).get("gttOrderId")
             )
+            if not new_sl_gtt_id:
+                log.warning(
+                    "Partial exit %s: breakeven SL GTT response had no gttOrderId — payload: %r",
+                    symbol, gtt_resp,
+                )
     except Exception as exc:
         log.warning("Partial exit: breakeven SL GTT failed for %s: %s", symbol, exc)
 
@@ -359,6 +417,8 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
 
     # 5 — Update position record; promote T2 → T1 for next monitor check
     old_t2 = float(pos.get("target_2") or 0)
+    pos["status"]        = "ARMED"            # clear PARTIAL_EXITING marker set in step 0
+    pos.pop("partial_exit_started_at", None)  # in-flight marker no longer relevant
     pos["quantity"]      = remaining
     pos["stop_loss"]     = fill_price          # breakeven — crash-safe "partial done" marker
     pos["target_1"]      = old_t2             # 0 if no T2 → monitor's "target_1 and ..." skips it
@@ -408,7 +468,7 @@ async def _update_trailing_sl(
 
     pos["trailing_sl"] = candidate
     r = await get_redis()
-    await r.set(f"yukti:positions:{symbol}", json.dumps(pos))
+    await r.set(f"yukti:positions:{symbol}", json.dumps(pos), ex=86_400)
     log.debug("Trailing SL %s: ₹%.2f → ₹%.2f", symbol, current, candidate)
 
 

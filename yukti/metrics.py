@@ -202,7 +202,15 @@ def record_trade_closed(direction: str, setup_type: str, won: bool) -> None:
 
 
 def record_skip(reason: str) -> None:
-    signals_skipped.labels(reason=reason or "unknown").inc()
+    # Reasons returned by gates often embed dynamic detail like
+    # "conviction_too_low: 7 < 8" or "cooldown: HDFCBANK recently traded".
+    # Using the full string as a Prometheus label would explode cardinality
+    # (every numeric pair / symbol becomes a unique time series), making the
+    # metric useless for dashboards and slow to scrape. Bucket by the stable
+    # category prefix (everything before the first ":"), which is bounded to
+    # the ~15 distinct gate / pattern reasons in the system.
+    label = (reason or "unknown").split(":", 1)[0].strip() or "unknown"
+    signals_skipped.labels(reason=label).inc()
 
 
 def estimate_claude_cost(input_tokens: int, output_tokens: int) -> float:

@@ -200,6 +200,12 @@ class Portfolio:
     # forced to pass them; when present, they enable the sector-cap gate.
     sector_exposure_pct: dict[str, float] | None = None
     trade_sector: str | None = None
+    # Recent win-rate, used to tighten/relax the conviction floor. Both
+    # default to None so callers that don't pass this info get the static
+    # min_conviction behavior. count is needed because get_performance_state
+    # returns a 0.5 prior when there's no trade history.
+    win_rate_last_10: float | None = None
+    win_rate_last_10_count: int = 0
 
 
 @dataclass
@@ -238,8 +244,35 @@ async def run_gates(
     if portfolio.trades_today >= settings.max_trades_per_day:
         return GateResult(False, f"max_trades_today: {portfolio.trades_today} >= {settings.max_trades_per_day}")
 
-    # 3. Conviction score >= minimum threshold
+    # 3. Conviction score >= dynamic minimum threshold.
+    # Three layers:
+    #   (a) base       — regime override or static settings.min_conviction
+    #   (b) loss-tier  — between -warn% and -limit% pnl, force min ≥ 8 so we
+    #                    only push through drawdown on very strong setups.
+    #                    This floor is *sticky*: win-rate easing must not
+    #                    cross it back down, otherwise a hot streak in a
+    #                    drawdown silently relaxes the safety intent.
+    #   (c) win-rate   — bump up on cold streaks (<40%), ease one notch on
+    #                    hot streaks (>60%); only applied with ≥5 sample size
     min_conviction = portfolio.min_conviction_override or settings.min_conviction
+    loss_tier_floor = 0  # 0 = no loss-tier floor active
+
+    daily_loss_warn_pct = settings.daily_loss_warn_pct * 100
+    if portfolio.daily_pnl_pct <= -daily_loss_warn_pct:
+        loss_tier_floor = 8
+        min_conviction = max(min_conviction, loss_tier_floor)
+
+    if portfolio.win_rate_last_10 is not None and portfolio.win_rate_last_10_count >= 5:
+        if portfolio.win_rate_last_10 < 0.40:
+            min_conviction += 2
+        elif portfolio.win_rate_last_10 > 0.60:
+            # Never ease below the static floor or the loss-tier floor (if
+            # active). Easing past the loss-tier floor would silently undo
+            # the drawdown protection.
+            ease_floor = max(settings.min_conviction, loss_tier_floor)
+            min_conviction = max(ease_floor, min_conviction - 1)
+
+    min_conviction = min(10, max(1, min_conviction))
     if trade_decision.conviction < min_conviction:
         return GateResult(False, f"conviction_too_low: {trade_decision.conviction} < {min_conviction}")
 

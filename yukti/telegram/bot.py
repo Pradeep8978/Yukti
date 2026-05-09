@@ -98,13 +98,15 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     positions = await get_all_positions()
 
     status_icon = "🛑 HALTED" if halted else "✅ ACTIVE"
+    wr_count = perf.get("win_rate_last_10_count", 0)
+    wr_str = f"{perf['win_rate_last_10']:.0%} ({wr_count}/10)" if wr_count else "— (no trades yet)"
     text = (
         f"*Yukti Status* — {datetime.now().strftime('%H:%M IST')}\n\n"
         f"Agent: {status_icon}\n"
         f"Open positions: {len(positions)}\n"
         f"Today P&L: {perf['daily_pnl_pct']:+.2f}%\n"
         f"Consecutive losses: {perf['consecutive_losses']}\n"
-        f"Win rate (last 10): {perf['win_rate_last_10']:.0%}\n"
+        f"Win rate (last 10): {wr_str}\n"
         f"Trades today: {perf['trades_today']}"
     )
     await update.message.reply_text(text, parse_mode="Markdown")

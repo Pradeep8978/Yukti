@@ -51,7 +51,119 @@ async def recover_from_crash() -> dict[str, int]:
     Non-fatal — logs and continues on individual failures.
     """
     log.info("=== Crash recovery scan starting ===")
-    stats = {"stale_cancelled": 0, "rearmed": 0, "emergency_exit": 0, "ghost_abandoned": 0}
+    stats = {
+        "stale_cancelled": 0,
+        "rearmed": 0,
+        "emergency_exit": 0,
+        "ghost_abandoned": 0,
+        "partial_exiting_recovered": 0,
+    }
+
+    # 0. Positions stuck mid-partial-exit. _partial_exit_t1 sets
+    #    status=PARTIAL_EXITING before any broker call; if the process died
+    #    between cancelling the T1 GTT and arming the new breakeven SL, the
+    #    remaining shares may sit naked at the broker. Force-flatten any
+    #    quantity the broker still holds for these symbols.
+    #
+    #    IMPORTANT: reconcile_positions() can be scheduled CONCURRENTLY from
+    #    monitor_positions() when an unrelated symbol disappears from the
+    #    broker. If we naively force-flatten anything in PARTIAL_EXITING, we
+    #    can clobber a live partial exit that's mid-flight (~0.5s window per
+    #    call). The partial_exit_started_at timestamp lets us distinguish a
+    #    truly stuck position (old) from one in active flight (fresh). Only
+    #    act on entries that have been in PARTIAL_EXITING for > 60s.
+    PARTIAL_EXIT_STUCK_THRESHOLD_SECS = 60
+    all_positions = await get_all_positions()
+    for symbol, pos in all_positions.items():
+        if pos.get("status") != "PARTIAL_EXITING":
+            continue
+
+        started = pos.get("partial_exit_started_at")
+        if started:
+            try:
+                elapsed = (datetime.utcnow() - datetime.fromisoformat(started)).total_seconds()
+            except (TypeError, ValueError):
+                # Malformed timestamp — treat as old to be safe (the alternative
+                # is leaving a possibly-naked position uncovered indefinitely).
+                elapsed = float("inf")
+            if elapsed < PARTIAL_EXIT_STUCK_THRESHOLD_SECS:
+                log.info(
+                    "Skipping PARTIAL_EXITING recovery for %s — %ss old, likely in flight",
+                    symbol, int(elapsed),
+                )
+                continue
+
+        log.warning("Position %s stuck in PARTIAL_EXITING — force-flattening", symbol)
+        direction    = (pos.get("direction") or "LONG").upper()
+        security_id  = pos.get("security_id", "")
+        product_type = "INTRADAY" if pos.get("holding_period") == "intraday" else "DELIVERY"
+
+        try:
+            broker_positions = await get_broker().get_positions()
+        except Exception as exc:
+            log.error(
+                "PARTIAL_EXITING recovery for %s: cannot fetch broker positions: %s",
+                symbol, exc,
+            )
+            continue
+
+        actual_qty = 0
+        for bp in broker_positions:
+            if bp.get("tradingSymbol") == symbol:
+                actual_qty = abs(int(bp.get("netQty", 0)))
+                break
+
+        # Cancel any lingering GTTs (best-effort) so they don't fire after we
+        # market-exit. T1 was likely cancelled before the crash; SL may or may
+        # not still be live depending on where the crash hit.
+        for gtt_field in ("sl_gtt_id", "target_gtt_id"):
+            gtt_id = pos.get(gtt_field)
+            if gtt_id:
+                try:
+                    await get_broker().cancel_gtt(gtt_id)
+                except Exception:
+                    pass
+
+        if actual_qty > 0:
+            try:
+                await get_broker().market_exit(security_id, direction, actual_qty, product_type)
+                log.info(
+                    "PARTIAL_EXITING recovery: force-flattened %d shares of %s",
+                    actual_qty, symbol,
+                )
+            except Exception as exc:
+                log.critical(
+                    "PARTIAL_EXITING recovery: force-flatten FAILED for %s: %s — halting",
+                    symbol, exc,
+                )
+                try:
+                    from yukti.telegram.bot import alert
+                    await alert(
+                        f"🚨🚨 *CRITICAL — {symbol}*\n"
+                        f"Position stuck in PARTIAL_EXITING and force-flatten failed.\n"
+                        f"*MANUAL INTERVENTION REQUIRED.*"
+                    )
+                except Exception:
+                    pass
+                await set_halt(True)
+                continue
+
+        intent_id = pos.get("intent_id")
+        if intent_id:
+            try:
+                await mark_abandoned(int(intent_id), "partial_exiting_recovered")
+            except Exception as exc:
+                log.warning("Could not mark intent #%s abandoned: %s", intent_id, exc)
+        await delete_position(symbol)
+        stats["partial_exiting_recovered"] += 1
+        try:
+            from yukti.telegram.bot import alert
+            await alert(
+                f"♻️ Recovery: {symbol} was stuck mid-partial-exit, "
+                f"force-flattened {actual_qty} shares."
+            )
+        except Exception:
+            pass
 
     # 1. Stale PLACED intents — entry order probably didn't fill
     stale = await find_stale_intents(older_than_minutes=10)

@@ -73,9 +73,11 @@ async def save_position(symbol: str, data: dict[str, Any]) -> None:
             db.add(pos)
         await db.commit()
 
-    # Save to Redis (cache)
+    # Save to Redis (cache). 24h TTL is a safety net for crash-leftover keys —
+    # a live position re-saves on every state change so the TTL never reaches 0
+    # in normal operation. delete_position() removes both stores on close.
     r = await get_redis()
-    await r.set(f"yukti:positions:{symbol}", json.dumps(data))
+    await r.set(f"yukti:positions:{symbol}", json.dumps(data), ex=86_400)
 
 
 async def get_position(symbol: str) -> dict[str, Any] | None:
@@ -170,10 +172,22 @@ async def count_open_positions() -> int:
 
 # ── Cooldown registry ─────────────────────────────────────────────────────────
 
-async def set_cooldown(symbol: str, candle_interval_seconds: int = 300) -> None:
-    """Block a symbol for N cycles after a trade."""
+async def set_cooldown(
+    symbol: str,
+    candle_interval_seconds: int = 300,
+    conviction: int | None = None,
+) -> None:
+    """Block a symbol for N cycles after a trade.
+
+    High-conviction setups (≥ 8) get half the cooldown so the system can
+    re-enter quickly when a strong pattern continues. Below 8 keeps the
+    full cooldown to avoid over-trading marginal setups.
+    """
     r = await get_redis()
-    ttl = settings.cooldown_cycles * candle_interval_seconds
+    cycles = settings.cooldown_cycles
+    if conviction is not None and conviction >= 8:
+        cycles = max(1, cycles // 2)
+    ttl = cycles * candle_interval_seconds
     await r.set(f"yukti:cooldown:{symbol}", "1", ex=ttl)
 
 
@@ -253,6 +267,7 @@ async def get_performance_state() -> dict[str, Any]:
         "consecutive_losses": abs(streak) if streak < 0 else 0,
         "daily_pnl_pct":      float(pnl_raw)  if pnl_raw    else 0.0,
         "win_rate_last_10":   sum(wins) / len(wins) if wins  else 0.5,
+        "win_rate_last_10_count": len(wins),
         "trades_today":       int(trades_raw)   if trades_raw else 0,
     }
 
