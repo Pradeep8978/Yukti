@@ -370,7 +370,7 @@ async def close_trade(
 
     entry  = float(pos.get("fill_price") or pos.get("entry_price", 0))
     qty    = int(pos.get("quantity", 0))
-    is_long = pos.get("direction") == "LONG"
+    is_long = (pos.get("direction") or "").upper() == "LONG"
 
     pnl     = (exit_price - entry) * qty if is_long else (entry - exit_price) * qty
     pnl_pct = pnl / (entry * qty) * 100 if entry * qty else 0.0
