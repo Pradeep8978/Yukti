@@ -11,6 +11,7 @@ account_value for position sizing and exposure gate calculations.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -18,6 +19,17 @@ log = logging.getLogger(__name__)
 
 _REDIS_KEY   = "yukti:account:available_balance"
 _TTL_SECONDS = 120   # refresh every 2 minutes
+
+# Singleflight lock: only one coroutine hits DhanHQ on cache miss.
+# Lazily created inside the running event loop.
+_refresh_lock: asyncio.Lock | None = None
+
+
+def _get_lock() -> asyncio.Lock:
+    global _refresh_lock
+    if _refresh_lock is None:
+        _refresh_lock = asyncio.Lock()
+    return _refresh_lock
 
 
 def _parse_available_balance(raw: dict[str, Any]) -> float | None:
@@ -43,7 +55,7 @@ def _parse_available_balance(raw: dict[str, Any]) -> float | None:
         if val is not None:
             try:
                 f = float(val)
-                if f > 0:
+                if f >= 0:   # 0 is a valid balance — propagate so gates can fail closed
                     return f
             except (TypeError, ValueError):
                 continue
@@ -79,16 +91,29 @@ async def fetch_available_balance() -> float:
         except (TypeError, ValueError):
             pass
 
-    try:
-        from yukti.execution.broker_factory import get_broker
-        raw = await get_broker().get_fund_limits()
-        bal = _parse_available_balance(raw)
-        if bal is not None:
-            await r.set(_REDIS_KEY, str(bal), ex=_TTL_SECONDS)
-            log.info("Live balance from DhanHQ: ₹%.2f (cached 2 min)", bal)
-            return bal
-        log.debug("fetch_available_balance: no usable balance in response: %s", raw)
-    except Exception as exc:
-        log.debug("fetch_available_balance failed (using config fallback): %s", exc)
+    # Singleflight: only one coroutine fetches from DhanHQ on cache miss.
+    # Others wait for the lock and then hit the now-warm Redis cache.
+    async with _get_lock():
+        # Re-check cache after acquiring lock — a sibling may have populated it.
+        cached = await r.get(_REDIS_KEY)
+        if cached:
+            try:
+                val = float(cached)
+                if val >= 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+
+        try:
+            from yukti.execution.broker_factory import get_broker
+            raw = await get_broker().get_fund_limits()
+            bal = _parse_available_balance(raw)
+            if bal is not None:
+                await r.set(_REDIS_KEY, str(bal), ex=_TTL_SECONDS)
+                log.info("Live balance from DhanHQ: ₹%.2f (cached 2 min)", bal)
+                return bal
+            log.debug("fetch_available_balance: no usable balance in response: %s", raw)
+        except Exception as exc:
+            log.debug("fetch_available_balance failed (using config fallback): %s", exc)
 
     return settings.account_value
