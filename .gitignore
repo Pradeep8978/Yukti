@@ -78,4 +78,7 @@ doppler.json
 # Local GitHub Actions runner install
 actions-runner/
 
+# Certbot / Let's Encrypt runtime data (managed by certbot, owned by root)
+deploy/nginx/letsencrypt/
+
 .venv/
