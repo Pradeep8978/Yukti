@@ -49,15 +49,21 @@ def _configure_logging() -> None:
 async def _load_universe() -> dict[str, str]:
     try:
         import redis.asyncio as aioredis
-        r   = await aioredis.from_url(settings.redis_url, decode_responses=True)
-        raw = await r.get("yukti:universe")
-        if not raw:
-            raw = await r.get("yukti:candidate_pool")
-            if raw:
-                log.info("Universe key empty — falling back to yukti:candidate_pool")
-        await r.aclose()
-        if raw:
-            entries = json.loads(raw)
+        r = await aioredis.from_url(settings.redis_url, decode_responses=True)
+        try:
+            raw = await r.get("yukti:universe")
+            entries = json.loads(raw) if raw else []
+            if not entries:
+                # universe key missing or empty list — fall back to candidate pool
+                if raw is not None:
+                    log.warning("Universe key is empty list — falling back to yukti:candidate_pool")
+                raw_pool = await r.get("yukti:candidate_pool")
+                if raw_pool:
+                    log.info("Universe key empty — falling back to yukti:candidate_pool")
+                    entries = json.loads(raw_pool)
+        finally:
+            await r.aclose()
+        if entries:
             return {u["symbol"]: u["security_id"] for u in entries}
     except Exception as exc:
         log.warning("Universe load from Redis failed: %s — falling back", exc)

@@ -55,7 +55,24 @@ class MarketScanService:
 
         Open positions are always included first, then the remaining startup
         universe is filled in original order until the configured cap.
+
+        Re-reads Redis each cycle so universe updates from scheduler jobs
+        (job_universe_scan, job_universe_refresh) take effect without a restart.
+        Falls back to the startup-loaded self.universe when Redis is empty.
         """
+        try:
+            import json as _json
+            import redis.asyncio as _aioredis
+            _r = await _aioredis.from_url(settings.redis_url, decode_responses=True)
+            _raw = await _r.get("yukti:universe")
+            await _r.aclose()
+            if _raw:
+                _entries = _json.loads(_raw)
+                if _entries:
+                    self.universe = {u["symbol"]: u["security_id"] for u in _entries}
+        except Exception as _exc:
+            log.debug("_get_cycle_universe: Redis re-read failed: %s", _exc)
+
         universe_items = list(self.universe.items())
         max_symbols = max(1, min(settings.max_symbols_per_scan_cycle, len(universe_items)))
 
@@ -385,6 +402,26 @@ class MarketScanService:
                     decision.skip_reason or "-",
                     reasoning_excerpt or "-",
                 )
+
+                # Persist every AI decision for audit and quality analysis.
+                # Best-effort — a DB failure must never block a trade.
+                try:
+                    from yukti.data.database import get_db
+                    from yukti.data.models import DecisionLog
+                    async with get_db() as _db:
+                        _db.add(DecisionLog(
+                            symbol=symbol,
+                            action=decision.action,
+                            direction=decision.direction,
+                            market_bias=decision.market_bias,
+                            conviction=decision.conviction,
+                            reasoning=decision.reasoning or "",
+                            skip_reason=decision.skip_reason,
+                            full_json=decision.model_dump(),
+                        ))
+                        await _db.commit()
+                except Exception as _dl_exc:
+                    log.debug("decision_log insert failed (non-fatal): %s", _dl_exc)
 
                 if decision.action == "SKIP":
                     record_skip(decision.skip_reason or "claude_skip")

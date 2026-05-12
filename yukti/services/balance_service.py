@@ -17,8 +17,9 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-_REDIS_KEY   = "yukti:account:available_balance"
-_TTL_SECONDS = 120   # refresh every 2 minutes
+_REDIS_KEY        = "yukti:account:available_balance"
+_TTL_SECONDS      = 120   # refresh every 2 minutes
+_last_known_live: float | None = None  # last successful broker fetch this process
 
 # Singleflight lock: only one coroutine hits DhanHQ on cache miss.
 # Lazily created inside the running event loop.
@@ -109,11 +110,24 @@ async def fetch_available_balance() -> float:
             raw = await get_broker().get_fund_limits()
             bal = _parse_available_balance(raw)
             if bal is not None:
+                global _last_known_live
+                _last_known_live = bal
                 await r.set(_REDIS_KEY, str(bal), ex=_TTL_SECONDS)
                 log.info("Live balance from DhanHQ: ₹%.2f (cached 2 min)", bal)
                 return bal
             log.debug("fetch_available_balance: no usable balance in response: %s", raw)
         except Exception as exc:
-            log.debug("fetch_available_balance failed (using config fallback): %s", exc)
+            log.debug("fetch_available_balance failed (using last-known fallback): %s", exc)
 
+    if _last_known_live is not None:
+        log.warning(
+            "fetch_available_balance: API unavailable — using last known ₹%.2f", _last_known_live
+        )
+        return _last_known_live
+
+    log.warning(
+        "fetch_available_balance: no live balance available — using settings.account_value=₹%.0f "
+        "(sizing may not reflect actual balance)",
+        settings.account_value,
+    )
     return settings.account_value

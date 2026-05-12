@@ -124,20 +124,42 @@ log "Restarting Yukti container..."
 cd "$REPO_DIR"
 docker compose up -d --force-recreate yukti >> "$LOG_FILE" 2>&1
 
-# ── Step 5: Health check ──────────────────────────────────────────────────────
-log "Waiting 25s for container to come healthy..."
-sleep 25
-HTTP_HEALTH=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null || echo "000")
-log "Health check: HTTP $HTTP_HEALTH"
+# ── Step 5: Health check (with retry) ────────────────────────────────────────
+_health_check() {
+    # curl returns "000" on connection failure via %{http_code}; the ||echo
+    # guard would produce "000000", so we capture only the curl output.
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null)
+    echo "${code:-000}"
+}
+
+log "Waiting 30s for container to come healthy..."
+sleep 30
+HTTP_HEALTH=$(_health_check)
+log "Health check (attempt 1): HTTP $HTTP_HEALTH"
+
+if [[ "$HTTP_HEALTH" != "200" ]]; then
+    log "Health check failed — waiting 60s and retrying..."
+    sleep 60
+    HTTP_HEALTH=$(_health_check)
+    log "Health check (attempt 2): HTTP $HTTP_HEALTH"
+fi
 
 if [[ "$HTTP_HEALTH" == "200" ]]; then
     log "SUCCESS: token renewed, container healthy"
     send_telegram "✅ *Yukti: DhanHQ token renewed successfully.*
 Container restarted and health check passed. Trading resumes normally."
 else
-    log "WARN: container health check returned $HTTP_HEALTH after renewal"
-    send_telegram "⚠️ *Yukti: DhanHQ token renewed but health check returned ${HTTP_HEALTH}.*
-Check logs: \`docker compose logs yukti --tail 30\`"
+    log "ERROR: container unhealthy after renewal (HTTP $HTTP_HEALTH) — trading may be DOWN"
+    send_telegram "🚨 *Yukti: container UNHEALTHY after token renewal (HTTP ${HTTP_HEALTH}).*
+Both health check attempts failed. Trading is likely DOWN.
+
+Investigate immediately:
+\`\`\`
+docker compose logs yukti --tail 50
+docker compose up -d --force-recreate yukti
+\`\`\`"
+    exit 1
 fi
 
 log "=== Renewal complete ==="

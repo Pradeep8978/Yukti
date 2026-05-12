@@ -358,7 +358,29 @@ class DhanClient:
         )
         
         data = result.get("data", []) if isinstance(result, dict) else []
-        
+
+        # DhanHQ SDK returns dict-of-arrays {"open":[...], "high":[...], "timestamp":[...]}
+        # Convert to list-of-dicts so downstream pd.DataFrame and len() checks work correctly.
+        if isinstance(data, dict):
+            try:
+                from datetime import datetime as _dt
+                ts_list = data.get("timestamp", [])
+                rows = []
+                for i, ts in enumerate(ts_list):
+                    rows.append({
+                        "time":   _dt.utcfromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S"),
+                        "open":   float(data["open"][i]),
+                        "high":   float(data["high"][i]),
+                        "low":    float(data["low"][i]),
+                        "close":  float(data["close"][i]),
+                        "volume": float(data["volume"][i]),
+                    })
+                data = rows
+                log.debug("DhanClient: converted dict-of-arrays to %d rows for %s", len(data), security_id)
+            except Exception as _conv_exc:
+                log.warning("DhanClient: dict-of-arrays conversion failed: %s", _conv_exc)
+                data = []
+
         # ── Fallback to yfinance ──────────────────────────────────────────
         # If Dhan returns no data or fails (common if not subscribed to Data API)
         if not data and symbol:

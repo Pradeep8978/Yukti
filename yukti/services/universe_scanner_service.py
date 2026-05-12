@@ -589,19 +589,32 @@ class UniverseScannerService:
         3. Emergency Nifty 50 baseline
         """
         try:
-            return await self.run_scan(is_refresh=is_refresh)
+            result = await self.run_scan(is_refresh=is_refresh)
+            if result:
+                return result
+            log.warning("UniverseScanner: run_scan returned 0 symbols — trying fallback")
+            try:
+                from yukti.telegram.bot import alert
+                await alert(
+                    "⚠️ *Yukti: universe scan returned 0 symbols*\n"
+                    "All DhanHQ data fetches may have failed or been rate-limited.\n"
+                    "Falling back to previous session / Nifty 50 baseline."
+                )
+            except Exception:
+                pass
         except Exception as exc:
             log.error("UniverseScanner: scan failed: %s — trying fallback", exc)
 
-        # Fallback 1: previous session
+        # Fallback 1: previous session (skip if it is also empty)
         try:
             from yukti.data.state import get_redis
             r = await get_redis()
             raw = await r.get("yukti:universe")
             if raw:
                 universe = json.loads(raw)
-                log.warning("UniverseScanner: using previous session universe (%d symbols)", len(universe))
-                return universe
+                if universe:
+                    log.warning("UniverseScanner: using previous session universe (%d symbols)", len(universe))
+                    return universe
         except Exception:
             pass
 

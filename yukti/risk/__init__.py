@@ -91,11 +91,30 @@ def calculate_position(
             mult = m
             break
 
-    final_qty   = int(Decimal(base_qty) * mult)
-    capital_dep = Decimal(final_qty) * entry_d
+    final_qty = int(Decimal(base_qty) * mult)
 
-    quant   = Decimal("0.01")
-    lev_d   = Decimal(str(max(1.0, leverage)))
+    quant = Decimal("0.01")
+    lev_d = Decimal(str(max(1.0, leverage)))
+
+    # Capital-based fallback when risk sizing produces zero shares.
+    # Happens when account is small (risk_amount < stop_distance).
+    # We use up to max_single_stock_pct of account as the position cap,
+    # capped further so margin never exceeds available account.
+    if final_qty == 0:
+        margin_per_share = entry_d / lev_d
+        if margin_per_share > 0:
+            capital_cap = acct * Decimal(str(settings.max_single_stock_pct))
+            capital_qty = int(capital_cap / margin_per_share)
+            if capital_qty >= 1:
+                log.debug(
+                    "position sizing: risk-based qty=0 (risk=₹%.2f stop=₹%.2f); "
+                    "falling back to capital-based qty=%d (%.0f%% of ₹%.0f)",
+                    float(risk_amount), float(stop_dist), capital_qty,
+                    float(settings.max_single_stock_pct * 100), float(acct),
+                )
+                final_qty = capital_qty
+
+    capital_dep = Decimal(final_qty) * entry_d
     margin  = (capital_dep / lev_d).quantize(quant, rounding=ROUND_HALF_UP)
     cap_pct = (margin / acct * Decimal("100")).quantize(quant, rounding=ROUND_HALF_UP)
 
@@ -304,10 +323,23 @@ async def run_gates(
         leverage=_gate_leverage,
     )
     account_value = Decimal(str(portfolio.account_value))
-    max_loss_cap_pct = Decimal(str(settings.max_loss_cap_pct)) * Decimal("100")
-    max_loss_pct = (position.max_loss / account_value * Decimal("100")) if account_value > 0 else Decimal("0")
-    if max_loss_pct > max_loss_cap_pct:
-        return GateResult(False, f"max_loss_too_large: {max_loss_pct:.2f}% > {max_loss_cap_pct:.2f}%")
+    if position.quantity == 0:
+        entry_fmt = f"₹{trade_decision.entry_price:.0f}" if trade_decision.entry_price else "?"
+        return GateResult(
+            False,
+            f"zero_quantity: account ₹{portfolio.account_value:.0f} cannot size even 1 share "
+            f"of {trade_decision.symbol} at {entry_fmt} (single_stock_cap "
+            f"₹{portfolio.account_value * settings.max_single_stock_pct:.0f} < margin/share)",
+        )
+    # max_loss_cap only applies to risk-sized positions (base_quantity > 0).
+    # When base_quantity == 0 the account is too small for ATR-based sizing and
+    # calculate_position() fell back to capital-based minimum sizing — the
+    # single_stock_cap (gate below) already bounds the exposure in that case.
+    if position.base_quantity > 0:
+        max_loss_cap_pct = Decimal(str(settings.max_loss_cap_pct)) * Decimal("100")
+        max_loss_pct = (position.max_loss / account_value * Decimal("100")) if account_value > 0 else Decimal("0")
+        if max_loss_pct > max_loss_cap_pct:
+            return GateResult(False, f"max_loss_too_large: {max_loss_pct:.2f}% > {max_loss_cap_pct:.2f}%")
 
     # 7. Single-stock concentration cap (notional / account)
     single_stock_cap_pct = Decimal(str(settings.max_single_stock_pct)) * Decimal("100")
