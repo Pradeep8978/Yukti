@@ -4,6 +4,7 @@ Telegram bot for Yukti — alerts, kill switch, status commands.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -34,6 +35,7 @@ def get_app() -> Application:
     global _app
     if _app is None:
         _app = Application.builder().token(settings.telegram_bot_token).build()
+        _app.add_handler(CommandHandler("health",     cmd_health))
         _app.add_handler(CommandHandler("halt",       cmd_halt))
         _app.add_handler(CommandHandler("resume",     cmd_resume))
         _app.add_handler(CommandHandler("status",     cmd_status))
@@ -65,6 +67,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Yukti (युक्ति) trading agent active.\n\n"
         "Commands:\n"
+        "/health — dependency health check\n"
         "/status — agent status\n"
         "/pnl — today's P&L\n"
         "/positions — open positions\n"
@@ -72,6 +75,76 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/resume — resume trading\n"
         "/squareoff — close all positions at market"
     )
+
+
+async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+
+    halted = await is_halted()
+    positions = await get_all_positions()
+
+    db_ok = False
+    db_error: str | None = None
+    try:
+        from sqlalchemy import select
+        from yukti.data.database import get_db
+
+        async with get_db() as db:
+            await db.execute(select(1))
+        db_ok = True
+    except Exception as exc:  # noqa: BLE001
+        db_error = str(exc)
+
+    redis_ok = False
+    redis_error: str | None = None
+    try:
+        from yukti.data.state import get_redis
+
+        redis_client = await get_redis()
+        redis_ok = bool(await redis_client.ping())
+    except Exception as exc:  # noqa: BLE001
+        redis_error = str(exc)
+
+    def _dhan_check() -> dict[str, Any]:
+        import requests
+
+        token = settings.dhan_access_token
+        client_id = settings.dhan_client_id
+        base = (settings.dhan_base_url or "").rstrip("/")
+        if not base:
+            return {"ok": False, "error": "no base url"}
+
+        headers: dict[str, str] = {}
+        if token:
+            headers["access-token"] = token
+        if client_id:
+            headers["dhanClientId"] = client_id
+
+        try:
+            response = requests.get(f"{base}/profile", headers=headers, timeout=5)
+            if response.status_code == 200:
+                return {"ok": True}
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "body": response.text[:120],
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    dhan_info = await asyncio.to_thread(_dhan_check)
+
+    health_icon = "✅" if db_ok and redis_ok and dhan_info.get("ok", False) and not halted else "⚠️"
+    lines = [
+        f"{health_icon} *Yukti Health*",
+        f"Agent: {'HALTED' if halted else 'ACTIVE'}",
+        f"Open positions: {len(positions)}",
+        f"Database: {'OK' if db_ok else f'FAIL ({db_error})'}",
+        f"Redis: {'OK' if redis_ok else f'FAIL ({redis_error})'}",
+        f"Dhan: {'OK' if dhan_info.get('ok', False) else f'FAIL ({dhan_info.get('error') or dhan_info.get('status_code', 'unknown')})'}",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_halt(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
