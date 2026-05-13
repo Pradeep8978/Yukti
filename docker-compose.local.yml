@@ -1,0 +1,46 @@
+version: '3.8'
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    volumes: ["redis_local_data:/data"]
+    command: redis-server --appendonly yes
+
+  postgres:
+    image: timescale/timescaledb-ha:pg16
+    restart: unless-stopped
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: yukti
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: yukti
+    volumes:
+      - postgres_local_data:/var/lib/postgresql/data
+      - ./deploy/init-pgvector.sql:/docker-entrypoint-initdb.d/init.sql
+
+  yukti:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on: [redis, postgres]
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_URL: postgresql+psycopg://yukti:${POSTGRES_PASSWORD:-password}@postgres:5432/yukti
+      MODE: ${MODE:-paper}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app:delegated
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  redis_local_data:
+  postgres_local_data:
