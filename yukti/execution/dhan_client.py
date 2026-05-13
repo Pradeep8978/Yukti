@@ -347,42 +347,54 @@ class DhanClient:
         symbol:       str = "",
     ) -> list[dict[str, Any]]:
         """Fetch historical candles. Falls back to yfinance if Dhan fails or is unavailable."""
-        result = await self._call(
-            self._dhan.intraday_minute_data,
-            security_id      = security_id,
-            exchange_segment = "NSE_EQ" if security_id != "13" else "IDX_I",
-            instrument_type  = "EQUITY" if security_id != "13" else "INDEX",
-            interval         = interval,
-            from_date        = from_date,
-            to_date          = to_date,
-        )
-        
-        data = result.get("data", []) if isinstance(result, dict) else []
 
-        # DhanHQ SDK returns dict-of-arrays {"open":[...], "high":[...], "timestamp":[...]}
-        # Convert to list-of-dicts so downstream pd.DataFrame and len() checks work correctly.
-        if isinstance(data, dict):
-            try:
+        def _fetch_from_dhan() -> list[dict[str, Any]]:
+            """Run DhanHQ SDK call and convert dict-of-arrays to list-of-dicts."""
+            res = self._dhan.intraday_minute_data(
+                security_id      = security_id,
+                exchange_segment = "NSE_EQ" if security_id != "13" else "IDX_I",
+                instrument_type  = "EQUITY" if security_id != "13" else "INDEX",
+                interval         = interval,
+                from_date        = from_date,
+                to_date          = to_date,
+            )
+            raw = res.get("data", []) if isinstance(res, dict) else []
+            if isinstance(raw, dict):
                 from datetime import datetime as _dt
-                ts_list = data.get("timestamp", [])
-                rows = []
-                for i, ts in enumerate(ts_list):
-                    rows.append({
+                ts_list = raw.get("timestamp", [])
+                return [
+                    {
                         "time":   _dt.utcfromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S"),
-                        "open":   float(data["open"][i]),
-                        "high":   float(data["high"][i]),
-                        "low":    float(data["low"][i]),
-                        "close":  float(data["close"][i]),
-                        "volume": float(data["volume"][i]),
-                    })
-                data = rows
-                log.debug("DhanClient: converted dict-of-arrays to %d rows for %s", len(data), security_id)
-            except Exception as _conv_exc:
-                log.warning("DhanClient: dict-of-arrays conversion failed: %s", _conv_exc)
-                data = []
+                        "open":   float(raw["open"][i]),
+                        "high":   float(raw["high"][i]),
+                        "low":    float(raw["low"][i]),
+                        "close":  float(raw["close"][i]),
+                        "volume": float(raw["volume"][i]),
+                    }
+                    for i, ts in enumerate(ts_list)
+                ]
+            return raw if isinstance(raw, list) else []
+
+        # Two attempts — DhanHQ SDK is synchronous and not thread-safe under
+        # concurrent run_in_executor calls; a single retry covers transient races.
+        data: list[dict[str, Any]] = []
+        for attempt in range(2):
+            try:
+                await _bucket.acquire()
+                rows = await self._loop.run_in_executor(None, _fetch_from_dhan)
+                if rows:
+                    data = rows
+                    log.debug("DhanClient: %d candles from DhanHQ for %s (attempt %d)", len(data), security_id, attempt + 1)
+                    break
+                if attempt == 0:
+                    log.debug("DhanClient: empty DhanHQ response for %s — retrying once", security_id)
+                    await asyncio.sleep(0.5)
+            except Exception as exc:
+                log.debug("DhanClient: DhanHQ candle fetch failed for %s (attempt %d): %s", security_id, attempt + 1, exc)
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
 
         # ── Fallback to yfinance ──────────────────────────────────────────
-        # If Dhan returns no data or fails (common if not subscribed to Data API)
         if not data and symbol:
             log.info("DhanClient: No data for %s, trying yfinance fallback...", symbol)
             try:

@@ -89,16 +89,27 @@ def compute(df: pd.DataFrame, swing_lookback: int = 20, timeframe: str = "5m") -
     df["ema50"] = ta.ema(df["close"], length=50)
 
     # ── VWAP (intraday — resets on each trading day) ─────────────────
+    # ta.vwap() silently returns None for daily candles (non-intraday frequency).
+    # Skip the call for daily timeframe to suppress the spurious warning.
     try:
-        df["vwap"] = ta.vwap(df["high"], df["low"], df["close"], df["volume"])
+        _vwap = None if timeframe == "daily" else ta.vwap(df["high"], df["low"], df["close"], df["volume"])
     except Exception:
-        # Fallback: per-day cumulative VWAP (resets each trading day, same as ta.vwap)
+        _vwap = None
+    if _vwap is None or (hasattr(_vwap, "isna") and _vwap.isna().all()):
         df["tp"] = (df["high"] + df["low"] + df["close"]) / 3
-        date_groups = df.index.date
-        df["vwap"] = (
-            df.groupby(date_groups)["tp"].transform(lambda s: (s * df.loc[s.index, "volume"]).cumsum())
-            / df.groupby(date_groups)["volume"].transform("cumsum")
-        )
+        import pandas as _pd
+        if isinstance(df.index, _pd.DatetimeIndex):
+            # Intraday: reset VWAP each calendar day
+            date_groups = df.index.normalize()
+            df["vwap"] = (
+                df.groupby(date_groups)["tp"].transform(lambda s: (s * df.loc[s.index, "volume"]).cumsum())
+                / df.groupby(date_groups)["volume"].transform("cumsum")
+            )
+        else:
+            # Daily / non-datetime index: single cumulative VWAP over full series
+            df["vwap"] = (df["tp"] * df["volume"]).cumsum() / df["volume"].cumsum()
+    else:
+        df["vwap"] = _vwap
 
     # ── Supertrend ───────────────────────────────────────────────────
     st = ta.supertrend(df["high"], df["low"], df["close"], length=7, multiplier=3.0)
