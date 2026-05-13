@@ -76,7 +76,7 @@ pip install .
 3. Run in paper mode locally:
 
 ```bash
-MODE=paper uv run python -m yukti --mode paper
+MODE=live uv run python -m yukti --mode live
 # or: python -m yukti --mode paper
 ```
 

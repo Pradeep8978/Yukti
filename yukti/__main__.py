@@ -9,7 +9,7 @@ Modes:
     backtest — replay historical candles, no live feed
 
 Usage:
-    uv run python -m yukti                    # uses MODE from .env (default: paper)
+    uv run python -m yukti                    # uses MODE from .env (default: live)
     uv run python -m yukti --mode shadow      # override to shadow
     uv run python -m yukti --mode backtest --bt-start 2024-01-01
 """

@@ -236,6 +236,9 @@ class GateResult:
 async def run_gates(
     trade_decision: TradeDecision,
     portfolio: Portfolio,
+    *,
+    ignore_cooldown: bool = False,
+    ignore_market_halt: bool = False,
 ) -> GateResult:
     """
     Run up to 9 pre-trade risk checks in order. Return first failure.
@@ -309,7 +312,7 @@ async def run_gates(
         )
 
     # 5. Cooldown period passed for the symbol
-    if await is_on_cooldown(trade_decision.symbol):
+    if not ignore_cooldown and await is_on_cooldown(trade_decision.symbol):
         return GateResult(False, f"cooldown: {trade_decision.symbol} recently traded")
 
     # 6. Position size fits within per-trade risk % and single-stock cap
@@ -340,6 +343,10 @@ async def run_gates(
         max_loss_pct = (position.max_loss / account_value * Decimal("100")) if account_value > 0 else Decimal("0")
         if max_loss_pct > max_loss_cap_pct:
             return GateResult(False, f"max_loss_too_large: {max_loss_pct:.2f}% > {max_loss_cap_pct:.2f}%")
+    else:
+        max_loss_pct = Decimal("0")
+
+    projected_total_exposure = Decimal(str(portfolio.total_exposure_pct)) + position.capital_pct
 
     # 7. Single-stock concentration cap — disabled (account too small for % limits to be meaningful)
     # total_exposure_cap — disabled alongside it
@@ -360,7 +367,7 @@ async def run_gates(
             )
 
     # 9. No market halt / circuit breaker conditions
-    if await is_market_halted():
+    if not ignore_market_halt and await is_market_halted():
         return GateResult(False, "market_halt: market is halted")
 
     log.info(

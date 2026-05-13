@@ -14,7 +14,7 @@ echo "=== Yukti — Oracle Cloud bootstrap ==="
 echo "[1/7] Installing system packages..."
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg git ufw
+    ca-certificates curl gnupg git ufw cron
 
 # ── 2. Docker (official repo, ARM64-compatible) ───────────────────────────────
 echo "[2/7] Installing Docker..."
@@ -68,7 +68,7 @@ if [ ! -f "$DEPLOY_DIR/.env" ]; then
     else
         cat > "$DEPLOY_DIR/.env" <<'EOF'
 # ── Yukti runtime environment ──────────────────────────────────────────────
-MODE=paper                          # paper | shadow | live
+MODE=live                           # paper | shadow | live
 
 # Postgres (used by docker-compose; keep in sync with POSTGRES_URL below)
 POSTGRES_PASSWORD=change_me_now
@@ -115,9 +115,21 @@ echo ""
 echo "$GH_PAT" | docker login ghcr.io -u "$GH_USER" --password-stdin
 echo "  GHCR login saved to ~/.docker/config.json"
 
+# ── 8. Host cron for Dhan token renewal ─────────────────────────────────────
+echo "[7/8] Installing Dhan token renewal cron..."
+sudo systemctl enable --now cron
+mkdir -p "$DEPLOY_DIR/logs"
+RENEW_CMD="bash $DEPLOY_DIR/scripts/renew_dhan_token.sh >> $DEPLOY_DIR/logs/renew.log 2>&1"
+(
+    crontab -l 2>/dev/null | grep -v 'renew_dhan_token.sh' || true
+    echo "30 2 * * * $RENEW_CMD"
+    echo "30 12 * * * $RENEW_CMD"
+) | crontab -
+echo "  Installed cron entries for 08:00 IST and 18:00 IST daily."
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
-echo "[7/7] Bootstrap complete!"
+echo "[8/8] Bootstrap complete!"
 echo ""
 echo "Next steps:"
 echo "  1. Edit $DEPLOY_DIR/.env with real credentials."
@@ -133,5 +145,6 @@ echo "     POSTGRES_PASSWORD = <value from .env>"
 echo "     GRAFANA_PASSWORD  = <value from .env>"
 echo ""
 echo "  3. Push to main — the CD workflow will build, push, and deploy automatically."
+echo "  4. Token renewal cron is installed for 08:00 IST and 18:00 IST daily."
 echo ""
 echo "  TIP: Log out and back in (or run 'newgrp docker') so the docker group applies."

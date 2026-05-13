@@ -1,0 +1,21 @@
+{
+	"inputs": [
+		{
+			"id": "api_token",
+			"type": "promptString",
+			"description": "Enter your Hostinger API token (required)"
+		}
+	],
+	"servers": {
+		"hostinger-mcp": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"hostinger-api-mcp@latest"
+			],
+			"env": {
+				"API_TOKEN": "eEL0L1ZQa0sS4e5qTQ1VXYhflYFTsBFdOvzi99Ni3d8c72d3"
+			}
+		}
+	}
+}

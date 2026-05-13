@@ -13,7 +13,7 @@ IMAGE_NAME="${IMAGE_NAME:-yukti:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-yukti}"
 HOST_PORT="${HOST_PORT:-8000}"
 APP_PORT="${APP_PORT:-8000}"
-MODE="${MODE:-paper}"
+MODE="${MODE:-live}"
 
 echo "[deploy] repo: $SCRIPT_DIR"
 echo "[deploy] env file: $ENV_FILE"
@@ -41,7 +41,7 @@ if [ ! -f "$ENV_FILE" ]; then
   else
     cat > .env <<EOF
 # Minimal .env for Yukti
-MODE=paper
+MODE=live
 ENABLE_SELF_LEARNING=false
 ENABLE_CANARY_ROUTING=false
 CANARY_RATIO=0.1

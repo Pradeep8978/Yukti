@@ -22,6 +22,7 @@ class ControlPlaneService:
         self.api_server = None
         self.tg = None
         self.watchdog_task = None
+        self.monitor_task = None
         self.scheduler = None
 
     async def start(self) -> None:
@@ -103,9 +104,10 @@ class ControlPlaneService:
         # Start live WebSocket feed for real-time SL/target detection
         try:
             from yukti.execution.live_feed import get_feed_manager
-            from yukti.execution.monitor import _on_tick
+            from yukti.execution.monitor import _on_tick, monitor_positions
             feed = get_feed_manager()
             await feed.start(_on_tick)
+            self.monitor_task = asyncio.create_task(monitor_positions(), name="position_monitor")
             log.info("ControlPlaneService: live feed started")
         except Exception as exc:
             log.warning("ControlPlaneService: live feed startup failed (non-fatal): %s", exc)
@@ -120,6 +122,8 @@ class ControlPlaneService:
 
         if self.watchdog_task:
             self.watchdog_task.cancel()
+        if self.monitor_task:
+            self.monitor_task.cancel()
         if self.tg is not None:
             try:
                 if self.tg.updater and self.tg.updater.running:

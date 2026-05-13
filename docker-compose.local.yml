@@ -29,7 +29,7 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       POSTGRES_URL: postgresql+psycopg://yukti:${POSTGRES_PASSWORD:-password}@postgres:5432/yukti
-      MODE: ${MODE:-paper}
+      MODE: ${MODE:-live}
     ports:
       - "8000:8000"
     volumes:

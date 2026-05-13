@@ -372,6 +372,7 @@ def build_scheduler() -> AsyncIOScheduler:
                   id="catalyst_refresh", replace_existing=True)
     sched.add_job(job_exclusions_refresh,   "cron", hour=8,  minute=15,
                   id="exclusions_refresh", replace_existing=True)
+
     sched.add_job(job_premarket_pool_build, "cron", hour=8,  minute=30,
                   id="premarket_pool_build", replace_existing=True)
     sched.add_job(job_universe_scan,        "cron", hour=8,  minute=45)
@@ -436,7 +437,7 @@ async def job_renew_and_test_dhan() -> None:
     """Periodic DhanHQ token health check.
 
     Token renewal is handled by the HOST-side cron script:
-        scripts/renew_dhan_token.sh  (runs at 08:00 and 17:30 IST on weekdays)
+        scripts/renew_dhan_token.sh  (runs at 08:00 and 18:00 IST daily)
 
     This job only verifies the current token is still accepted and alerts via
     Telegram if it has gone stale between scheduled renewal runs.
@@ -448,7 +449,7 @@ async def job_renew_and_test_dhan() -> None:
             from yukti.telegram.bot import alert
             await alert(
                 "🚨 *Yukti: DhanHQ token check FAILED* (scheduled verify).\n"
-                "The host renewal script will attempt renewal at 08:00 / 17:30 IST.\n"
+                "The host renewal script will attempt renewal at 08:00 / 18:00 IST.\n"
                 "If this is outside those windows, run manually:\n"
                 "`bash /opt/yukti/scripts/renew_dhan_token.sh`"
             )

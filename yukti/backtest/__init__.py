@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -41,6 +41,7 @@ class SimPosition:
     exit_reason:  str  = ""
     pnl:          float = 0.0
     pnl_pct:      float = 0.0
+    exit_time:    datetime | None = None
 
 
 class PaperBroker:
@@ -51,6 +52,7 @@ class PaperBroker:
     """
 
     def __init__(self, account_value: float = 500_000.0, slippage_pct: float = 0.001) -> None:
+        self.initial_account_value = account_value
         self.account_value  = account_value
         self.slippage_pct   = slippage_pct          # 0.1% default slippage
         self.positions:     dict[str, SimPosition] = {}
@@ -60,16 +62,18 @@ class PaperBroker:
 
     def update_prices(
         self,
+        current_time: datetime,
         prices: dict[str, float],
         highs:  dict[str, float] | None = None,
         lows:   dict[str, float] | None = None,
     ) -> None:
         """Called each candle. highs/lows enable accurate daily-candle GTT checks."""
         self._current_prices.update(prices)
-        self._check_gtts(highs or {}, lows or {})
+        self._check_gtts(current_time, highs or {}, lows or {})
 
     def _check_gtts(
         self,
+        current_time: datetime,
         highs: dict[str, float],
         lows:  dict[str, float],
     ) -> None:
@@ -86,16 +90,16 @@ class PaperBroker:
 
             if pos.direction == "LONG":
                 if low <= pos.stop_loss:
-                    self._close_position(symbol, pos.stop_loss * (1 - self.slippage_pct), "stop_loss_hit")
+                    self._close_position(symbol, pos.stop_loss * (1 - self.slippage_pct), "stop_loss_hit", current_time)
                 elif high >= pos.target_1:
-                    self._close_position(symbol, pos.target_1, "target_1_hit")
+                    self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
             else:  # SHORT
                 if high >= pos.stop_loss:
-                    self._close_position(symbol, pos.stop_loss * (1 + self.slippage_pct), "stop_loss_hit")
+                    self._close_position(symbol, pos.stop_loss * (1 + self.slippage_pct), "stop_loss_hit", current_time)
                 elif low <= pos.target_1:
-                    self._close_position(symbol, pos.target_1, "target_1_hit")
+                    self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
 
-    def _close_position(self, symbol: str, exit_price: float, reason: str) -> None:
+    def _close_position(self, symbol: str, exit_price: float, reason: str, exit_time: datetime | None = None) -> None:
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
@@ -104,6 +108,7 @@ class PaperBroker:
         pos.exit_reason = reason
         pos.pnl         = (exit_price - pos.entry_price) * pos.quantity if is_long else (pos.entry_price - exit_price) * pos.quantity
         pos.pnl_pct     = pos.pnl / (pos.entry_price * pos.quantity) * 100
+        pos.exit_time   = exit_time
         pos.status      = "CLOSED"
         self.account_value += pos.pnl
         self.closed_trades.append(pos)
@@ -192,11 +197,68 @@ class BacktestEngine:
         self.claude_sample_rate  = claude_sample_rate
         self.use_rules_engine    = use_rules_engine
         self._equity_curve:      list[dict] = []
+        self._cooldowns:         dict[str, datetime] = {}
+        self._closed_trades_seen = 0
+
+    def _trades_today(self, ts: datetime) -> int:
+        trade_day = ts.date()
+        closed_today = sum(1 for trade in self.broker.closed_trades if trade.exit_time and trade.exit_time.date() == trade_day)
+        open_today = sum(1 for trade in self.broker.positions.values() if trade.entry_time.date() == trade_day)
+        return closed_today + open_today
+
+    def _daily_pnl_pct(self, ts: datetime) -> float:
+        trade_day = ts.date()
+        return float(sum(trade.pnl_pct for trade in self.broker.closed_trades if trade.exit_time and trade.exit_time.date() == trade_day))
+
+    def _win_rate_last_10(self) -> tuple[float | None, int]:
+        recent = self.broker.closed_trades[-10:]
+        if not recent:
+            return None, 0
+        wins = sum(1 for trade in recent if trade.pnl > 0)
+        return wins / len(recent), len(recent)
+
+    def _consecutive_losses(self) -> int:
+        streak = 0
+        for trade in reversed(self.broker.closed_trades):
+            if trade.pnl >= 0:
+                break
+            streak += 1
+        return streak
+
+    def _total_exposure_pct(self) -> float:
+        account_value = max(self.broker.account_value, 1.0)
+        total_margin = 0.0
+        for trade in self.broker.positions.values():
+            leverage = settings.intraday_leverage if trade.holding == "intraday" else 1.0
+            total_margin += (trade.entry_price * trade.quantity) / max(leverage, 1.0)
+        return round(total_margin / account_value * 100, 2) if account_value else 0.0
+
+    def _cooldown_until(self, ts: datetime, conviction: int, cycle_delta: timedelta) -> datetime:
+        cycles = settings.cooldown_cycles
+        if conviction >= 8:
+            cycles = max(1, cycles // 2)
+        return ts + (cycle_delta * cycles)
+
+    def _register_new_cooldowns(self, ts: datetime, cycle_delta: timedelta) -> None:
+        while self._closed_trades_seen < len(self.broker.closed_trades):
+            trade = self.broker.closed_trades[self._closed_trades_seen]
+            exit_ts = trade.exit_time or ts
+            self._cooldowns[trade.symbol] = self._cooldown_until(exit_ts, trade.conviction if hasattr(trade, "conviction") else 0, cycle_delta)
+            self._closed_trades_seen += 1
+
+    def _is_on_cooldown(self, symbol: str, ts: datetime) -> bool:
+        until = self._cooldowns.get(symbol)
+        if until is None:
+            return False
+        if ts >= until:
+            self._cooldowns.pop(symbol, None)
+            return False
+        return True
 
     async def run(self) -> "BacktestReport":
         """Run the full backtest and return a report."""
         from yukti.signals.indicators import compute
-        from yukti.risk import calculate_position, calculate_levels
+        from yukti.risk import Portfolio, calculate_position, calculate_levels, run_gates
 
         if self.use_rules_engine:
             from yukti.agents.rules_engine import decide as rules_decide
@@ -232,6 +294,11 @@ class BacktestEngine:
             and all_dates[0].time().minute == 0
         )
         tf_label = "daily" if is_daily else "intraday"
+        cycle_delta = timedelta(days=1) if is_daily else timedelta(minutes=5)
+        if len(all_dates) >= 2:
+            observed_delta = all_dates[1] - all_dates[0]
+            if observed_delta.total_seconds() > 0:
+                cycle_delta = observed_delta
         log.info(
             "Backtest: %d symbols × %d candles  mode=%s  timeframe=%s",
             len(symbols), len(all_dates),
@@ -256,18 +323,24 @@ class BacktestEngine:
                     prices[sym] = float(df.loc[ts, "close"])
                     highs[sym]  = float(df.loc[ts, "high"])
                     lows[sym]   = float(df.loc[ts, "low"])
-            self.broker.update_prices(prices, highs, lows)
+            self.broker.update_prices(ts, prices, highs, lows)
 
             # Daily candles: square off at end of each week (Friday)
             if is_daily and hasattr(ts, "dayofweek") and ts.dayofweek == 4:
                 for sym in list(self.broker.positions.keys()):
-                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff")
+                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff", ts)
             # Intraday: square off at 15:15 IST
             elif not is_daily and hasattr(ts, "time") and ts.time().hour == 15 and ts.time().minute >= 15:
                 for sym in list(self.broker.positions.keys()):
-                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff")
+                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff", ts)
+
+            self._register_new_cooldowns(ts, cycle_delta)
 
             for symbol in symbols:
+                if symbol in self.broker.positions:
+                    continue
+                if self._is_on_cooldown(symbol, ts):
+                    continue
                 df = self.candles[symbol].loc[:ts]
                 if len(df) < 60:
                     continue
@@ -284,10 +357,11 @@ class BacktestEngine:
                     continue
 
                 perf = {
-                    "consecutive_losses": 0,
-                    "daily_pnl_pct":      0.0,
-                    "win_rate_last_10":   0.5,
-                    "trades_today":       0,
+                    "consecutive_losses": self._consecutive_losses(),
+                    "daily_pnl_pct":      self._daily_pnl_pct(ts),
+                    "win_rate_last_10":   self._win_rate_last_10()[0] if self._win_rate_last_10()[0] is not None else 0.5,
+                    "win_rate_last_10_count": self._win_rate_last_10()[1],
+                    "trades_today":       self._trades_today(ts),
                 }
 
                 # ── Decision ──────────────────────────────────────────
@@ -311,6 +385,9 @@ class BacktestEngine:
                 if decision.action == "SKIP":
                     continue
 
+                if self.broker.account_value <= 0:
+                    continue
+
                 # Fill levels from AI decision or compute fallback
                 if not decision.stop_loss or not decision.target_1:
                     levels = calculate_levels(
@@ -325,12 +402,32 @@ class BacktestEngine:
                     decision.target_2    = decision.target_2   or levels.target_2
                     decision.risk_reward = decision.risk_reward or levels.risk_reward
 
+                portfolio = Portfolio(
+                    account_value=max(self.broker.account_value, 1.0),
+                    open_positions=len(self.broker.positions),
+                    daily_pnl_pct=perf["daily_pnl_pct"],
+                    total_exposure_pct=self._total_exposure_pct(),
+                    trades_today=perf["trades_today"],
+                    win_rate_last_10=perf["win_rate_last_10"],
+                    win_rate_last_10_count=perf["win_rate_last_10_count"],
+                )
+                gate = await run_gates(
+                    decision,
+                    portfolio,
+                    ignore_cooldown=True,
+                    ignore_market_halt=True,
+                )
+                if not gate.passed:
+                    continue
+
                 try:
                     position = calculate_position(
                         entry_price = decision.entry_price or snap.close,
                         stop_loss   = decision.stop_loss,
                         direction   = decision.direction or "LONG",
                         conviction  = decision.conviction,
+                        account_value = max(self.broker.account_value, 1.0),
+                        leverage = settings.intraday_leverage if decision.holding_period == "intraday" else 1.0,
                     )
                 except ValueError:
                     continue
@@ -373,7 +470,7 @@ class BacktestEngine:
         return BacktestReport(
             trades        = self.broker.closed_trades,
             equity_curve  = pd.DataFrame(self._equity_curve),
-            initial_value = 500_000.0,
+            initial_value = self.broker.initial_account_value,
             final_value   = self.broker.account_value,
         )
 
@@ -459,18 +556,32 @@ def run_cli() -> None:
     parser.add_argument("--sample-rate", type=float, default=0.3, help="Claude call sample rate (0.0-1.0, AI path only)")
     parser.add_argument("--symbols", nargs="*", default=None, help="Specific symbols (default: all in universe)")
     parser.add_argument("--rules-engine", action="store_true", help="Use deterministic rules engine instead of AI")
+    parser.add_argument("--interval", default=None, help="Candle interval to backtest (default: settings.candle_interval, e.g. 5 or D)")
     args = parser.parse_args()
 
     import asyncio
-    asyncio.run(_run_backtest(args.start, args.end, args.sample_rate, args.symbols, args.rules_engine))
+    asyncio.run(_run_backtest(args.start, args.end, args.sample_rate, args.symbols, args.rules_engine, args.interval))
 
 
-async def _run_backtest(start: str, end: str, sample_rate: float, symbols: list[str] | None = None, use_rules_engine: bool = False) -> None:
+async def _run_backtest(
+    start: str,
+    end: str,
+    sample_rate: float,
+    symbols: list[str] | None = None,
+    use_rules_engine: bool = False,
+    interval: str | None = None,
+) -> None:
     """Run the backtest with optional symbol filter."""
     from yukti.config import settings
     from yukti.data.models import Candle
     from sqlalchemy import select, and_, func as sa_func
     import pandas as pd
+
+    start_date = date.fromisoformat(start)
+    end_date = date.fromisoformat(end)
+    candle_interval = str(interval or settings.candle_interval).strip()
+    daily_intervals = {"D", "1D", "d", "1d", "day", "daily"}
+    normalized_interval = "D" if candle_interval in daily_intervals else candle_interval
 
     # Load universe or use provided symbols
     if symbols:
@@ -501,8 +612,9 @@ async def _run_backtest(start: str, end: str, sample_rate: float, symbols: list[
                     .where(
                         and_(
                             Candle.symbol == symbol,
-                            sa_func.date(Candle.time) >= start,
-                            sa_func.date(Candle.time) <= end,
+                            Candle.interval == normalized_interval,
+                            sa_func.date(Candle.time) >= start_date,
+                            sa_func.date(Candle.time) <= end_date,
                         )
                     )
                     .order_by(Candle.time)
@@ -516,7 +628,7 @@ async def _run_backtest(start: str, end: str, sample_rate: float, symbols: list[
     except Exception as db_err:
         log.warning("DB unavailable (%s) — falling back to yfinance daily data", db_err)
 
-    if not candles:
+    if not candles and normalized_interval == "D":
         try:
             import warnings
             import yfinance as yf
@@ -541,6 +653,12 @@ async def _run_backtest(start: str, end: str, sample_rate: float, symbols: list[
                     pass
         except Exception as yf_err:
             log.error("yfinance fallback also failed: %s", yf_err)
+    elif not candles:
+        log.error(
+            "No %s-minute candle data found in DB. Populate candles for interval=%s before running intraday backtests.",
+            normalized_interval,
+            normalized_interval,
+        )
 
     if not candles:
         log.error("No candle data found. Populate the DB or install yfinance.")

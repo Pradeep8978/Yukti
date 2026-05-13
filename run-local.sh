@@ -7,7 +7,7 @@ set -euo pipefail
 #   setup     — create venv, install deps, and prepare .env
 #   migrate   — run alembic migrations
 #   bootstrap  — run scripts/bootstrap.py (requires Redis + Postgres running)
-#   start [mode] — start Yukti in given mode (default: paper)
+#   start [mode] — start Yukti in given mode (default: live)
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$ROOT_DIR/.venv"
@@ -51,7 +51,7 @@ case ${1-} in
     ;;
 
   start)
-    MODE=${2-paper}
+    MODE=${2-live}
     ensure_venv
     export MODE
     echo "Starting Yukti in mode=$MODE"

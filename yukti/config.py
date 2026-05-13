@@ -120,7 +120,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # ── Operating mode ────────────────────────────────
-    mode: Literal["live", "paper", "shadow", "backtest"] = "paper"
+    mode: Literal["live", "paper", "shadow", "backtest"] = "live"
 
     # ── Account ───────────────────────────────────────
     account_value: float = Field(default=500_000.0, gt=0)

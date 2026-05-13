@@ -115,7 +115,7 @@ nano ~/yukti/.env
 Fill in at minimum:
 
 ```env
-MODE=paper                    # start with paper to verify everything works
+MODE=live                     # default live mode
 POSTGRES_PASSWORD=<strong-password>
 POSTGRES_URL=postgresql+psycopg://yukti:<strong-password>@postgres:5432/yukti
 REDIS_URL=redis://redis:6379/0

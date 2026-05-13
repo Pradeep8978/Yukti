@@ -81,7 +81,7 @@ VOYAGE_API_KEY=your_voyage_key         # from https://www.voyageai.com
 TELEGRAM_BOT_TOKEN=123456:AAxxxxx      # from @BotFather
 TELEGRAM_CHAT_ID=your_chat_id          # from @userinfobot
 POSTGRES_PASSWORD=choose_a_strong_password
-MODE=paper                             # start in paper mode!
+MODE=live                              # default live mode
 ACCOUNT_VALUE=500000
 WATCHLIST=RELIANCE,HDFCBANK,INFY,TCS,ICICIBANK
 ```
@@ -100,7 +100,7 @@ Expected output after ~30 seconds:
 ```
 yukti          | ============================================================
 yukti          | YUKTI (युक्ति) — Autonomous NSE Trading Agent
-yukti          | Mode:           PAPER
+yukti          | Mode:           LIVE
 yukti          | AI provider:    GEMINI
 yukti          | Account:        ₹500,000
 yukti          | Risk per trade: 1.0%

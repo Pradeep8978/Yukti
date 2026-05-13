@@ -86,6 +86,7 @@ class DhanClient:
         self._base = base.rstrip('/')
         self._access_token = access_token
         self._auth_method = None
+        self._ctx = None
 
         if access_token:
             try:
@@ -109,6 +110,7 @@ class DhanClient:
             if "sandbox" in ctx.dhan_http.base_url and not ctx.dhan_http.base_url.endswith("/v2"):
                 ctx.dhan_http.base_url += "/v2"
 
+        self._ctx = ctx
         self._dhan = dhanhq(ctx)
         self._loop = asyncio.get_event_loop()
 
@@ -168,6 +170,7 @@ class DhanClient:
             ctx = DhanContext(client_id=self._cid, access_token=new_token)
             if hasattr(ctx, 'dhan_http') and self._base:
                 ctx.dhan_http.base_url = self._base
+            self._ctx = ctx
             self._dhan = dhanhq(ctx)
             log.info("DhanClient: access token renewed and client reinitialized")
             return True

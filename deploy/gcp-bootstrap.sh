@@ -21,7 +21,7 @@ echo "=== Yukti — GCP Compute Engine bootstrap ==="
 echo "[1/7] Installing system packages..."
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg git ufw
+    ca-certificates curl gnupg git ufw cron
 
 # ── 2. Docker (official repo) ────────────────────────────────────────────────
 echo "[2/7] Installing Docker..."
@@ -81,7 +81,7 @@ if [ ! -f "$DEPLOY_DIR/.env" ]; then
     else
         cat > "$DEPLOY_DIR/.env" <<'EOF'
 # ── Yukti runtime environment (GCP) ───────────────────────────────────────
-MODE=paper                          # paper | shadow | live
+MODE=live                           # paper | shadow | live
 
 # Postgres (used by docker-compose; keep in sync with POSTGRES_URL below)
 POSTGRES_PASSWORD=change_me_now
@@ -149,6 +149,18 @@ else
     echo "  Swap already configured — skipping."
 fi
 
+# ── 9. Host cron for Dhan token renewal ─────────────────────────────────────
+echo "[8/8] Installing Dhan token renewal cron..."
+sudo systemctl enable --now cron
+mkdir -p "$DEPLOY_DIR/logs"
+RENEW_CMD="bash $DEPLOY_DIR/scripts/renew_dhan_token.sh >> $DEPLOY_DIR/logs/renew.log 2>&1"
+(
+    crontab -l 2>/dev/null | grep -v 'renew_dhan_token.sh' || true
+    echo "30 2 * * * $RENEW_CMD"
+    echo "30 12 * * * $RENEW_CMD"
+) | crontab -
+echo "  Installed cron entries for 08:00 IST and 18:00 IST daily."
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Bootstrap complete! ==="
@@ -158,6 +170,7 @@ echo "  1. Edit .env:              nano $DEPLOY_DIR/.env"
 echo "  2. Start the stack:        cd $DEPLOY_DIR && docker compose up -d"
 echo "  3. Watch logs:             docker compose logs -f yukti"
 echo "  4. Open web portal:        http://$(curl -s ifconfig.me):8000"
+echo "  5. Token renewal cron:     08:00 IST and 18:00 IST daily"
 echo ""
 echo "GCP budget tip: Set a budget alert at \$50/month in"
 echo "  Console → Billing → Budgets & alerts"

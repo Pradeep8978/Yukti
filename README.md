@@ -200,7 +200,7 @@ DhanHQ access tokens expire every 24 hours. A host-side cron script handles rene
 # Runs on the host (not inside Docker) — registered by setup
 crontab -l
 # 30 2  * * *  /opt/yukti/scripts/renew_dhan_token.sh   # 08:00 IST daily
-# 0  12 * * *  /opt/yukti/scripts/renew_dhan_token.sh   # 17:30 IST daily
+# 30 12 * * *  /opt/yukti/scripts/renew_dhan_token.sh   # 18:00 IST daily
 ```
 
 The script calls `/RenewToken`, writes the new token to `.env`, force-recreates the container, and sends a Telegram alert (✅ success or 🚨 failure).
@@ -210,7 +210,7 @@ To add the cron entries on a fresh machine:
 ```bash
 (crontab -l 2>/dev/null; \
  echo "30 2  * * *  /opt/yukti/scripts/renew_dhan_token.sh >> /opt/yukti/logs/renew.log 2>&1"; \
- echo "0  12 * * *  /opt/yukti/scripts/renew_dhan_token.sh >> /opt/yukti/logs/renew.log 2>&1") \
+ echo "30 12 * * *  /opt/yukti/scripts/renew_dhan_token.sh >> /opt/yukti/logs/renew.log 2>&1") \
 | crontab -
 ```
 

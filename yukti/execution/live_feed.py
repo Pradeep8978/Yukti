@@ -69,13 +69,11 @@ class LiveFeedManager:
                 return
             self._subscriptions[symbol] = security_id
             self._security_to_symbol[security_id] = symbol
-        log.debug("LiveFeedManager: subscribed %s (id=%s)", symbol, security_id)
+        log.info("LiveFeedManager: subscribed %s (id=%s)", symbol, security_id)
 
         if self._connected and self._feed is not None:
             try:
-                self._feed.subscribe_symbols(
-                    [{"ExchangeSegment": "NSE_EQ", "SecurityId": security_id}]
-                )
+                self._feed.subscribe_symbols([("NSE", security_id, getattr(self._feed, "Ticker", None))])
             except Exception as exc:
                 log.debug("LiveFeedManager: subscribe_symbols failed for %s: %s", symbol, exc)
 
@@ -87,13 +85,11 @@ class LiveFeedManager:
                 self._security_to_symbol.pop(security_id, None)
         if not security_id:
             return
-        log.debug("LiveFeedManager: unsubscribed %s", symbol)
+        log.info("LiveFeedManager: unsubscribed %s", symbol)
 
         if self._connected and self._feed is not None:
             try:
-                self._feed.unsubscribe_symbols(
-                    [{"ExchangeSegment": "NSE_EQ", "SecurityId": security_id}]
-                )
+                self._feed.unsubscribe_symbols([("NSE", security_id, getattr(self._feed, "Ticker", None))])
             except Exception as exc:
                 log.debug("LiveFeedManager: unsubscribe_symbols failed for %s: %s", symbol, exc)
 
@@ -125,7 +121,7 @@ class LiveFeedManager:
                     for sid in self._subscriptions.values()
                 ]
 
-            self._feed = self._create_feed(dhan_client, client_id, access_token, pre_instruments)
+            self._feed = self._create_feed(broker, client_id, access_token, pre_instruments)
             if self._feed is None:
                 return
 
@@ -140,7 +136,7 @@ class LiveFeedManager:
 
     def _create_feed(
         self,
-        dhan_client: Any,
+        broker: Any,
         client_id: str,
         access_token: str,
         pre_instruments: list[dict],
@@ -150,17 +146,23 @@ class LiveFeedManager:
         try:
             from dhanhq import MarketFeed  # type: ignore[attr-defined]
 
-            instruments = [(i["ExchangeSegment"], i["SecurityId"], MarketFeed.LTP)
-                           for i in pre_instruments] if pre_instruments else []
+            dhan_context = getattr(broker, "_ctx", None)
+            if dhan_context is None:
+                raise TypeError("DhanContext unavailable on broker")
+
+            instruments = [
+                (MarketFeed.NSE, i["SecurityId"], MarketFeed.Ticker)
+                for i in pre_instruments
+            ] if pre_instruments else []
 
             feed = MarketFeed(
-                dhan_client,
+                dhan_context,
                 instruments,
-                version = "v1",
+                version = "v2",
+                on_message = self._on_message,
+                on_close   = self._on_close,
+                on_error   = self._on_error,
             )
-            feed.on_message = self._on_message
-            feed.on_close   = self._on_close
-            feed.on_error   = self._on_error
             log.info("LiveFeedManager: using MarketFeed (dhanhq>=2.0)")
             return feed
         except (ImportError, AttributeError, TypeError):
@@ -191,9 +193,12 @@ class LiveFeedManager:
         log.warning("LiveFeedManager: dhanhq package missing or unsupported version — feed disabled")
         return None
 
-    def _on_message(self, data: dict) -> None:
+    def _on_message(self, *args: Any) -> None:
         """Dispatch incoming tick to asyncio tick handler."""
         try:
+            data = args[-1] if args else {}
+            if not isinstance(data, dict):
+                return
             security_id = str(
                 data.get("security_id")
                 or data.get("securityId")

@@ -48,11 +48,11 @@ ensure_env() {
 
   set_if_missing "POSTGRES_PASSWORD" "$POSTGRES_PASSWORD"
   set_if_missing "CONTROL_API_KEY" "$CONTROL_API_KEY"
-  # Ensure MODE=paper for safe defaults
+  # Ensure MODE=live for the default local run mode
   if grep -q '^MODE=' .env; then
-    sed -i "s|^MODE=.*|MODE=paper|" .env
+    sed -i "s|^MODE=.*|MODE=live|" .env
   else
-    echo "MODE=paper" >> .env
+    echo "MODE=live" >> .env
   fi
   # Ensure POSTGRES_URL points to localhost for local runs
   if grep -q '^POSTGRES_URL=' .env; then

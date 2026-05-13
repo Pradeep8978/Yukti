@@ -24,7 +24,7 @@ RUN uv sync --frozen
 # Inject built webapp into FastAPI static directory
 COPY --from=webapp-build /webapp/dist ./yukti/api/static/
 EXPOSE 8000
-ENV MODE=paper
+ENV MODE=live
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

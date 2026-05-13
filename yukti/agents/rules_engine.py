@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 
 from yukti.agents.arjun import CallMeta, TradeDecision
+from yukti.config import settings
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         return _skip("daily_loss_limit_hit", conviction=1, symbol=symbol)
 
     # Minimum conviction gate (tightens under adverse conditions)
-    min_conviction = 7
+    min_conviction = max(settings.min_conviction, 7)
     if consec_losses >= 3:
         min_conviction = 9
     elif win_rate < 0.40:
@@ -118,6 +119,9 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     # ── Step 1: Pattern required ───────────────────────────────────────
     if pattern is None or not pattern.detected:
         return _skip("no_pattern", symbol=symbol)
+
+    if pattern.strength < 0.70:
+        return _skip("pattern_strength_below_0_70", conviction=2, symbol=symbol)
 
     if pattern.pattern_type in _LONG_PATTERNS:
         direction = "LONG"
@@ -148,6 +152,8 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         return _skip("rsi_oversold_blocks_short", conviction=2, bias=market_bias, symbol=symbol)
     if direction == "LONG" and snap.rsi_overbought():
         return _skip("rsi_overbought_blocks_long", conviction=2, bias=market_bias, symbol=symbol)
+    if snap.volume_ratio < 1.0:
+        return _skip("volume_ratio_below_1_0", conviction=2, bias=market_bias, symbol=symbol)
 
     # ── Step 4: Conviction scoring ─────────────────────────────────────
     score = _Score()
@@ -188,10 +194,17 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     elif snap.volume_ratio < 0.8:
         score.adjust(-1, "vol_low")
 
+    trend_confirmed = False
+    vwap_confirmed = False
+    macd_confirmed = False
+    ema_confirmed = False
+
     # Supertrend alignment
     if direction == "LONG" and snap.supertrend_bull:
+        trend_confirmed = True
         score.adjust(+1, "supertrend_bull")
     elif direction == "SHORT" and not snap.supertrend_bull:
+        trend_confirmed = True
         score.adjust(+1, "supertrend_bear")
     else:
         score.adjust(-1, "supertrend_misaligned")
@@ -199,26 +212,41 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     # VWAP position — institutions use VWAP as reference; misalignment is a real headwind
     if direction == "LONG":
         if snap.above_vwap():
+            vwap_confirmed = True
             score.adjust(+1, "above_vwap")
         else:
             score.adjust(-1, "below_vwap_long")
     else:
         if not snap.above_vwap():
+            vwap_confirmed = True
             score.adjust(+1, "below_vwap")
         else:
             score.adjust(-1, "above_vwap_short")
 
     # MACD direction — momentum confirmation bonus (no penalty: pattern already carries this)
     if direction == "LONG" and snap.macd_bull:
+        macd_confirmed = True
         score.adjust(+1, "macd_bull")
     elif direction == "SHORT" and not snap.macd_bull:
+        macd_confirmed = True
         score.adjust(+1, "macd_bear")
 
     # EMA20 position — price above/below short-term trend
     if direction == "LONG" and snap.above_ema20():
+        ema_confirmed = True
         score.adjust(+1, "above_ema20")
     elif direction == "SHORT" and not snap.above_ema20():
+        ema_confirmed = True
         score.adjust(+1, "below_ema20")
+
+    confirmation_count = sum((trend_confirmed, vwap_confirmed, macd_confirmed, ema_confirmed))
+    if confirmation_count < 3:
+        return _skip(
+            f"confirmation_count_{confirmation_count}_below_3",
+            conviction=score.clamp(),
+            bias=market_bias,
+            symbol=symbol,
+        )
 
     # Elevated VIX — markets are nervous, reduce conviction (not a hard stop below 30)
     if india_vix is not None and india_vix >= 20:

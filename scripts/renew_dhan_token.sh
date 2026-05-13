@@ -4,9 +4,9 @@
 # Renews the DhanHQ access token, writes it to both .env files, restarts the
 # Yukti container, and sends a Telegram alert.
 #
-# Run via host cron (times are IST = UTC+5:30):
+# Run via host cron (UTC schedule shown for 08:00 / 18:00 IST):
 #   30 2  * * *  /opt/yukti/scripts/renew_dhan_token.sh   # 08:00 IST daily
-#   0  12 * * *  /opt/yukti/scripts/renew_dhan_token.sh   # 17:30 IST daily
+#   30 12 * * *  /opt/yukti/scripts/renew_dhan_token.sh   # 18:00 IST daily
 #
 # Manual run: bash /opt/yukti/scripts/renew_dhan_token.sh
 
