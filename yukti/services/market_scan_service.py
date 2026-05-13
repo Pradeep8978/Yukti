@@ -359,34 +359,9 @@ class MarketScanService:
                 except Exception:
                     pass
 
-                # ── Memory retrieval (hybrid) ───────────────────────────
-                memory_setup = pattern.pattern_type if pattern else "unknown"
-                memory_dir   = "LONG" if macro.nifty_trend == "UP" else "SHORT" if macro.nifty_trend == "DOWN" else "LONG"
-                # Map macro trend to market regime
-                regime_map = {"UP": "BULLISH", "DOWN": "BEARISH", "SIDEWAYS": "NEUTRAL"}
-                market_regime = regime_map.get(macro.nifty_trend, "NEUTRAL")
-                
-                # Use hybrid retrieval with metadata filters
-                retrieved_journals = await retrieve_similar_trades(
-                    symbol, memory_setup, memory_dir, market_regime=market_regime, top_k=settings.rag_max_retrieved
-                )
-                past_journal = format_retrieved_journals_for_context(
-                    retrieved_journals, 
-                    include_meta_lessons=settings.rag_include_meta_lessons
-                )
-                symbol_headlines = filter_headlines_for_symbol(symbol, macro.headlines)
-
-                # ── Context (updated with daily + ORB/VWAP) ──────────
-                context = build_context(
-                    symbol, snap, macro, perf, past_journal, symbol_headlines,
-                    indicators_daily=snap_daily,
-                    or_high=or_high,
-                    or_low=or_low,
-                )
-
                 if not is_trading_day() or not is_trading_hours():
                     record_skip("outside_trading_hours")
-                    log.info("MarketScanService: skipping AI call for %s outside trading hours", symbol)
+                    log.info("MarketScanService: skipping decision for %s outside trading hours", symbol)
                     return
 
                 # Block new entries < 20 min before EOD squareoff
@@ -398,12 +373,43 @@ class MarketScanService:
                     record_skip("too_close_to_eod")
                     return
 
-                decision = await arjun.safe_decide(context)
+                if not settings.use_ai_decision:
+                    # ── Rules engine path (no API calls) ─────────────
+                    from yukti.agents.rules_engine import decide as rules_decide
+                    decision, _ = rules_decide(symbol, snap, macro, perf, pattern, snap_daily)
+                    decision_label = "Rules"
+                else:
+                    # ── AI path (Gemini / Claude) ─────────────────────
+                    # Memory direction derived from pattern type, not Nifty trend.
+                    _long_patterns = {"breakout", "trend_pullback", "reversal_long", "momentum", "orb_breakout"}
+                    memory_setup  = pattern.pattern_type if pattern else "unknown"
+                    memory_dir    = "LONG" if pattern and pattern.pattern_type in _long_patterns else "SHORT"
+                    regime_map    = {"UP": "BULLISH", "DOWN": "BEARISH", "SIDEWAYS": "NEUTRAL"}
+                    market_regime = regime_map.get(macro.nifty_trend, "NEUTRAL")
+
+                    retrieved_journals = await retrieve_similar_trades(
+                        symbol, memory_setup, memory_dir, market_regime=market_regime, top_k=settings.rag_max_retrieved
+                    )
+                    past_journal = format_retrieved_journals_for_context(
+                        retrieved_journals,
+                        include_meta_lessons=settings.rag_include_meta_lessons
+                    )
+                    symbol_headlines = filter_headlines_for_symbol(symbol, macro.headlines)
+                    context = build_context(
+                        symbol, snap, macro, perf, past_journal, symbol_headlines,
+                        indicators_daily=snap_daily,
+                        or_high=or_high,
+                        or_low=or_low,
+                    )
+                    decision = await arjun.safe_decide(context)
+                    decision_label = "AI"
+
                 reasoning_excerpt = " ".join((decision.reasoning or "").split())
                 if len(reasoning_excerpt) > 240:
                     reasoning_excerpt = reasoning_excerpt[:237] + "..."
                 log.info(
-                    "MarketScanService: AI decision for %s: %s dir=%s conviction=%d bias=%s skip_reason=%s reasoning=%s",
+                    "MarketScanService: %s decision for %s: %s dir=%s conviction=%d bias=%s skip_reason=%s reasoning=%s",
+                    decision_label,
                     symbol,
                     decision.action,
                     decision.direction or "-",

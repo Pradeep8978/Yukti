@@ -53,6 +53,11 @@ class Settings(BaseSettings):
 
     watchlist: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
+    # ── Decision mode ──────────────────────────────────
+    # USE_AI_DECISION=true  → Gemini (or claude/ab_test per ai_provider)
+    # USE_AI_DECISION=false → deterministic rules engine (zero API cost, zero latency)
+    use_ai_decision: bool = False
+
     # ── AI provider ───────────────────────────────────
     # Arjun (trade decisions) — the ONLY component allowed to use Gemini.
     # "claude"  → Anthropic Claude Sonnet 4.6  ($3/$15 per MTok)

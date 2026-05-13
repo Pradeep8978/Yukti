@@ -58,29 +58,41 @@ class PaperBroker:
         self.order_counter  = 0
         self._current_prices: dict[str, float] = {}
 
-    def update_prices(self, prices: dict[str, float]) -> None:
-        """Called each candle with current close prices. Triggers GTT checks."""
+    def update_prices(
+        self,
+        prices: dict[str, float],
+        highs:  dict[str, float] | None = None,
+        lows:   dict[str, float] | None = None,
+    ) -> None:
+        """Called each candle. highs/lows enable accurate daily-candle GTT checks."""
         self._current_prices.update(prices)
-        self._check_gtts()
+        self._check_gtts(highs or {}, lows or {})
 
-    def _check_gtts(self) -> None:
-        """Check if any position's SL or target has been hit."""
+    def _check_gtts(
+        self,
+        highs: dict[str, float],
+        lows:  dict[str, float],
+    ) -> None:
+        """Check if any position's SL or target has been hit.
+        Uses intraday high/low when available (daily candles); falls back to close."""
         for symbol, pos in list(self.positions.items()):
             if pos.status != "OPEN":
                 continue
-            price = self._current_prices.get(symbol)
-            if not price:
+            close = self._current_prices.get(symbol)
+            if not close:
                 continue
+            high = highs.get(symbol, close)
+            low  = lows.get(symbol, close)
 
             if pos.direction == "LONG":
-                if price <= pos.stop_loss:
+                if low <= pos.stop_loss:
                     self._close_position(symbol, pos.stop_loss * (1 - self.slippage_pct), "stop_loss_hit")
-                elif price >= pos.target_1:
+                elif high >= pos.target_1:
                     self._close_position(symbol, pos.target_1, "target_1_hit")
             else:  # SHORT
-                if price >= pos.stop_loss:
+                if high >= pos.stop_loss:
                     self._close_position(symbol, pos.stop_loss * (1 + self.slippage_pct), "stop_loss_hit")
-                elif price <= pos.target_1:
+                elif low <= pos.target_1:
                     self._close_position(symbol, pos.target_1, "target_1_hit")
 
     def _close_position(self, symbol: str, exit_price: float, reason: str) -> None:
@@ -158,37 +170,74 @@ class PaperBroker:
 class BacktestEngine:
     """
     Replays historical OHLCV candles symbol-by-symbol, cycle-by-cycle.
-    On each candle close, runs the full Yukti signal + Claude pipeline.
+    On each candle close, runs the full Yukti signal pipeline and either
+    the AI agent (Arjun/Gemini/Claude) or the deterministic rules engine.
     Uses PaperBroker for simulated fills.
+
+    use_rules_engine=True  → calls rules_engine.decide() (zero API cost, zero latency)
+    use_rules_engine=False → calls arjun.safe_decide() (AI path, respects claude_sample_rate)
     """
 
     def __init__(
         self,
-        candles:       dict[str, pd.DataFrame],  # symbol → OHLCV df
-        nifty_candles: pd.DataFrame,
-        account_value: float       = 500_000.0,
-        claude_sample_rate: float  = 1.0,   # 1.0=always, 0.1=10% sample (cheap testing)
+        candles:           dict[str, pd.DataFrame],  # symbol → OHLCV df
+        nifty_candles:     pd.DataFrame,
+        account_value:     float = 500_000.0,
+        claude_sample_rate: float = 1.0,   # fraction of candles sent to AI (reduce to cut cost)
+        use_rules_engine:  bool  = False,  # True → deterministic rules, no API calls
     ) -> None:
-        self.candles            = candles
-        self.nifty_candles      = nifty_candles
-        self.broker             = PaperBroker(account_value)
-        self.claude_sample_rate = claude_sample_rate
-        self._equity_curve:     list[dict] = []
+        self.candles             = candles
+        self.nifty_candles       = nifty_candles
+        self.broker              = PaperBroker(account_value)
+        self.claude_sample_rate  = claude_sample_rate
+        self.use_rules_engine    = use_rules_engine
+        self._equity_curve:      list[dict] = []
 
     async def run(self) -> "BacktestReport":
         """Run the full backtest and return a report."""
-        from yukti.agents.arjun import arjun
         from yukti.signals.indicators import compute
-        from yukti.signals.context import build_context
-        from yukti.risk import calculate_position, calculate_levels, run_gates
-        from yukti.execution.order_sm import open_trade
+        from yukti.risk import calculate_position, calculate_levels
+
+        if self.use_rules_engine:
+            from yukti.agents.rules_engine import decide as rules_decide
+            from yukti.services.macro_context_service import MacroContext
+            from yukti.signals.patterns import (
+                breakout, breakdown,
+                trend_pullback_long, trend_pullback_short,
+                reversal_long, reversal_short,
+                momentum_long,
+            )
+
+            def _detect_pattern(snap):
+                candidates = [
+                    breakout(snap), breakdown(snap),
+                    trend_pullback_long(snap), trend_pullback_short(snap),
+                    reversal_long(snap), reversal_short(snap),
+                    momentum_long(snap),
+                ]
+                detected = [p for p in candidates if p.detected]
+                return max(detected, key=lambda p: p.strength) if detected else None
+        else:
+            from yukti.agents.arjun import arjun
+            from yukti.signals.context import build_context
 
         symbols    = list(self.candles.keys())
         all_dates  = sorted(set(
             idx for df in self.candles.values() for idx in df.index
         ))
 
-        log.info("Backtest: %d symbols × %d candles", len(symbols), len(all_dates))
+        # Detect timeframe: daily candles have no intraday time component
+        is_daily = all_dates and (
+            hasattr(all_dates[0], "time") and all_dates[0].time().hour == 0
+            and all_dates[0].time().minute == 0
+        )
+        tf_label = "daily" if is_daily else "intraday"
+        log.info(
+            "Backtest: %d symbols × %d candles  mode=%s  timeframe=%s",
+            len(symbols), len(all_dates),
+            "rules_engine" if self.use_rules_engine else "ai",
+            tf_label,
+        )
 
         for ts in all_dates:
             nifty_slice = self.nifty_candles.loc[:ts]
@@ -198,25 +247,39 @@ class BacktestEngine:
             nifty_chg   = float((nifty_slice["close"].iloc[-1] - nifty_slice["close"].iloc[-2]) / nifty_slice["close"].iloc[-2] * 100)
             nifty_trend = "UP" if nifty_slice["close"].iloc[-1] > nifty_slice["close"].iloc[-10] else "DOWN"
 
-            # Update paper broker prices at this timestamp
+            # Pass high/low to broker so GTT checks are accurate on daily candles
             prices = {}
+            highs  = {}
+            lows   = {}
             for sym, df in self.candles.items():
                 if ts in df.index:
                     prices[sym] = float(df.loc[ts, "close"])
-            self.broker.update_prices(prices)
+                    highs[sym]  = float(df.loc[ts, "high"])
+                    lows[sym]   = float(df.loc[ts, "low"])
+            self.broker.update_prices(prices, highs, lows)
+
+            # Daily candles: square off at end of each week (Friday)
+            if is_daily and hasattr(ts, "dayofweek") and ts.dayofweek == 4:
+                for sym in list(self.broker.positions.keys()):
+                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff")
+            # Intraday: square off at 15:15 IST
+            elif not is_daily and hasattr(ts, "time") and ts.time().hour == 15 and ts.time().minute >= 15:
+                for sym in list(self.broker.positions.keys()):
+                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff")
 
             for symbol in symbols:
                 df = self.candles[symbol].loc[:ts]
                 if len(df) < 60:
                     continue
 
-                # Sample rate: skip some candles to reduce Claude API calls
-                import random
-                if random.random() > self.claude_sample_rate:
-                    continue
+                # AI path only: sample rate gate to limit API spend
+                if not self.use_rules_engine:
+                    import random
+                    if random.random() > self.claude_sample_rate:
+                        continue
 
                 try:
-                    snap = compute(df)
+                    snap = compute(df, timeframe="daily" if is_daily else "5m")
                 except Exception:
                     continue
 
@@ -227,19 +290,28 @@ class BacktestEngine:
                     "trades_today":       0,
                 }
 
-                context = build_context(
-                    symbol, snap,
-                    nifty_change_pct=nifty_chg,
-                    nifty_trend=nifty_trend,
-                    news_summary="backtest mode — no live news",
-                    perf=perf,
-                )
+                # ── Decision ──────────────────────────────────────────
+                if self.use_rules_engine:
+                    macro = MacroContext(
+                        nifty_chg_pct=nifty_chg,
+                        nifty_trend=nifty_trend,
+                    )
+                    pattern = _detect_pattern(snap)
+                    decision, _ = rules_decide(symbol, snap, macro, perf, pattern)
+                else:
+                    context = build_context(
+                        symbol, snap,
+                        nifty_change_pct=nifty_chg,
+                        nifty_trend=nifty_trend,
+                        news_summary="backtest mode — no live news",
+                        perf=perf,
+                    )
+                    decision = await arjun.safe_decide(context)
 
-                decision = await arjun.safe_decide(context)
                 if decision.action == "SKIP":
                     continue
 
-                # Fill levels from Claude or compute fallback
+                # Fill levels from AI decision or compute fallback
                 if not decision.stop_loss or not decision.target_1:
                     levels = calculate_levels(
                         decision.direction or "LONG",
@@ -248,17 +320,17 @@ class BacktestEngine:
                         snap.nearest_swing_low,
                         snap.nearest_swing_high,
                     )
-                    decision.stop_loss  = decision.stop_loss  or levels.stop_loss
-                    decision.target_1   = decision.target_1   or levels.target_1
-                    decision.target_2   = decision.target_2   or levels.target_2
+                    decision.stop_loss   = decision.stop_loss  or levels.stop_loss
+                    decision.target_1    = decision.target_1   or levels.target_1
+                    decision.target_2    = decision.target_2   or levels.target_2
                     decision.risk_reward = decision.risk_reward or levels.risk_reward
 
                 try:
                     position = calculate_position(
-                        entry_price  = decision.entry_price or snap.close,
-                        stop_loss    = decision.stop_loss,
-                        direction    = decision.direction or "LONG",
-                        conviction   = decision.conviction,
+                        entry_price = decision.entry_price or snap.close,
+                        stop_loss   = decision.stop_loss,
+                        direction   = decision.direction or "LONG",
+                        conviction  = decision.conviction,
                     )
                 except ValueError:
                     continue
@@ -380,33 +452,30 @@ class BacktestReport:
 def run_cli() -> None:
     """Command-line interface for running backtests."""
     import argparse
-    from yukti.config import settings
 
     parser = argparse.ArgumentParser(description="Yukti Backtest Engine")
     parser.add_argument("--start", default="2024-01-01", help="Start date YYYY-MM-DD")
     parser.add_argument("--end", default="2024-12-31", help="End date YYYY-MM-DD")
-    parser.add_argument("--sample-rate", type=float, default=0.3, help="Claude call sample rate (0.0-1.0)")
+    parser.add_argument("--sample-rate", type=float, default=0.3, help="Claude call sample rate (0.0-1.0, AI path only)")
     parser.add_argument("--symbols", nargs="*", default=None, help="Specific symbols (default: all in universe)")
+    parser.add_argument("--rules-engine", action="store_true", help="Use deterministic rules engine instead of AI")
     args = parser.parse_args()
 
     import asyncio
-    asyncio.run(_run_backtest(args.start, args.end, args.sample_rate, args.symbols))
+    asyncio.run(_run_backtest(args.start, args.end, args.sample_rate, args.symbols, args.rules_engine))
 
 
-async def _run_backtest(start: str, end: str, sample_rate: float, symbols: list[str] | None = None) -> None:
+async def _run_backtest(start: str, end: str, sample_rate: float, symbols: list[str] | None = None, use_rules_engine: bool = False) -> None:
     """Run the backtest with optional symbol filter."""
-    from yukti.data.database import create_all_tables
+    from yukti.config import settings
     from yukti.data.models import Candle
     from sqlalchemy import select, and_, func as sa_func
     import pandas as pd
-
-    await create_all_tables()
 
     # Load universe or use provided symbols
     if symbols:
         universe = symbols
     else:
-        from yukti.config import settings
         try:
             import redis.asyncio as aioredis
             r = await aioredis.from_url(settings.redis_url, decode_responses=True)
@@ -420,31 +489,61 @@ async def _run_backtest(start: str, end: str, sample_rate: float, symbols: list[
         except Exception:
             universe = ["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK"]
 
-    # Load candles from DB
-    from yukti.data.database import get_db
+    # Load candles — try DB first, fall back to yfinance (daily) when DB is unreachable
     candles: dict[str, pd.DataFrame] = {}
-    async with get_db() as db:
-        for symbol in universe:
-            rows = (await db.execute(
-                select(Candle)
-                .where(
-                    and_(
-                        Candle.symbol == symbol,
-                        sa_func.date(Candle.time) >= start,
-                        sa_func.date(Candle.time) <= end,
+    try:
+        from yukti.data.database import create_all_tables, get_db
+        await create_all_tables()
+        async with get_db() as db:
+            for symbol in universe:
+                rows = (await db.execute(
+                    select(Candle)
+                    .where(
+                        and_(
+                            Candle.symbol == symbol,
+                            sa_func.date(Candle.time) >= start,
+                            sa_func.date(Candle.time) <= end,
+                        )
                     )
-                )
-                .order_by(Candle.time)
-            )).scalars().all()
-            if rows:
-                df = pd.DataFrame(
-                    [(r.time, r.open, r.high, r.low, r.close, r.volume) for r in rows],
-                    columns=["time", "open", "high", "low", "close", "volume"],
-                ).set_index("time")
-                candles[symbol] = df.astype(float)
+                    .order_by(Candle.time)
+                )).scalars().all()
+                if rows:
+                    df = pd.DataFrame(
+                        [(r.time, r.open, r.high, r.low, r.close, r.volume) for r in rows],
+                        columns=["time", "open", "high", "low", "close", "volume"],
+                    ).set_index("time")
+                    candles[symbol] = df.astype(float)
+    except Exception as db_err:
+        log.warning("DB unavailable (%s) — falling back to yfinance daily data", db_err)
 
     if not candles:
-        log.error("No candle data found for the date range. Populate the candles table first.")
+        try:
+            import warnings
+            import yfinance as yf
+            warnings.filterwarnings("ignore")
+            from datetime import timedelta
+            warmup_start = (
+                datetime.fromisoformat(start) - timedelta(days=180)
+            ).strftime("%Y-%m-%d")
+            ns_syms = [s + ".NS" for s in universe]
+            log.info("Fetching %d symbols from yfinance [%s → %s]", len(universe), warmup_start, end)
+            raw = yf.download(ns_syms, start=warmup_start, end=end,
+                              interval="1d", auto_adjust=True, progress=False)
+            for sym, ns in zip(universe, ns_syms):
+                try:
+                    df = raw.loc[:, (slice(None), ns)].copy()
+                    df.columns = df.columns.get_level_values(0).str.lower()
+                    df.index = pd.to_datetime(df.index)
+                    df = df.dropna(subset=["close"])
+                    if len(df) >= 60:
+                        candles[sym] = df.astype(float)
+                except Exception:
+                    pass
+        except Exception as yf_err:
+            log.error("yfinance fallback also failed: %s", yf_err)
+
+    if not candles:
+        log.error("No candle data found. Populate the DB or install yfinance.")
         return
 
     nifty_df = candles.get("NIFTY", next(iter(candles.values())))
@@ -452,6 +551,7 @@ async def _run_backtest(start: str, end: str, sample_rate: float, symbols: list[
         candles, nifty_df,
         account_value=settings.account_value,
         claude_sample_rate=sample_rate,
+        use_rules_engine=use_rules_engine,
     )
     report = await engine.run()
     report.print_summary()
