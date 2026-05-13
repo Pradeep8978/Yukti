@@ -4,9 +4,11 @@ Builds the full prompt context string sent to Claude each trading cycle.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from yukti.signals.indicators import IndicatorSnapshot
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 
 def compute_alignment(
@@ -177,7 +179,7 @@ def build_context(
   India VIX        : {macro.vix_label}
   FII flows today  : {macro.fii_label}
   DII flows today  : {macro.dii_label}
-  Time (IST)       : {datetime.now().strftime("%H:%M")}
+  Time (IST)       : {datetime.now(_IST).strftime("%H:%M IST")}
   Headlines        :
 {macro.headlines_text}
 ╚════════════════════════════════════════════════════════════════╝

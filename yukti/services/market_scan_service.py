@@ -53,16 +53,16 @@ class MarketScanService:
     async def _get_cycle_universe(self) -> list[tuple[str, str]]:
         """Limit each AI scan cycle to a small deterministic shortlist.
 
-        Open positions are always included first, then the remaining startup
-        universe is filled in original order until the configured cap.
+        Open positions are always included first, then the remaining scanned
+        universe is filled in score order until max_symbols_per_scan_cycle.
 
         Re-reads Redis each cycle so universe updates from scheduler jobs
         (job_universe_scan, job_universe_refresh) take effect without a restart.
         Falls back to the startup-loaded self.universe when Redis is empty.
         """
+        import json as _json
+        import redis.asyncio as _aioredis
         try:
-            import json as _json
-            import redis.asyncio as _aioredis
             _r = await _aioredis.from_url(settings.redis_url, decode_responses=True)
             _raw = await _r.get("yukti:universe")
             await _r.aclose()

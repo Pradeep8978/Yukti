@@ -500,16 +500,56 @@ class DhanClient:
                     to_date          = to_d.isoformat(),
                 )
                 rows = res.get("data", []) if isinstance(res, dict) else []
+                # DhanHQ may return dict-of-arrays — same pattern as intraday
+                if isinstance(rows, dict):
+                    try:
+                        ts_list = rows.get("timestamp", [])
+                        rows = [
+                            {
+                                "time":   str(ts)[:10],  # YYYY-MM-DD
+                                "open":   float(rows["open"][i]),
+                                "high":   float(rows["high"][i]),
+                                "low":    float(rows["low"][i]),
+                                "close":  float(rows["close"][i]),
+                                "volume": float(rows["volume"][i]),
+                            }
+                            for i, ts in enumerate(ts_list)
+                        ]
+                        log.debug("historical_daily: converted dict-of-arrays to %d rows for %s", len(rows), security_id)
+                    except Exception as _conv_exc:
+                        log.warning("historical_daily: dict-of-arrays conversion failed: %s", _conv_exc)
+                        rows = []
                 if rows and isinstance(rows, list):
                     return rows[-days:]
             except Exception as exc:
-                log.warning("historical_daily DhanHQ call failed for %s: %s — using get_candles fallback", security_id, exc)
+                log.warning("historical_daily DhanHQ call failed for %s: %s — trying yfinance", security_id, exc)
 
-        return await self.get_candles(
-            security_id, interval="1",
-            from_date=from_d.isoformat(), to_date=to_d.isoformat(),
-            symbol=symbol,
-        )
+        # Fallback: yfinance daily candles (always available, reliable pre-market)
+        if symbol:
+            try:
+                ticker_sym = f"{symbol}.NS"
+                ticker = yf.Ticker(ticker_sym)
+                df = ticker.history(
+                    start=from_d.isoformat(), end=to_d.isoformat(), interval="1d"
+                )
+                if not df.empty:
+                    yf_rows = [
+                        {
+                            "time":   ts.strftime("%Y-%m-%d"),
+                            "open":   float(row["Open"]),
+                            "high":   float(row["High"]),
+                            "low":    float(row["Low"]),
+                            "close":  float(row["Close"]),
+                            "volume": float(row["Volume"]),
+                        }
+                        for ts, row in df.iterrows()
+                    ]
+                    log.debug("historical_daily: yfinance returned %d daily rows for %s", len(yf_rows), symbol)
+                    return yf_rows[-days:]
+            except Exception as yf_exc:
+                log.warning("historical_daily: yfinance fallback failed for %s: %s", symbol, yf_exc)
+
+        return []
 
     # ── Option chain ──────────────────────────────────────────────────────────
 

@@ -193,20 +193,21 @@ _SCANNER_FETCH_CONCURRENCY = 8
 
 async def _fetch_volume_and_price_data(symbols: dict[str, str]) -> list[dict[str, Any]]:
     """
-    Fetch previous-day candles for all symbols in the pool, in parallel
+    Fetch 30 daily candles for all symbols in the pool, in parallel
     (bounded by `_SCANNER_FETCH_CONCURRENCY`). Computes volume ratio and
     price change for each surviving symbol.
+
+    Uses daily candles (not 1-min intraday) so this works pre-market at 08:45
+    IST when today's intraday session hasn't started yet.
     """
     from yukti.execution.dhan_client import dhan
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     sem = asyncio.Semaphore(_SCANNER_FETCH_CONCURRENCY)
 
     async def _fetch_one(symbol: str, sec_id: str) -> dict[str, Any] | None:
         async with sem:
             try:
-                raw = await dhan.get_candles(sec_id, "1", start, today)
+                raw = await dhan.historical_daily(sec_id, days=30, symbol=symbol)
             except Exception as exc:
                 log.warning("Scanner: failed to fetch %s: %s", symbol, exc)
                 return None
