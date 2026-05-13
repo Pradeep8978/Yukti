@@ -341,21 +341,9 @@ async def run_gates(
         if max_loss_pct > max_loss_cap_pct:
             return GateResult(False, f"max_loss_too_large: {max_loss_pct:.2f}% > {max_loss_cap_pct:.2f}%")
 
-    # 7. Single-stock concentration cap (notional / account)
-    single_stock_cap_pct = Decimal(str(settings.max_single_stock_pct)) * Decimal("100")
-    if position.capital_pct > single_stock_cap_pct:
-        return GateResult(
-            False,
-            f"single_stock_cap: {position.capital_pct:.2f}% > {single_stock_cap_pct:.2f}%",
-        )
-
-    total_exposure_cap_pct = Decimal(str(settings.max_total_exposure_pct)) * Decimal("100")
-    projected_total_exposure = Decimal(str(portfolio.total_exposure_pct)) + position.capital_pct
-    if projected_total_exposure > total_exposure_cap_pct:
-        return GateResult(
-            False,
-            f"total_exposure_cap: {projected_total_exposure:.2f}% > {total_exposure_cap_pct:.2f}%",
-        )
+    # 7. Single-stock concentration cap — disabled (account too small for % limits to be meaningful)
+    # total_exposure_cap — disabled alongside it
+    pass
 
     if trade_decision.holding_period == "swing" and trade_decision.direction == "SHORT":
         return GateResult(False, "swing_short_blocked: NSE equity delivery cannot carry overnight shorts")

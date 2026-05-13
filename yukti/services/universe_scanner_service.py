@@ -239,6 +239,7 @@ async def _fetch_volume_and_price_data(symbols: dict[str, str]) -> list[dict[str
             "has_catalyst": False,
             "sector_in_play": False,
             "avg_turnover_cr": float(avg_turnover),
+            "close_price": float(df["close"].iloc[-1]),
         }
 
     results = await asyncio.gather(
@@ -523,6 +524,25 @@ class UniverseScannerService:
         except Exception as exc:
             log.debug("Regime compute skipped: %s", exc)
             effective_pick = settings.scanner_pick_count
+
+        # Affordability filter: drop stocks where 1 share margin > live account.
+        # Runs before select so unaffordable stocks never enter the universe.
+        try:
+            from yukti.services.balance_service import fetch_available_balance
+            _acct = await fetch_available_balance()
+        except Exception:
+            _acct = settings.account_value
+        _lev = settings.intraday_leverage
+        before = len(candidates)
+        candidates = [
+            c for c in candidates
+            if c.get("pinned")  # always keep pinned watchlist entries
+            or not c.get("close_price")  # no price info — let scan decide
+            or (c["close_price"] / _lev) <= _acct
+        ]
+        dropped = before - len(candidates)
+        if dropped:
+            log.info("UniverseScanner: dropped %d unaffordable symbols (account ₹%.0f, leverage %.0fx)", dropped, _acct, _lev)
 
         selected = _select_universe(
             candidates,

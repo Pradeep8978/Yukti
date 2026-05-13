@@ -288,6 +288,16 @@ class MarketScanService:
                     (snap.close - snap.bb_lower) / max(snap.bb_upper - snap.bb_lower, 0.01) * 100,
                 )
 
+                # ── Affordability pre-filter: skip before AI if we can't buy 1 share ──
+                _margin_per_share = snap.close / settings.intraday_leverage
+                if _margin_per_share > live_account_value:
+                    record_skip("unaffordable")
+                    log.info(
+                        "SKIP %s | unaffordable: margin/share ₹%.0f > account ₹%.0f",
+                        symbol, _margin_per_share, live_account_value,
+                    )
+                    return
+
                 # ── Daily candles (new — multi-timeframe) ─────────────
                 snap_daily = None
                 daily_df = await self._get_daily_candles(symbol, security_id)

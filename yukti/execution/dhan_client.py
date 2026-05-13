@@ -239,7 +239,8 @@ class DhanClient:
         if idempotency_key is None:
             idempotency_key = uuid.uuid4().hex
 
-        tag_value = f"{tag}|id={idempotency_key}" if tag else f"id={idempotency_key}"
+        # DhanHQ correlationId max length is 20 characters — use first 16 chars of UUID
+        tag_value = idempotency_key[:16]
 
         attempts = 3
         last_exc: Exception | None = None
