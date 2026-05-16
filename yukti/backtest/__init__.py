@@ -115,7 +115,10 @@ class PaperBroker:
                         pos.quantity = max(0, pos.quantity - partial_qty)
                         # Credit realized PnL to account value immediately
                         self.account_value += realized
-                        log.debug("Partial exit %s qty=%d at ₹%.2f realized=%.2f", symbol, partial_qty, pos.target_1, realized)
+                        # Move remaining runner stop to breakeven (entry) to lock gains
+                        if pos.quantity > 0:
+                            pos.stop_loss = pos.entry_price
+                        log.debug("Partial exit %s qty=%d at ₹%.2f realized=%.2f; runner_qty=%d stop moved to ₹%.2f", symbol, partial_qty, pos.target_1, realized, pos.quantity, pos.stop_loss)
                         # If after partial exit there's no runner left, finalize
                         if pos.quantity == 0:
                             self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
