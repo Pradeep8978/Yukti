@@ -50,8 +50,11 @@ class MarketScanService:
         # pass the MAX_OPEN_POSITIONS gate and double-enter the same cycle.
         self._open_lock = asyncio.Lock()
 
-    async def _get_cycle_universe(self) -> list[tuple[str, str]]:
-        """Return the full shortlisted universe for scanning every cycle.
+    async def _get_cycle_universe(self) -> tuple[list[tuple[str, str]], dict]:
+        """Return the full shortlisted universe and current positions for one cycle.
+
+        Positions are fetched once here and passed through to each _scan_symbol
+        call to avoid redundant Redis reads across the concurrent tasks.
 
         Open positions are always first so existing trades are monitored before
         new entries are considered. The semaphore (max_concurrent) already caps
@@ -90,23 +93,31 @@ class MarketScanService:
             if symbol not in seen_symbols:
                 selected.append((symbol, security_id))
 
-        return selected
+        return selected, positions
 
     async def run_single_scan(self) -> None:
         """Run one complete scan cycle (for paper mode)."""
         log.info("MarketScanService: starting single scan cycle")
 
+        if await is_halted():
+            log.info("MarketScanService: halted, skipping scan")
+            return
+
         macro = await self._get_macro_context()
         perf = await get_performance_state()
         live_account_value = await fetch_available_balance()
 
-        cycle_universe = await self._get_cycle_universe()
+        cycle_universe, cached_positions = await self._get_cycle_universe()
 
-        for symbol, security_id in cycle_universe:
-            if await is_halted():
-                log.info("MarketScanService: halted, stopping scan")
-                break
-            await self._scan_symbol(symbol, security_id, macro, perf, live_account_value)
+        tasks = [
+            self._scan_symbol(symbol, security_id, macro, perf, live_account_value, cached_positions)
+            for symbol, security_id in cycle_universe
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for (sym, _), result in zip(cycle_universe, results):
+            if isinstance(result, Exception):
+                scan_failures.labels(symbol=sym).inc()
+                log.error("MarketScanService: scan failed for %s: %s", sym, result, exc_info=result)
 
         log.info("MarketScanService: single scan cycle complete")
 
@@ -130,10 +141,10 @@ class MarketScanService:
                 macro = await self._get_macro_context()
                 perf = await get_performance_state()
                 live_account_value = await fetch_available_balance()
-                cycle_universe = await self._get_cycle_universe()
+                cycle_universe, cached_positions = await self._get_cycle_universe()
 
                 tasks = [
-                    self._scan_symbol(symbol, security_id, macro, perf, live_account_value)
+                    self._scan_symbol(symbol, security_id, macro, perf, live_account_value, cached_positions)
                     for symbol, security_id in cycle_universe
                 ]
                 symbols_list = [symbol for symbol, _ in cycle_universe]
@@ -252,19 +263,67 @@ class MarketScanService:
             log.warning("Failed to fetch daily candles for %s: %s", symbol, exc)
             return None
 
-    async def _scan_symbol(self, symbol: str, security_id: str, macro: MacroContext, perf: dict, live_account_value: float = 0.0) -> None:
+    async def _scan_symbol(
+        self,
+        symbol: str,
+        security_id: str,
+        macro: MacroContext,
+        perf: dict,
+        live_account_value: float = 0.0,
+        cached_positions: dict | None = None,
+    ) -> None:
         """Scan one symbol with daily + 5-min multi-timeframe analysis."""
         async with self.sem:
             signals_scanned.inc()
             log.info("MarketScanService: scanning %s", symbol)
             try:
                 broker = get_broker()
-                # ── 5-min candles (existing) ──────────────────────────
                 now_ist = datetime.now(KOLKATA)
+                current_time = now_ist.time()
+
+                # ── Early exits (no candle fetch needed) ──────────────
+                if not is_trading_day() or not is_trading_hours():
+                    record_skip("outside_trading_hours")
+                    return
+
+                eod_h, eod_m = (int(p) for p in settings.eod_squareoff.split(":"))
+                _eod_dt = now_ist.replace(hour=eod_h, minute=eod_m, second=0, microsecond=0)
+                _entry_cutoff = (_eod_dt - timedelta(minutes=20)).time()
+                if current_time >= _entry_cutoff:
+                    record_skip("too_close_to_eod")
+                    return
+
+                if await is_halted() or await is_market_halted():
+                    record_skip("market_halted_preai")
+                    return
+
+                if await is_on_cooldown(symbol):
+                    record_skip("cooldown_preai")
+                    return
+
+                # Fetch daily_pnl + open_pos_count once; reuse for Portfolio below.
+                daily_pnl, open_pos_count = await asyncio.gather(
+                    get_daily_pnl_pct(),
+                    count_open_positions(),
+                )
+                if daily_pnl <= -(settings.daily_loss_limit_pct * 100):
+                    record_skip("daily_loss_limit_preai")
+                    return
+
+                if open_pos_count >= settings.max_open_positions:
+                    record_skip("max_positions_preai")
+                    return
+
+                # ── 5-min + daily candles fetched in parallel ─────────
                 today = now_ist.strftime("%Y-%m-%d")
                 start = (now_ist - timedelta(days=3)).strftime("%Y-%m-%d")
-                raw = await broker.get_candles(security_id, 5, start, today, symbol=symbol)
-                if not raw or len(raw) < 60:
+                raw, daily_df = await asyncio.gather(
+                    broker.get_candles(security_id, 5, start, today, symbol=symbol),
+                    self._get_daily_candles(symbol, security_id),
+                    return_exceptions=True,
+                )
+
+                if isinstance(raw, Exception) or not raw or len(raw) < 60:
                     return
 
                 df = pd.DataFrame(raw, columns=["time","open","high","low","close","volume"])
@@ -284,7 +343,7 @@ class MarketScanService:
                     (snap.close - snap.bb_lower) / max(snap.bb_upper - snap.bb_lower, 0.01) * 100,
                 )
 
-                # ── Affordability pre-filter: skip before AI if we can't buy 1 share ──
+                # ── Affordability pre-filter ──────────────────────────
                 _margin_per_share = snap.close / settings.intraday_leverage
                 if _margin_per_share > live_account_value:
                     record_skip("unaffordable")
@@ -294,17 +353,15 @@ class MarketScanService:
                     )
                     return
 
-                # ── Daily candles (new — multi-timeframe) ─────────────
+                # ── Daily snap ────────────────────────────────────────
                 snap_daily = None
-                daily_df = await self._get_daily_candles(symbol, security_id)
-                if daily_df is not None and len(daily_df) >= 20:
+                if not isinstance(daily_df, Exception) and daily_df is not None and len(daily_df) >= 20:
                     snap_daily = compute(daily_df, timeframe="daily")
 
-                # ── Current time for time-gating ──────────────────────
-                current_time = now_ist.time()
+                # ── Today's intraday candles for time-gated patterns ──
                 today_df = df[df.index.date == now_ist.date()]
                 # >= 1 so gap_go can run at 09:20 (only 1 candle available).
-                # Patterns that need more bars (ORB needs 3, VWAP needs 3) guard internally.
+                # Patterns that need more bars (ORB, VWAP) guard internally.
                 pattern_df = today_df if len(today_df) >= 1 else None
 
                 # ── ORB levels (from first 3 candles of today) ────────
@@ -314,30 +371,16 @@ class MarketScanService:
                     or_high = float(or_candles["high"].max())
                     or_low = float(or_candles["low"].min())
 
-                # ── Pattern detection (updated with multi-timeframe) ──
+                # ── Pattern detection ─────────────────────────────────
                 pattern = best_pattern(snap, candles=pattern_df, indicators_daily=snap_daily, current_time=current_time)
 
-                # ── Pre-AI filter: skip expensive AI call when signal is absent ──
                 if pattern is None:
                     log.info("PATTERN %s | no signal (trend=%s rsi=%.1f vol_ratio=%.2fx)", symbol, snap.trend, snap.rsi, snap.volume_ratio)
                     record_skip("no_pattern")
                     return
                 log.info("PATTERN %s | %s strength=%.2f | %s", symbol, pattern.pattern_type, pattern.strength, pattern.notes)
 
-                if await is_halted() or await is_market_halted():
-                    record_skip("market_halted_preai")
-                    return
-
-                _daily_pnl = await get_daily_pnl_pct()
-                if _daily_pnl <= -(settings.daily_loss_limit_pct * 100):
-                    record_skip("daily_loss_limit_preai")
-                    return
-
-                if await is_on_cooldown(symbol):
-                    record_skip("cooldown_preai")
-                    return
-
-                # ── Liquidity gate: skip illiquid symbols before AI call ───
+                # ── Liquidity gate ────────────────────────────────────
                 # Fail-open: depth API errors never block a trade.
                 try:
                     depth = await broker.get_market_depth(security_id)
@@ -356,20 +399,6 @@ class MarketScanService:
                             return
                 except Exception:
                     pass
-
-                if not is_trading_day() or not is_trading_hours():
-                    record_skip("outside_trading_hours")
-                    log.info("MarketScanService: skipping decision for %s outside trading hours", symbol)
-                    return
-
-                # Block new entries < 20 min before EOD squareoff
-                # A trade at 14:56 has only 19 minutes before forced close — not enough.
-                eod_h, eod_m = (int(p) for p in settings.eod_squareoff.split(":"))
-                _eod_dt = now_ist.replace(hour=eod_h, minute=eod_m, second=0, microsecond=0)
-                _entry_cutoff = (_eod_dt - timedelta(minutes=20)).time()
-                if current_time >= _entry_cutoff:
-                    record_skip("too_close_to_eod")
-                    return
 
                 if not settings.use_ai_decision:
                     # ── Rules engine path (no API calls) ─────────────
@@ -417,8 +446,7 @@ class MarketScanService:
                     reasoning_excerpt or "-",
                 )
 
-                # Persist every AI decision for audit and quality analysis.
-                # Best-effort — a DB failure must never block a trade.
+                # Persist every decision for audit. Best-effort — DB failure must not block a trade.
                 try:
                     from yukti.data.database import get_db
                     from yukti.data.models import DecisionLog
@@ -448,13 +476,13 @@ class MarketScanService:
                     decision.target_2 = decision.target_2 or levels.target_2
                     decision.risk_reward = decision.risk_reward or levels.risk_reward
 
-                # Guard: zero balance means no funds available — skip sizing
                 if live_account_value == 0:
                     record_skip("zero_balance")
                     return
 
-                # Compute total exposure as margin-adjusted sum (notional / leverage per position)
-                all_positions = await get_all_positions()
+                # Use cached positions (fetched once in _get_cycle_universe) for exposure math.
+                # Slightly stale is fine — _open_lock is the final position-count guard.
+                all_positions = cached_positions if cached_positions is not None else await get_all_positions()
                 total_notional = 0.0
                 for p in all_positions.values():
                     try:
@@ -486,8 +514,8 @@ class MarketScanService:
 
                 portfolio = Portfolio(
                     account_value=live_account_value,
-                    open_positions=await count_open_positions(),
-                    daily_pnl_pct=await get_daily_pnl_pct(),
+                    open_positions=open_pos_count,       # reuse early-fetched count
+                    daily_pnl_pct=daily_pnl,             # reuse early-fetched pnl
                     total_exposure_pct=total_exposure_pct,
                     trades_today=int(perf.get("trades_today", 0) or 0),
                     min_conviction_override=regime_min_conviction,
