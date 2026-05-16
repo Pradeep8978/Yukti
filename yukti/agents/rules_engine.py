@@ -162,8 +162,10 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         return _skip("rsi_oversold_blocks_short", conviction=2, bias=market_bias, symbol=symbol)
     if direction == "LONG" and snap.rsi_overbought():
         return _skip("rsi_overbought_blocks_long", conviction=2, bias=market_bias, symbol=symbol)
-    if snap.volume_ratio < 1.0:
-        return _skip("volume_ratio_below_1_0", conviction=2, bias=market_bias, symbol=symbol)
+    # Soft volume handling: rather than a hard skip at <1.0, treat low volume as
+    # a conviction penalty. Extremely low volume (<0.5×) remains a hard skip.
+    if snap.volume_ratio < 0.5:
+        return _skip("volume_ratio_below_0_5", conviction=2, bias=market_bias, symbol=symbol)
 
     # ── Step 4: Conviction scoring ─────────────────────────────────────
     score = _Score()
@@ -258,14 +260,13 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         ema_confirmed = True
         score.adjust(+1, "below_ema20")
 
-    confirmation_count = sum((trend_confirmed, vwap_confirmed, macd_confirmed, ema_confirmed))
-    if confirmation_count < 3:
-        return _skip(
-            f"confirmation_count_{confirmation_count}_below_3",
-            conviction=score.clamp(),
-            bias=market_bias,
-            symbol=symbol,
-        )
+    # Require trend alignment plus at least one momentum/structure vote.
+    # This replaces the previous 3-of-4 confirmation gate which counted
+    # correlated votes and could be overly strict.
+    if not trend_confirmed:
+        return _skip("trend_not_confirmed", conviction=score.clamp(), bias=market_bias, symbol=symbol)
+    if not (macd_confirmed or ema_confirmed or vwap_confirmed):
+        return _skip("no_momentum_or_structure_confirmation", conviction=score.clamp(), bias=market_bias, symbol=symbol)
 
     # Elevated VIX — markets are nervous, reduce conviction (not a hard stop below 30)
     if india_vix is not None and india_vix >= 20:
