@@ -151,6 +151,31 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     else:
         market_bias = "NEUTRAL"
 
+    # Hard trend-alignment gates for daily timeframe.
+    # momentum (LONG) relies on price being above recent average — unreliable
+    # in a confirmed daily downtrend. Require daily UPTREND or SIDEWAYS.
+    # trend_pullback_short has a very poor historical win rate; block unless
+    # daily trend confirms the short direction.
+    if snap_daily is not None:
+        daily_trend = getattr(snap_daily, "trend", None)
+        if direction == "LONG" and pattern.pattern_type == "momentum" and daily_trend == "DOWNTREND":
+            return _skip("momentum_long_blocked_in_downtrend", conviction=2, bias=market_bias, symbol=symbol)
+        if pattern.pattern_type == "trend_pullback_short" and daily_trend != "DOWNTREND":
+            return _skip("trend_pullback_short_needs_downtrend", conviction=2, bias=market_bias, symbol=symbol)
+
+    # On daily timeframe, skip low-edge setups that historically underperform:
+    # - momentum LONG: fires too broadly, loses in sideways/down markets
+    # - trend_pullback_short: poor win rate across regimes
+    # - breakout LONG: 28% WR on daily, false breakouts dominate
+    is_daily_tf = getattr(snap, "timeframe", "5m") == "daily"
+    if is_daily_tf:
+        if pattern.pattern_type == "momentum" and direction == "LONG":
+            return _skip("momentum_long_blocked_daily", conviction=2, bias=market_bias, symbol=symbol)
+        if pattern.pattern_type == "trend_pullback_short":
+            return _skip("trend_pullback_short_blocked_daily", conviction=2, bias=market_bias, symbol=symbol)
+        if pattern.pattern_type == "breakout":
+            return _skip("breakout_blocked_daily", conviction=2, bias=market_bias, symbol=symbol)
+
     # ── Step 3: Hard gates (VIX + RSI) ────────────────────────────────
     india_vix = getattr(macro, "india_vix", None)
     if india_vix is not None and india_vix >= 30:
