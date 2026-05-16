@@ -100,15 +100,50 @@ class PaperBroker:
             low  = lows.get(symbol, close)
 
             if pos.direction == "LONG":
+                # Stop loss check (assume stop fires before targets on same bar)
                 if low <= pos.stop_loss:
                     self._close_position(symbol, pos.stop_loss * (1 - self.slippage_pct), "stop_loss_hit", current_time)
+                # Target 1: partial exit
                 elif high >= pos.target_1:
-                    self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
+                    # If partial hasn't been taken yet, take a partial exit
+                    if getattr(pos, 'partial_exit_price', 0.0) <= 0.0 and pos.target_1 is not None:
+                        partial_qty = max(1, int((pos.original_quantity or pos.quantity) // 2))
+                        realized = (pos.target_1 - pos.entry_price) * partial_qty
+                        pos.partial_exit_price = pos.target_1
+                        pos.partial_exit_qty = partial_qty
+                        pos.partial_pnl += realized
+                        pos.quantity = max(0, pos.quantity - partial_qty)
+                        # Credit realized PnL to account value immediately
+                        self.account_value += realized
+                        log.debug("Partial exit %s qty=%d at ₹%.2f realized=%.2f", symbol, partial_qty, pos.target_1, realized)
+                        # If after partial exit there's no runner left, finalize
+                        if pos.quantity == 0:
+                            self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
+                    else:
+                        # If partial already taken and runner exists, ignore (T2 handles final)
+                        pass
+                # Target 2: close remaining runner
+                elif pos.target_2 is not None and high >= pos.target_2 and pos.quantity > 0:
+                    self._close_position(symbol, pos.target_2, "target_2_hit", current_time)
             else:  # SHORT
                 if high >= pos.stop_loss:
                     self._close_position(symbol, pos.stop_loss * (1 + self.slippage_pct), "stop_loss_hit", current_time)
                 elif low <= pos.target_1:
-                    self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
+                    if getattr(pos, 'partial_exit_price', 0.0) <= 0.0 and pos.target_1 is not None:
+                        partial_qty = max(1, int((pos.original_quantity or pos.quantity) // 2))
+                        realized = (pos.entry_price - pos.target_1) * partial_qty
+                        pos.partial_exit_price = pos.target_1
+                        pos.partial_exit_qty = partial_qty
+                        pos.partial_pnl += realized
+                        pos.quantity = max(0, pos.quantity - partial_qty)
+                        self.account_value += realized
+                        log.debug("Partial exit SHORT %s qty=%d at ₹%.2f realized=%.2f", symbol, partial_qty, pos.target_1, realized)
+                        if pos.quantity == 0:
+                            self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
+                    else:
+                        pass
+                elif pos.target_2 is not None and low <= pos.target_2 and pos.quantity > 0:
+                    self._close_position(symbol, pos.target_2, "target_2_hit", current_time)
 
     def _close_position(self, symbol: str, exit_price: float, reason: str, exit_time: datetime | None = None) -> None:
         pos = self.positions.pop(symbol, None)

@@ -115,14 +115,16 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     if daily_pnl <= -2.0:
         return _skip("daily_loss_limit_hit", conviction=1, symbol=symbol)
 
-    # Minimum conviction gate (tightens under adverse conditions)
-    min_conviction = max(settings.min_conviction, 7)
+    # Minimum conviction gate
+    # Use configured min_conviction directly rather than silently enforcing a
+    # hard floor of 7. This allows ops to calibrate conviction per config.
+    min_conviction = settings.min_conviction
     if consec_losses >= 3:
-        min_conviction = 9
+        min_conviction = max(min_conviction, 9)
     elif win_rate < 0.40:
-        min_conviction = 9
+        min_conviction = max(min_conviction, 9)
     elif daily_pnl >= 3.0:
-        min_conviction = 8
+        min_conviction = max(min_conviction, 8)
 
     # ── Step 1: Pattern required ───────────────────────────────────────
     if pattern is None or not pattern.detected:
