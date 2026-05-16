@@ -51,10 +51,11 @@ class MarketScanService:
         self._open_lock = asyncio.Lock()
 
     async def _get_cycle_universe(self) -> list[tuple[str, str]]:
-        """Limit each AI scan cycle to a small deterministic shortlist.
+        """Return the full shortlisted universe for scanning every cycle.
 
-        Open positions are always included first, then the remaining scanned
-        universe is filled in score order until max_symbols_per_scan_cycle.
+        Open positions are always first so existing trades are monitored before
+        new entries are considered. The semaphore (max_concurrent) already caps
+        parallel broker calls — no need to rotate a subset across cycles.
 
         Re-reads Redis each cycle so universe updates from scheduler jobs
         (job_universe_scan, job_universe_refresh) take effect without a restart.
@@ -74,9 +75,9 @@ class MarketScanService:
             log.debug("_get_cycle_universe: Redis re-read failed: %s", _exc)
 
         universe_items = list(self.universe.items())
-        max_symbols = max(1, min(settings.max_symbols_per_scan_cycle, len(universe_items)))
-
         positions = await get_all_positions()
+
+        # Open positions first, then the rest in universe order
         selected: list[tuple[str, str]] = []
         seen_symbols: set[str] = set()
 
@@ -84,15 +85,10 @@ class MarketScanService:
             if symbol in positions and symbol not in seen_symbols:
                 selected.append((symbol, security_id))
                 seen_symbols.add(symbol)
-                if len(selected) >= max_symbols:
-                    return selected
 
         for symbol, security_id in universe_items:
-            if symbol in seen_symbols:
-                continue
-            selected.append((symbol, security_id))
-            if len(selected) >= max_symbols:
-                break
+            if symbol not in seen_symbols:
+                selected.append((symbol, security_id))
 
         return selected
 

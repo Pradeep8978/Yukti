@@ -269,6 +269,15 @@ def orb_breakout(
     or_low = float(or_candles["low"].min())
     or_mid = (or_high + or_low) / 2
 
+    # Gap filter: large opening gaps (>1.5%) signal gap-and-reverse days where
+    # the OR is faked out — price breaks out then immediately reverses into the gap.
+    # Use yesterday's daily close (indicators_daily.prev_close) vs today's first open.
+    if indicators_daily is not None and indicators_daily.prev_close > 0:
+        today_open = float(or_candles.iloc[0]["open"])
+        gap_pct = abs(today_open - indicators_daily.prev_close) / indicators_daily.prev_close
+        if gap_pct > 0.015:
+            return PatternSignal(False, "orb_breakout", 0.0, "")
+
     # Determine direction
     long_break = snap.close > or_high
     short_break = snap.close < or_low
@@ -281,7 +290,7 @@ def orb_breakout(
 
     if long_break:
         vol_ok = snap.volume_ratio >= 1.5
-        rsi_ok = 50 <= snap.rsi <= 70
+        rsi_ok = 45 <= snap.rsi <= 70   # widened from 50–70: catches early breakouts
         daily_ok = daily_trend != "DOWNTREND"
         if not vol_ok or not rsi_ok or not daily_ok:
             return PatternSignal(False, "orb_breakout", 0.0, "")
@@ -306,7 +315,7 @@ def orb_breakout(
 
     if short_break:
         vol_ok = snap.volume_ratio >= 1.5
-        rsi_ok = 30 <= snap.rsi <= 50
+        rsi_ok = 30 <= snap.rsi <= 55   # widened from 30–50: covers post-breakdown momentum
         daily_ok = daily_trend != "UPTREND"
         if not vol_ok or not rsi_ok or not daily_ok:
             return PatternSignal(False, "orb_breakout", 0.0, "")
@@ -368,6 +377,10 @@ def vwap_bounce(
         vol_ok = snap.volume_ratio > 1.0
         macd_improving = snap.macd_hist > 0 or snap.macd_bull
 
+        # Hard daily-trend filter: don't fade an established downtrend
+        if daily_trend == "DOWNTREND":
+            return PatternSignal(False, "vwap_bounce", 0.0, "")
+
         if uptrend and rsi_ok and vol_ok and macd_improving:
             strength = 0.5
             if daily_trend == "UPTREND":
@@ -394,6 +407,10 @@ def vwap_bounce(
         rsi_ok = 40 <= snap.rsi <= 60
         vol_ok = snap.volume_ratio > 1.0
         macd_declining = snap.macd_hist < 0 or not snap.macd_bull
+
+        # Hard daily-trend filter: don't fade an established uptrend
+        if daily_trend == "UPTREND":
+            return PatternSignal(False, "vwap_bounce", 0.0, "")
 
         if downtrend and rsi_ok and vol_ok and macd_declining:
             strength = 0.5

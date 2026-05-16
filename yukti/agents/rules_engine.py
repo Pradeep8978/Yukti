@@ -368,7 +368,10 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         # losses manageable. T1 at 1.5R = 1.8 ATR is achievable in 3-5 days.
         sl_mult = 1.5 if (atm_iv is not None and atm_iv > 25) else 1.2
     else:
-        sl_mult = 2.0 if (atm_iv is not None and atm_iv > 25) else 1.5
+        # Intraday: tighter SL so T1 is reachable within the session.
+        # 1.5×ATR SL → T1 at 3×ATR was unreachable on 5m charts (needed ~3% move).
+        # 1.0×ATR SL → T1 at 1.5×ATR = achievable in a normal trending session.
+        sl_mult = 1.5 if (atm_iv is not None and atm_iv > 25) else 1.0
 
     if direction == "LONG":
         sl         = max(entry - sl_mult * atr, snap.nearest_swing_low * 0.995)
@@ -391,8 +394,10 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         t1_r = 1.2
         t2_r = 2.0
     else:
-        t1_r = 2.0
-        t2_r = 3.0
+        # Intraday: T1 at 1.5R (was 2R) so break-even WR drops from ~37% to ~30%.
+        # T2 at 2.5R keeps the runner meaningful without requiring extreme moves.
+        t1_r = 1.5
+        t2_r = 2.5
     if direction == "LONG":
         t1 = entry + t1_r * stop_dist
         t2 = entry + t2_r * stop_dist

@@ -66,10 +66,17 @@ class PaperBroker:
     GTT orders trigger when price crosses the trigger level.
     """
 
-    def __init__(self, account_value: float = 500_000.0, slippage_pct: float = 0.001) -> None:
+    # NSE intraday round-trip transaction cost estimate:
+    #   STT 0.025% (sell side only) + exchange fees ~0.004% + brokerage ~0.004%
+    #   ≈ 0.033% per trade, applied as a flat deduction on close.
+    TRANSACTION_COST_PCT: float = 0.00033
+
+    def __init__(self, account_value: float = 500_000.0, slippage_pct: float = 0.002) -> None:
         self.initial_account_value = account_value
         self.account_value  = account_value
-        self.slippage_pct   = slippage_pct          # 0.1% default slippage
+        # 0.2% slippage: covers bid-ask spread (0.15-0.4% on NSE mid-caps) for
+        # market orders (SL-M, EOD squareoff). Limit entries/targets are exempt.
+        self.slippage_pct   = slippage_pct
         self.positions:     dict[str, SimPosition] = {}
         self.closed_trades: list[SimPosition]      = []
         self.order_counter  = 0
@@ -176,18 +183,31 @@ class PaperBroker:
         if not pos:
             return
         is_long = pos.direction == "LONG"
+
+        # EOD squareoff is a market order — apply slippage.
+        # Limit targets (T1/T2) fill at the trigger price; no adverse slippage.
+        if reason == "eod_squareoff":
+            exit_price = exit_price * (1 - self.slippage_pct) if is_long \
+                else exit_price * (1 + self.slippage_pct)
+
         runner_pnl = (exit_price - pos.entry_price) * pos.quantity if is_long \
             else (pos.entry_price - exit_price) * pos.quantity
+
+        # Deduct NSE transaction costs (STT + exchange fees + brokerage) on close.
+        # Applied per-trade on full original notional to match how NSE charges work.
+        denom_qty = pos.original_quantity if pos.original_quantity > 0 else pos.quantity
+        notional = pos.entry_price * max(denom_qty, 1)
+        transaction_cost = notional * self.TRANSACTION_COST_PCT
+
         pos.exit_price  = exit_price
         pos.exit_reason = reason
-        pos.pnl         = runner_pnl + pos.partial_pnl
+        pos.pnl         = runner_pnl + pos.partial_pnl - transaction_cost
         # pnl_pct is computed against the *original* exposure so partial-exit
         # winners show a comparable % regardless of how the position was scaled.
-        denom_qty = pos.original_quantity if pos.original_quantity > 0 else pos.quantity
-        pos.pnl_pct     = pos.pnl / (pos.entry_price * max(denom_qty, 1)) * 100
+        pos.pnl_pct     = pos.pnl / notional * 100
         pos.exit_time   = exit_time
         pos.status      = "CLOSED"
-        self.account_value += runner_pnl
+        self.account_value += runner_pnl - transaction_cost
         self.closed_trades.append(pos)
         log.debug("Paper closed: %s %s P&L=%.1f%%", symbol, reason, pos.pnl_pct)
 
@@ -205,12 +225,14 @@ class PaperBroker:
         tag: str = "",
     ) -> dict[str, Any]:
         self.order_counter += 1
-        # Simulate fill at price + slippage
         fill_price = price if price > 0 else self._current_prices.get(security_id, price)
-        if transaction_type == "BUY":
-            fill_price *= (1 + self.slippage_pct)
-        else:
-            fill_price *= (1 - self.slippage_pct)
+        # LIMIT entries fill at the limit price (no adverse slippage — price must
+        # come to us). MARKET orders pay the spread.
+        if order_type == "MARKET":
+            if transaction_type == "BUY":
+                fill_price *= (1 + self.slippage_pct)
+            else:
+                fill_price *= (1 - self.slippage_pct)
 
         return {
             "orderId": f"SIM-{self.order_counter:06d}",
@@ -381,25 +403,39 @@ class BacktestEngine:
             )
 
             def _detect_pattern(snap, candles_today=None, current_time=None, snap_daily=None):
-                # Mirror the live scanner's coverage: include all 10 patterns,
-                # including momentum_short (which was previously missing and
-                # tilted the backtest LONG-heavy), and the intraday ORB / VWAP
-                # bounce patterns when we have intraday candles + a clock.
-                #
-                # On intraday (5m) bars, daily-calibrated patterns (momentum,
-                # breakout, trend_pullback) fire on market-open noise and cause
-                # near-instant stop-outs (empirically: 94% SL-hit rate, WR 33%).
-                # For intraday, restrict to ORB and VWAP-bounce only — patterns
-                # specifically designed for the intraday session structure.
                 if not is_daily:
-                    # Intraday: only ORB + VWAP bounce (need established intraday range)
-                    if candles_today is not None and current_time is not None:
-                        candidates = [
-                            orb_breakout(snap, candles_today, current_time, snap_daily),
-                            vwap_bounce(snap, candles_today, current_time, snap_daily),
-                        ]
-                    else:
+                    if candles_today is None or current_time is None:
                         return None
+                    # Base intraday set: ORB and VWAP bounce (session-aware patterns).
+                    # Reversal patterns added unconditionally — they have hard RSI gates
+                    # (RSI<36 for long, RSI>64 for short) so they only fire at genuine
+                    # extremes and are not noise-prone on 5m.
+                    candidates = [
+                        orb_breakout(snap, candles_today, current_time, snap_daily),
+                        vwap_bounce(snap, candles_today, current_time, snap_daily),
+                        reversal_long(snap),
+                        reversal_short(snap),
+                    ]
+                    # When the daily trend confirms a direction, unlock trend-following
+                    # patterns on that side only. Without daily confirmation these patterns
+                    # fire on market-open noise and produce near-instant stop-outs.
+                    # This is also the fix for "daily downtrend should generate shorts":
+                    # breakdown / momentum_short / trend_pullback_short are now active
+                    # whenever the daily trend is confirmed DOWNTREND.
+                    if snap_daily is not None:
+                        daily_trend = getattr(snap_daily, "trend", "SIDEWAYS")
+                        if daily_trend == "DOWNTREND":
+                            candidates.extend([
+                                breakdown(snap),
+                                momentum_short(snap),
+                                trend_pullback_short(snap),
+                            ])
+                        elif daily_trend == "UPTREND":
+                            candidates.extend([
+                                breakout(snap),
+                                momentum_long(snap),
+                                trend_pullback_long(snap),
+                            ])
                 else:
                     candidates = [
                         breakout(snap), breakdown(snap),
@@ -465,7 +501,9 @@ class BacktestEngine:
                     daily = df.resample('D').agg({
                         'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
                     }).dropna()
-                    if len(daily) < 60:
+                    # Lower threshold for intraday: 5m data window is shorter (~37
+                    # trading days) so 30 bars is enough for indicator warmup.
+                    if len(daily) < 30:
                         continue
                     full_indicators_daily[sym] = compute_full(daily, timeframe='daily')
                 except Exception:
