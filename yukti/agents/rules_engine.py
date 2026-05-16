@@ -209,19 +209,28 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     else:
         score.adjust(-1, "supertrend_misaligned")
 
-    # VWAP position — institutions use VWAP as reference; misalignment is a real headwind
-    if direction == "LONG":
-        if snap.above_vwap():
-            vwap_confirmed = True
-            score.adjust(+1, "above_vwap")
+    # VWAP position — institutions use VWAP as reference; misalignment is a real headwind.
+    # Only counts on timeframes where VWAP resets per session (intraday). On a
+    # daily series the computed VWAP is just cumulative-since-history-start
+    # and correlates with trend, so it adds noise rather than information.
+    if getattr(snap, "vwap_is_meaningful", lambda: True)():
+        if direction == "LONG":
+            if snap.above_vwap():
+                vwap_confirmed = True
+                score.adjust(+1, "above_vwap")
+            else:
+                score.adjust(-1, "below_vwap_long")
         else:
-            score.adjust(-1, "below_vwap_long")
+            if not snap.above_vwap():
+                vwap_confirmed = True
+                score.adjust(+1, "below_vwap")
+            else:
+                score.adjust(-1, "above_vwap_short")
     else:
-        if not snap.above_vwap():
-            vwap_confirmed = True
-            score.adjust(+1, "below_vwap")
-        else:
-            score.adjust(-1, "above_vwap_short")
+        # Treat the VWAP confirmation slot as neutral — neither a vote up nor
+        # a penalty. The remaining trend / MACD / EMA20 votes carry the
+        # alignment check.
+        vwap_confirmed = True
 
     # MACD direction — momentum confirmation bonus (no penalty: pattern already carries this)
     if direction == "LONG" and snap.macd_bull:

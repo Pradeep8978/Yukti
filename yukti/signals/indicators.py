@@ -63,11 +63,26 @@ class IndicatorSnapshot:
     daily_support:    float | None = None
     daily_resistance: float | None = None
 
+    # Tagged with the timeframe this snapshot was computed for so rules can
+    # decide which votes are meaningful (e.g. VWAP is intraday-resetting in
+    # live and on 5m candles, but degenerates to a cumulative-since-history-
+    # start average on daily — meaningless as an independent vote).
+    timeframe:        str = "5m"
+
     def above_vwap(self)   -> bool: return self.close > self.vwap
     def above_ema20(self)  -> bool: return self.close > self.ema20
     def above_ema50(self)  -> bool: return self.close > self.ema50
     def rsi_overbought(self) -> bool: return self.rsi > 70
     def rsi_oversold(self)   -> bool: return self.rsi < 30
+    def vwap_is_meaningful(self) -> bool:
+        """True when the VWAP value carries real information.
+
+        On daily timeframe pandas_ta.vwap returns None and we fall back to a
+        cumulative-since-history-start VWAP — that's just 'price vs long-run
+        average' and correlates with trend, so it shouldn't count as an
+        independent confirmation vote.
+        """
+        return self.timeframe != "daily"
 
 
 def compute_full(df: pd.DataFrame, timeframe: str = "5m") -> pd.DataFrame:
@@ -222,6 +237,7 @@ def snapshot_at(
         adx=adx_value,
         daily_support=daily_support_val,
         daily_resistance=daily_resistance_val,
+        timeframe=timeframe,
     )
 
 
@@ -388,4 +404,5 @@ def compute(df: pd.DataFrame, swing_lookback: int = 20, timeframe: str = "5m") -
         adx              = adx_value,
         daily_support    = daily_support_val,
         daily_resistance = daily_resistance_val,
+        timeframe        = timeframe,
     )
