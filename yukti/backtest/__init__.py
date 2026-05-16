@@ -198,12 +198,14 @@ class BacktestEngine:
         account_value:     float = 500_000.0,
         claude_sample_rate: float = 1.0,   # fraction of candles sent to AI (reduce to cut cost)
         use_rules_engine:  bool  = False,  # True → deterministic rules, no API calls
+        decision_start:    date | None = None,  # only open new trades on/after this date
     ) -> None:
         self.candles             = candles
         self.nifty_candles       = nifty_candles
         self.broker              = PaperBroker(account_value)
         self.claude_sample_rate  = claude_sample_rate
         self.use_rules_engine    = use_rules_engine
+        self.decision_start      = decision_start
         self._equity_curve:      list[dict] = []
         self._cooldowns:         dict[str, datetime] = {}
         self._closed_trades_seen = 0
@@ -287,7 +289,7 @@ class BacktestEngine:
 
     async def run(self) -> "BacktestReport":
         """Run the full backtest and return a report."""
-        from yukti.signals.indicators import compute
+        from yukti.signals.indicators import compute_full, snapshot_at
         from yukti.risk import Portfolio, calculate_position, calculate_levels, run_gates
 
         if self.use_rules_engine:
@@ -336,6 +338,20 @@ class BacktestEngine:
             tf_label,
         )
 
+        # Precompute indicators once per symbol on the full series.
+        # Avoids the O(n²) cost of running pandas_ta.supertrend (Python loop) on
+        # a growing slice for every (ts, symbol). Daily backtest with 220-day
+        # warmup × 50 symbols was ~3 min before this; now well under 10 sec.
+        full_indicators: dict[str, pd.DataFrame] = {}
+        tf_for_indicators = "daily" if is_daily else "5m"
+        for sym, df in self.candles.items():
+            if len(df) < 60:
+                continue
+            try:
+                full_indicators[sym] = compute_full(df, timeframe=tf_for_indicators)
+            except Exception as exc:
+                log.debug("precompute failed for %s: %s", sym, exc)
+
         for ts in all_dates:
             nifty_slice = self.nifty_candles.loc[:ts]
             if len(nifty_slice) < 50:
@@ -366,6 +382,11 @@ class BacktestEngine:
 
             self._register_new_cooldowns(ts, cycle_delta)
 
+            # Warmup pre-roll: feed indicator history but don't open new trades.
+            ts_date = ts.date() if hasattr(ts, "date") else None
+            if self.decision_start is not None and ts_date is not None and ts_date < self.decision_start:
+                continue
+
             for symbol in symbols:
                 if symbol in self.broker.positions:
                     continue
@@ -381,8 +402,11 @@ class BacktestEngine:
                     if random.random() > self.claude_sample_rate:
                         continue
 
+                full_df = full_indicators.get(symbol)
+                if full_df is None:
+                    continue
                 try:
-                    snap = compute(df, timeframe="daily" if is_daily else "5m")
+                    snap = snapshot_at(full_df, ts, timeframe=tf_for_indicators)
                 except Exception:
                     continue
 
@@ -613,6 +637,14 @@ async def _run_backtest(
     daily_intervals = {"D", "1D", "d", "1d", "day", "daily"}
     normalized_interval = "D" if candle_interval in daily_intervals else candle_interval
 
+    # Indicator warmup. 50-EMA needs ≥50 bars and the engine skips symbols with
+    # <60 bars; without pre-roll a 1-month daily backtest would produce zero
+    # trades because every symbol's slice has only ~22 candles.
+    # The engine still iterates only over candles inside [start, end] — the
+    # warmup tail is used purely to seed indicator state.
+    warmup_days = 220 if normalized_interval == "D" else 14
+    db_window_start = start_date - timedelta(days=warmup_days)
+
     # Load universe or use provided symbols
     if symbols:
         universe = symbols
@@ -630,7 +662,9 @@ async def _run_backtest(
         except Exception:
             universe = ["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK"]
 
-    # Load candles — try DB first, fall back to yfinance (daily) when DB is unreachable
+    # Load candles — try DB first, fall back to yfinance (daily) when DB is unreachable.
+    # The DB window includes warmup history (db_window_start..start_date) so
+    # indicators have enough lookback before the first decision bar.
     candles: dict[str, pd.DataFrame] = {}
     try:
         from yukti.data.database import create_all_tables, get_db
@@ -643,7 +677,7 @@ async def _run_backtest(
                         and_(
                             Candle.symbol == symbol,
                             Candle.interval == normalized_interval,
-                            sa_func.date(Candle.time) >= start_date,
+                            sa_func.date(Candle.time) >= db_window_start,
                             sa_func.date(Candle.time) <= end_date,
                         )
                     )
@@ -663,7 +697,6 @@ async def _run_backtest(
             import warnings
             import yfinance as yf
             warnings.filterwarnings("ignore")
-            from datetime import timedelta
             warmup_start = (
                 datetime.fromisoformat(start) - timedelta(days=180)
             ).strftime("%Y-%m-%d")
@@ -700,6 +733,7 @@ async def _run_backtest(
         account_value=settings.account_value,
         claude_sample_rate=sample_rate,
         use_rules_engine=use_rules_engine,
+        decision_start=start_date,
     )
     report = await engine.run()
     report.print_summary()
