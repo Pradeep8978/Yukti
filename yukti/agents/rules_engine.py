@@ -130,8 +130,8 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     if pattern is None or not pattern.detected:
         return _skip("no_pattern", symbol=symbol)
 
-    if pattern.strength < 0.70:
-        return _skip("pattern_strength_below_0_70", conviction=2, symbol=symbol)
+    if pattern.strength < 0.55:
+        return _skip("pattern_strength_below_0_55", conviction=2, symbol=symbol)
 
     if pattern.pattern_type in _LONG_PATTERNS:
         direction = "LONG"
@@ -331,9 +331,18 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     entry = snap.close
     atr   = snap.atr
 
+    # Detect timeframe from the snapshot to choose appropriate SL/target ratios.
+    # Daily candles need tighter stops and closer targets because they are held
+    # for a limited number of bars (1-2 weeks); intraday can afford wider ratios.
+    is_daily_tf = getattr(snap, "timeframe", "5m") == "daily"
+
     # Widen SL multiplier when options market shows elevated IV (system prompt rule)
     atm_iv = getattr(macro, "nifty_atm_iv", None)
-    sl_mult = 2.0 if (atm_iv is not None and atm_iv > 25) else 1.5
+    if is_daily_tf:
+        # Daily/swing: tighter SL so losses are smaller and targets reachable
+        sl_mult = 1.5 if (atm_iv is not None and atm_iv > 25) else 1.0
+    else:
+        sl_mult = 2.0 if (atm_iv is not None and atm_iv > 25) else 1.5
 
     if direction == "LONG":
         sl         = max(entry - sl_mult * atr, snap.nearest_swing_low * 0.995)
@@ -350,8 +359,14 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     if stop_dist <= 0:
         return _skip("zero_stop_distance", conviction=conviction, bias=market_bias, symbol=symbol)
 
-    t1_r = 2.0
-    t2_r = 3.0
+    # Daily targets must be reachable within a 1-2 week holding window.
+    # Intraday keeps the wider 2R/3R ratios for momentum plays.
+    if is_daily_tf:
+        t1_r = 1.5
+        t2_r = 2.5
+    else:
+        t1_r = 2.0
+        t2_r = 3.0
     if direction == "LONG":
         t1 = entry + t1_r * stop_dist
         t2 = entry + t2_r * stop_dist
@@ -385,5 +400,5 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         target_2=round(t2, 2),
         conviction=conviction,
         risk_reward=t1_r,
-        holding_period="intraday",
+        holding_period="swing" if is_daily_tf else "intraday",
     )

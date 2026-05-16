@@ -21,6 +21,13 @@ async def main():
             print("ERROR: Empty candidate pool")
             return
 
+        # Temporarily widen capacity for daily backtest (revert after run)
+        from yukti.config import settings
+        orig_max_pos = settings.max_open_positions
+        orig_cooldown = settings.cooldown_cycles
+        settings.max_open_positions = 5
+        settings.cooldown_cycles = 1
+
         # Signature: _run_backtest(start, end, sample_rate, symbols, use_rules_engine)
         start_date = "2026-04-13"
         end_date = "2026-05-13"
@@ -38,6 +45,9 @@ async def main():
         except Exception as e:
             print(f"BACKTEST_FAILED: {e}")
             traceback.print_exc()
+        finally:
+            settings.max_open_positions = orig_max_pos
+            settings.cooldown_cycles = orig_cooldown
 
     except Exception as e:
         print(f"ERROR: {e}")

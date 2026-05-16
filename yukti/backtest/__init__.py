@@ -52,6 +52,11 @@ class SimPosition:
     partial_exit_price:  float = 0.0
     partial_exit_qty:    int   = 0
     partial_pnl:         float = 0.0
+    # Trailing stop state: tracks the most favorable price since entry and
+    # a bar counter so the trail can activate after N bars in profit.
+    high_water_mark:     float = 0.0   # highest high (LONG) or lowest low (SHORT)
+    bars_held:           int   = 0
+    atr_at_entry:        float = 0.0   # ATR at entry for trailing calculation
 
 
 class PaperBroker:
@@ -89,7 +94,9 @@ class PaperBroker:
     ) -> None:
         """Check if any position's SL or target has been hit.
         Uses intraday high/low when available (daily candles); falls back to close.
-        On a same-bar SL+target hit we conservatively assume SL fired first."""
+        On a same-bar SL+target hit we conservatively assume SL fired first.
+        After T1 partial, a trailing stop activates: after 3 bars in profit the
+        stop trails at (high_water_mark - 1.0×ATR) for longs."""
         for symbol, pos in list(self.positions.items()):
             if pos.status != "OPEN":
                 continue
@@ -99,13 +106,31 @@ class PaperBroker:
             high = highs.get(symbol, close)
             low  = lows.get(symbol, close)
 
+            # Update bar counter and high/low water mark each bar
+            pos.bars_held += 1
+            if pos.direction == "LONG":
+                pos.high_water_mark = max(pos.high_water_mark, high)
+            else:
+                pos.high_water_mark = min(pos.high_water_mark, low) if pos.high_water_mark > 0 else low
+
+            # Trailing stop logic: after partial exit and 3+ bars, trail the stop
+            atr = pos.atr_at_entry if pos.atr_at_entry > 0 else 0
+            if pos.partial_exit_price > 0 and pos.quantity > 0 and pos.bars_held >= 3 and atr > 0:
+                if pos.direction == "LONG":
+                    trail_stop = pos.high_water_mark - 1.0 * atr
+                    if trail_stop > pos.stop_loss:
+                        pos.stop_loss = trail_stop
+                else:
+                    trail_stop = pos.high_water_mark + 1.0 * atr
+                    if trail_stop < pos.stop_loss:
+                        pos.stop_loss = trail_stop
+
             if pos.direction == "LONG":
                 # Stop loss check (assume stop fires before targets on same bar)
                 if low <= pos.stop_loss:
                     self._close_position(symbol, pos.stop_loss * (1 - self.slippage_pct), "stop_loss_hit", current_time)
                 # Target 1: partial exit
                 elif high >= pos.target_1:
-                    # If partial hasn't been taken yet, take a partial exit
                     if getattr(pos, 'partial_exit_price', 0.0) <= 0.0 and pos.target_1 is not None:
                         partial_qty = max(1, int((pos.original_quantity or pos.quantity) // 2))
                         realized = (pos.target_1 - pos.entry_price) * partial_qty
@@ -113,17 +138,13 @@ class PaperBroker:
                         pos.partial_exit_qty = partial_qty
                         pos.partial_pnl += realized
                         pos.quantity = max(0, pos.quantity - partial_qty)
-                        # Credit realized PnL to account value immediately
                         self.account_value += realized
-                        # Move remaining runner stop to breakeven (entry) to lock gains
                         if pos.quantity > 0:
                             pos.stop_loss = pos.entry_price
-                        log.debug("Partial exit %s qty=%d at ₹%.2f realized=%.2f; runner_qty=%d stop moved to ₹%.2f", symbol, partial_qty, pos.target_1, realized, pos.quantity, pos.stop_loss)
-                        # If after partial exit there's no runner left, finalize
+                        log.debug("Partial exit %s qty=%d at ₹%.2f realized=%.2f; runner_qty=%d stop→₹%.2f", symbol, partial_qty, pos.target_1, realized, pos.quantity, pos.stop_loss)
                         if pos.quantity == 0:
                             self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
                     else:
-                        # If partial already taken and runner exists, ignore (T2 handles final)
                         pass
                 # Target 2: close remaining runner
                 elif pos.target_2 is not None and high >= pos.target_2 and pos.quantity > 0:
@@ -140,6 +161,8 @@ class PaperBroker:
                         pos.partial_pnl += realized
                         pos.quantity = max(0, pos.quantity - partial_qty)
                         self.account_value += realized
+                        if pos.quantity > 0:
+                            pos.stop_loss = pos.entry_price
                         log.debug("Partial exit SHORT %s qty=%d at ₹%.2f realized=%.2f", symbol, partial_qty, pos.target_1, realized)
                         if pos.quantity == 0:
                             self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
@@ -452,10 +475,18 @@ class BacktestEngine:
                     lows[sym]   = float(df.loc[ts, "low"])
             self.broker.update_prices(ts, prices, highs, lows)
 
-            # Daily candles: square off at end of each week (Friday)
-            if is_daily and hasattr(ts, "dayofweek") and ts.dayofweek == 4:
+            # Daily candles: squareoff positions that have been held ≥10 bars
+            # (≈2 trading weeks). This replaces the old every-Friday squareoff
+            # which was killing winners after only 1-5 days before targets could
+            # be reached. Positions that hit SL/T1/T2 before 10 bars are
+            # handled by _check_gtts as usual.
+            if is_daily:
+                max_hold_bars = 10
                 for sym in list(self.broker.positions.keys()):
-                    self._squareoff(sym, prices, ts)
+                    pos = self.broker.positions[sym]
+                    bars_held = (ts - pos.entry_time).days if hasattr(ts, '__sub__') else 0
+                    if bars_held >= max_hold_bars:
+                        self._squareoff(sym, prices, ts)
             # Intraday: square off at 15:15 IST
             elif not is_daily and hasattr(ts, "time") and ts.time().hour == 15 and ts.time().minute >= 15:
                 for sym in list(self.broker.positions.keys()):
@@ -609,7 +640,10 @@ class BacktestEngine:
                 except ValueError:
                     continue
 
-                if decision.risk_reward < settings.min_rr or position.quantity == 0:
+                # For daily/swing trades min_rr is 1.5 (T1 at 1.5R), for
+                # intraday it stays at settings.min_rr (default 2.0).
+                effective_min_rr = 1.3 if is_daily else settings.min_rr
+                if decision.risk_reward < effective_min_rr or position.quantity == 0:
                     continue
 
                 # Simulate fill
@@ -635,6 +669,8 @@ class BacktestEngine:
                     holding      = decision.holding_period,
                     entry_time   = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts)),
                     original_quantity = position.quantity,
+                    high_water_mark   = fill_price,
+                    atr_at_entry      = snap.atr,
                 )
                 # Attach decision metadata so the trade log surfaces which
                 # pattern fired and at what conviction. Used for offline
