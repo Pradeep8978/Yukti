@@ -399,7 +399,7 @@ class BacktestEngine:
                 trend_pullback_long, trend_pullback_short,
                 reversal_long, reversal_short,
                 momentum_long, momentum_short,
-                orb_breakout, vwap_bounce,
+                orb_breakout, vwap_bounce, gap_go,
             )
 
             def _detect_pattern(snap, candles_today=None, current_time=None, snap_daily=None):
@@ -411,6 +411,7 @@ class BacktestEngine:
                     # (RSI<36 for long, RSI>64 for short) so they only fire at genuine
                     # extremes and are not noise-prone on 5m.
                     candidates = [
+                        gap_go(snap, candles_today, current_time, snap_daily),
                         orb_breakout(snap, candles_today, current_time, snap_daily),
                         vwap_bounce(snap, candles_today, current_time, snap_daily),
                         reversal_long(snap),
@@ -622,7 +623,7 @@ class BacktestEngine:
                             sym_df = self.candles[symbol]
                             mask = sym_df.index.normalize() == pd.Timestamp(ts_date)
                             today_slice = sym_df.loc[mask]
-                            if len(today_slice) >= 3:
+                            if len(today_slice) >= 1:
                                 candles_today = today_slice
                         except Exception:
                             candles_today = None

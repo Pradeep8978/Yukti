@@ -303,7 +303,9 @@ class MarketScanService:
                 # ── Current time for time-gating ──────────────────────
                 current_time = now_ist.time()
                 today_df = df[df.index.date == now_ist.date()]
-                pattern_df = today_df if len(today_df) >= 3 else None
+                # >= 1 so gap_go can run at 09:20 (only 1 candle available).
+                # Patterns that need more bars (ORB needs 3, VWAP needs 3) guard internally.
+                pattern_df = today_df if len(today_df) >= 1 else None
 
                 # ── ORB levels (from first 3 candles of today) ────────
                 or_high, or_low = None, None
