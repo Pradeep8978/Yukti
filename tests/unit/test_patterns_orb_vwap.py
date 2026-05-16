@@ -51,7 +51,7 @@ class TestORBBreakout:
         snap = _make_snap(close=1028.0, rsi=60.0, volume_ratio=1.8)
         result = orb_breakout(snap, candles, current_time=time(9, 45))
         assert result.detected is True
-        assert result.pattern_type == "orb_breakout"
+        assert result.pattern_type == "orb_breakout_long"
         assert result.strength > 0
 
     def test_orb_not_detected_inside_range(self):
@@ -123,7 +123,7 @@ class TestVWAPBounce:
         )
         result = vwap_bounce(snap, candles, current_time=time(10, 30))
         assert result.detected is True
-        assert result.pattern_type == "vwap_bounce"
+        assert result.pattern_type == "vwap_bounce_long"
         assert result.strength > 0
 
     def test_vwap_not_detected_before_0945(self):
