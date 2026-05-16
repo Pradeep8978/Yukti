@@ -25,11 +25,11 @@ log = logging.getLogger(__name__)
 # entry. patterns.py now emits orb_breakout_long / orb_breakout_short.
 _LONG_PATTERNS  = frozenset({
     "breakout", "trend_pullback", "reversal_long", "momentum",
-    "orb_breakout_long", "vwap_bounce",
+    "orb_breakout_long", "vwap_bounce_long",
 })
 _SHORT_PATTERNS = frozenset({
     "breakdown", "trend_pullback_short", "reversal_short", "momentum_short",
-    "orb_breakout_short",
+    "orb_breakout_short", "vwap_bounce_short",
 })
 
 
