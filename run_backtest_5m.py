@@ -4,6 +4,7 @@ import asyncio
 import traceback
 import os
 from yukti.backtest import _run_backtest
+from yukti.config import settings
 
 async def main():
     try:
@@ -27,6 +28,13 @@ async def main():
         if not top50:
             print("ERROR: Empty candidate pool")
             return
+
+        # Override settings for intraday backtest
+        settings.account_value = 500_000        # ₹5L — enough to trade NSE stocks
+        settings.max_open_positions = 5         # intraday: fewer concurrent positions
+        settings.max_trades_per_day = 10        # allow more setups per day
+        settings.cooldown_cycles = 1            # 1 bar cooldown on intraday
+        settings.min_rr = 1.5                   # T1=2R intraday — reachable within session
 
         # Signature: _run_backtest(start, end, sample_rate, symbols, use_rules_engine, interval='1')
         # Use the full Dhan 5m window (~60 days) so we get ~120-180 trades per
