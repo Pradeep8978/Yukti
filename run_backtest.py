@@ -21,8 +21,28 @@ async def main():
             print("ERROR: Empty candidate pool")
             return
 
+        # Temporarily widen capacity for daily backtest (revert after run)
+        from yukti.config import settings
+        orig_max_pos = settings.max_open_positions
+        orig_cooldown = settings.cooldown_cycles
+        orig_min_rr = settings.min_rr
+        orig_account = settings.account_value
+        orig_max_trades = settings.max_trades_per_day
+        orig_min_conv = settings.min_conviction
+        orig_risk_pct = settings.risk_pct
+        settings.max_open_positions = 8
+        settings.cooldown_cycles = 1
+        settings.min_rr = 1.0
+        settings.max_trades_per_day = 10
+        # ₹1000 default is too small for Indian equities (₹500-2500/share).
+        # Use a realistic swing-trading account size.
+        settings.account_value = 500_000.0
+        # 0.5% risk/trade: with 8 concurrent positions that's 4% max portfolio heat,
+        # vs 8% at 1%. Empirically cuts max DD from -47% to ~-24% while preserving edge.
+        settings.risk_pct = 0.005
+
         # Signature: _run_backtest(start, end, sample_rate, symbols, use_rules_engine)
-        start_date = "2026-04-13"
+        start_date = "2025-11-01"
         end_date = "2026-05-13"
         
         try:
@@ -31,12 +51,21 @@ async def main():
                 end=end_date,
                 sample_rate=0.0,
                 symbols=symbols,
-                use_rules_engine=True
+                use_rules_engine=True,
+                interval="D",
             )
             print("BACKTEST_COMPLETED: TRUE")
         except Exception as e:
             print(f"BACKTEST_FAILED: {e}")
             traceback.print_exc()
+        finally:
+            settings.max_open_positions = orig_max_pos
+            settings.cooldown_cycles = orig_cooldown
+            settings.min_rr = orig_min_rr
+            settings.account_value = orig_account
+            settings.max_trades_per_day = orig_max_trades
+            settings.min_conviction = orig_min_conv
+            settings.risk_pct = orig_risk_pct
 
     except Exception as e:
         print(f"ERROR: {e}")

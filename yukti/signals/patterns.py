@@ -269,6 +269,15 @@ def orb_breakout(
     or_low = float(or_candles["low"].min())
     or_mid = (or_high + or_low) / 2
 
+    # Gap filter: large opening gaps (>1.5%) signal gap-and-reverse days where
+    # the OR is faked out — price breaks out then immediately reverses into the gap.
+    # Use yesterday's daily close (indicators_daily.prev_close) vs today's first open.
+    if indicators_daily is not None and indicators_daily.prev_close > 0:
+        today_open = float(or_candles.iloc[0]["open"])
+        gap_pct = abs(today_open - indicators_daily.prev_close) / indicators_daily.prev_close
+        if gap_pct > 0.015:
+            return PatternSignal(False, "orb_breakout", 0.0, "")
+
     # Determine direction
     long_break = snap.close > or_high
     short_break = snap.close < or_low
@@ -281,7 +290,7 @@ def orb_breakout(
 
     if long_break:
         vol_ok = snap.volume_ratio >= 1.5
-        rsi_ok = 50 <= snap.rsi <= 70
+        rsi_ok = 45 <= snap.rsi <= 70   # widened from 50–70: catches early breakouts
         daily_ok = daily_trend != "DOWNTREND"
         if not vol_ok or not rsi_ok or not daily_ok:
             return PatternSignal(False, "orb_breakout", 0.0, "")
@@ -302,11 +311,11 @@ def orb_breakout(
             f"| range ₹{or_range:.2f} | vol {snap.volume_ratio:.1f}×"
             f"{' | daily aligned' if daily_trend == 'UPTREND' else ''}"
         )
-        return PatternSignal(True, "orb_breakout", round(min(strength, 1.0), 2), notes)
+        return PatternSignal(True, "orb_breakout_long", round(min(strength, 1.0), 2), notes)
 
     if short_break:
         vol_ok = snap.volume_ratio >= 1.5
-        rsi_ok = 30 <= snap.rsi <= 50
+        rsi_ok = 30 <= snap.rsi <= 55   # widened from 30–50: covers post-breakdown momentum
         daily_ok = daily_trend != "UPTREND"
         if not vol_ok or not rsi_ok or not daily_ok:
             return PatternSignal(False, "orb_breakout", 0.0, "")
@@ -327,7 +336,7 @@ def orb_breakout(
             f"| range ₹{or_range:.2f} | vol {snap.volume_ratio:.1f}×"
             f"{' | daily aligned' if daily_trend == 'DOWNTREND' else ''}"
         )
-        return PatternSignal(True, "orb_breakout", round(min(strength, 1.0), 2), notes)
+        return PatternSignal(True, "orb_breakout_short", round(min(strength, 1.0), 2), notes)
 
     return PatternSignal(False, "orb_breakout", 0.0, "")
 
@@ -368,6 +377,10 @@ def vwap_bounce(
         vol_ok = snap.volume_ratio > 1.0
         macd_improving = snap.macd_hist > 0 or snap.macd_bull
 
+        # Hard daily-trend filter: don't fade an established downtrend
+        if daily_trend == "DOWNTREND":
+            return PatternSignal(False, "vwap_bounce", 0.0, "")
+
         if uptrend and rsi_ok and vol_ok and macd_improving:
             strength = 0.5
             if daily_trend == "UPTREND":
@@ -386,7 +399,7 @@ def vwap_bounce(
                 f"| RSI {snap.rsi:.1f} | vol {snap.volume_ratio:.1f}×"
                 f"{' | daily aligned' if daily_trend == 'UPTREND' else ''}"
             )
-            return PatternSignal(True, "vwap_bounce", round(min(strength, 1.0), 2), notes)
+            return PatternSignal(True, "vwap_bounce_long", round(min(strength, 1.0), 2), notes)
 
     # VWAP Bounce Short (Rejection)
     if snap.close < vwap and touched_above:
@@ -394,6 +407,10 @@ def vwap_bounce(
         rsi_ok = 40 <= snap.rsi <= 60
         vol_ok = snap.volume_ratio > 1.0
         macd_declining = snap.macd_hist < 0 or not snap.macd_bull
+
+        # Hard daily-trend filter: don't fade an established uptrend
+        if daily_trend == "UPTREND":
+            return PatternSignal(False, "vwap_bounce", 0.0, "")
 
         if downtrend and rsi_ok and vol_ok and macd_declining:
             strength = 0.5
@@ -412,9 +429,105 @@ def vwap_bounce(
                 f"| RSI {snap.rsi:.1f} | vol {snap.volume_ratio:.1f}×"
                 f"{' | daily aligned' if daily_trend == 'DOWNTREND' else ''}"
             )
-            return PatternSignal(True, "vwap_bounce", round(min(strength, 1.0), 2), notes)
+            return PatternSignal(True, "vwap_bounce_short", round(min(strength, 1.0), 2), notes)
 
     return PatternSignal(False, "vwap_bounce", 0.0, "")
+
+
+def gap_go(
+    snap: IndicatorSnapshot,
+    candles: pd.DataFrame | None = None,
+    current_time: dt_time | None = None,
+    indicators_daily: IndicatorSnapshot | None = None,
+) -> PatternSignal:
+    """
+    Gap & Go: trade the continuation of an opening gap in the first 15 minutes.
+
+    After the first 5m candle closes (09:20), if the stock gapped 0.5–2% and the
+    first candle confirmed the gap direction (closes in upper/lower half with high
+    volume), enter on the breakout of that first candle's high/low.
+
+    Gap < 0.5%: not a real gap — random overnight drift, no momentum edge.
+    Gap > 2%: risk of gap-fill reversal; these are better traded as reversals.
+    Valid 09:20–09:30 only — after that ORB takes over.
+    """
+    if current_time is None or current_time < dt_time(9, 20) or current_time >= dt_time(9, 30):
+        return PatternSignal(False, "gap_go", 0.0, "")
+
+    if candles is None or len(candles) < 1:
+        return PatternSignal(False, "gap_go", 0.0, "")
+
+    if indicators_daily is None or indicators_daily.prev_close <= 0:
+        return PatternSignal(False, "gap_go", 0.0, "")
+
+    prev_close   = indicators_daily.prev_close
+    first        = candles.iloc[0]   # the 09:15–09:20 candle
+    today_open   = float(first["open"])
+    first_high   = float(first["high"])
+    first_low    = float(first["low"])
+    first_open   = float(first["open"])
+    first_close  = float(first["close"])
+    candle_range = first_high - first_low
+
+    gap_pct = (today_open - prev_close) / prev_close   # + = gap up, - = gap down
+    gap_abs = abs(gap_pct)
+
+    # Gap must be 0.5–2%
+    if gap_abs < 0.005 or gap_abs > 0.02:
+        return PatternSignal(False, "gap_go", 0.0, "")
+
+    daily_trend = indicators_daily.trend if indicators_daily else "SIDEWAYS"
+
+    if gap_pct > 0:   # ── Gap Up → Long ──────────────────────────────────────
+        candle_bullish = first_close > first_open
+        # Close in upper 40% of the candle range (momentum confirmation)
+        closes_high    = candle_range > 0 and (first_close - first_low) / candle_range >= 0.60
+        vol_ok         = snap.volume_ratio >= 2.5
+        rsi_ok         = snap.rsi < 72
+        daily_ok       = daily_trend != "DOWNTREND"
+        # Price must have broken above first candle high (entry trigger)
+        breaking_out   = snap.close >= first_high
+
+        if not (candle_bullish and closes_high and vol_ok and rsi_ok and daily_ok and breaking_out):
+            return PatternSignal(False, "gap_go", 0.0, "")
+
+        strength = 0.60
+        if daily_trend == "UPTREND":  strength += 0.15
+        if snap.volume_ratio >= 3.5:  strength += 0.10
+        if gap_abs >= 0.01:           strength += 0.10   # 1%+ gap = stronger momentum
+        if snap.macd_bull:            strength += 0.05
+
+        notes = (
+            f"Gap & Go LONG: gap +{gap_pct*100:.1f}% (open ₹{today_open:.2f} vs prev ₹{prev_close:.2f}) "
+            f"| first candle breaks ₹{first_high:.2f} | vol {snap.volume_ratio:.1f}×"
+            f"{' | daily aligned' if daily_trend == 'UPTREND' else ''}"
+        )
+        return PatternSignal(True, "gap_go_long", round(min(strength, 1.0), 2), notes)
+
+    else:   # ── Gap Down → Short ────────────────────────────────────────────
+        candle_bearish = first_close < first_open
+        # Close in lower 40% of the candle range
+        closes_low     = candle_range > 0 and (first_high - first_close) / candle_range >= 0.60
+        vol_ok         = snap.volume_ratio >= 2.5
+        rsi_ok         = snap.rsi > 28
+        daily_ok       = daily_trend != "UPTREND"
+        breaking_down  = snap.close <= first_low
+
+        if not (candle_bearish and closes_low and vol_ok and rsi_ok and daily_ok and breaking_down):
+            return PatternSignal(False, "gap_go", 0.0, "")
+
+        strength = 0.60
+        if daily_trend == "DOWNTREND": strength += 0.15
+        if snap.volume_ratio >= 3.5:   strength += 0.10
+        if gap_abs >= 0.01:            strength += 0.10
+        if not snap.macd_bull:         strength += 0.05
+
+        notes = (
+            f"Gap & Go SHORT: gap {gap_pct*100:.1f}% (open ₹{today_open:.2f} vs prev ₹{prev_close:.2f}) "
+            f"| first candle breaks ₹{first_low:.2f} | vol {snap.volume_ratio:.1f}×"
+            f"{' | daily aligned' if daily_trend == 'DOWNTREND' else ''}"
+        )
+        return PatternSignal(True, "gap_go_short", round(min(strength, 1.0), 2), notes)
 
 
 def scan_all(
@@ -437,6 +550,7 @@ def scan_all(
         momentum_short(snap),
         orb_breakout(snap, candles, current_time, indicators_daily),
         vwap_bounce(snap, candles, current_time, indicators_daily),
+        gap_go(snap, candles, current_time, indicators_daily),
     ]
     detected = [p for p in all_patterns if p.detected]
     return sorted(detected, key=lambda p: p.strength, reverse=True)

@@ -96,11 +96,11 @@ def calculate_position(
     quant = Decimal("0.01")
     lev_d = Decimal(str(max(1.0, leverage)))
 
-    # Capital-based fallback when risk sizing produces zero shares.
-    # Happens when account is small (risk_amount < stop_distance).
-    # We use up to max_single_stock_pct of account as the position cap,
-    # capped further so margin never exceeds available account.
-    if final_qty == 0:
+    # Capital-based fallback when risk sizing produces zero shares due to
+    # account size being too small (risk_amount < stop_distance). This does
+    # NOT apply when final_qty is zero because of a low conviction multiplier
+    # (conviction < 5 should produce zero qty — a deliberate skip safeguard).
+    if final_qty == 0 and base_qty > 0 and mult > Decimal("0"):
         margin_per_share = entry_d / lev_d
         if margin_per_share > 0:
             capital_cap = acct * Decimal(str(settings.max_single_stock_pct))
@@ -239,6 +239,7 @@ async def run_gates(
     *,
     ignore_cooldown: bool = False,
     ignore_market_halt: bool = False,
+    ignore_swing_short: bool = False,
 ) -> GateResult:
     """
     Run up to 9 pre-trade risk checks in order. Return first failure.
@@ -352,7 +353,7 @@ async def run_gates(
     # total_exposure_cap — disabled alongside it
     pass
 
-    if trade_decision.holding_period == "swing" and trade_decision.direction == "SHORT":
+    if not ignore_swing_short and trade_decision.holding_period == "swing" and trade_decision.direction == "SHORT":
         return GateResult(False, "swing_short_blocked: NSE equity delivery cannot carry overnight shorts")
 
     # 8. Sector concentration cap — only enforced when caller passed sector info.

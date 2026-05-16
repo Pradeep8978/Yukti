@@ -19,10 +19,18 @@ from yukti.config import settings
 
 log = logging.getLogger(__name__)
 
-# Pattern types that imply a LONG direction
-_LONG_PATTERNS  = frozenset({"breakout", "trend_pullback", "reversal_long", "momentum", "orb_breakout"})
-# Pattern types that imply a SHORT direction
-_SHORT_PATTERNS = frozenset({"breakdown", "trend_pullback_short", "reversal_short", "momentum_short"})
+# Pattern types that imply a LONG direction.
+# orb_breakout previously emitted the same pattern_type for both up- and
+# down-breaks, so an ORB *short* breakdown was being routed here as a LONG
+# entry. patterns.py now emits orb_breakout_long / orb_breakout_short.
+_LONG_PATTERNS  = frozenset({
+    "breakout", "trend_pullback", "reversal_long", "momentum",
+    "orb_breakout_long", "vwap_bounce_long", "gap_go_long",
+})
+_SHORT_PATTERNS = frozenset({
+    "breakdown", "trend_pullback_short", "reversal_short", "momentum_short",
+    "orb_breakout_short", "vwap_bounce_short", "gap_go_short",
+})
 
 
 @dataclass
@@ -107,21 +115,23 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     if daily_pnl <= -2.0:
         return _skip("daily_loss_limit_hit", conviction=1, symbol=symbol)
 
-    # Minimum conviction gate (tightens under adverse conditions)
-    min_conviction = max(settings.min_conviction, 7)
+    # Minimum conviction gate
+    # Use configured min_conviction directly rather than silently enforcing a
+    # hard floor of 7. This allows ops to calibrate conviction per config.
+    min_conviction = settings.min_conviction
     if consec_losses >= 3:
-        min_conviction = 9
+        min_conviction = max(min_conviction, 9)
     elif win_rate < 0.40:
-        min_conviction = 9
+        min_conviction = max(min_conviction, 9)
     elif daily_pnl >= 3.0:
-        min_conviction = 8
+        min_conviction = max(min_conviction, 8)
 
     # ── Step 1: Pattern required ───────────────────────────────────────
     if pattern is None or not pattern.detected:
         return _skip("no_pattern", symbol=symbol)
 
-    if pattern.strength < 0.70:
-        return _skip("pattern_strength_below_0_70", conviction=2, symbol=symbol)
+    if pattern.strength < 0.55:
+        return _skip("pattern_strength_below_0_55", conviction=2, symbol=symbol)
 
     if pattern.pattern_type in _LONG_PATTERNS:
         direction = "LONG"
@@ -141,6 +151,31 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     else:
         market_bias = "NEUTRAL"
 
+    # Hard trend-alignment gates for daily timeframe.
+    # momentum (LONG) relies on price being above recent average — unreliable
+    # in a confirmed daily downtrend. Require daily UPTREND or SIDEWAYS.
+    # trend_pullback_short has a very poor historical win rate; block unless
+    # daily trend confirms the short direction.
+    if snap_daily is not None:
+        daily_trend = getattr(snap_daily, "trend", None)
+        if direction == "LONG" and pattern.pattern_type == "momentum" and daily_trend == "DOWNTREND":
+            return _skip("momentum_long_blocked_in_downtrend", conviction=2, bias=market_bias, symbol=symbol)
+        if pattern.pattern_type == "trend_pullback_short" and daily_trend != "DOWNTREND":
+            return _skip("trend_pullback_short_needs_downtrend", conviction=2, bias=market_bias, symbol=symbol)
+
+    # On daily timeframe, skip low-edge setups that historically underperform:
+    # - momentum LONG: fires too broadly, loses in sideways/down markets
+    # - trend_pullback_short: poor win rate across regimes
+    # - breakout LONG: 28% WR on daily, false breakouts dominate
+    is_daily_tf = getattr(snap, "timeframe", "5m") == "daily"
+    if is_daily_tf:
+        if pattern.pattern_type == "momentum" and direction == "LONG":
+            return _skip("momentum_long_blocked_daily", conviction=2, bias=market_bias, symbol=symbol)
+        if pattern.pattern_type == "trend_pullback_short":
+            return _skip("trend_pullback_short_blocked_daily", conviction=2, bias=market_bias, symbol=symbol)
+        if pattern.pattern_type == "breakout":
+            return _skip("breakout_blocked_daily", conviction=2, bias=market_bias, symbol=symbol)
+
     # ── Step 3: Hard gates (VIX + RSI) ────────────────────────────────
     india_vix = getattr(macro, "india_vix", None)
     if india_vix is not None and india_vix >= 30:
@@ -152,8 +187,10 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         return _skip("rsi_oversold_blocks_short", conviction=2, bias=market_bias, symbol=symbol)
     if direction == "LONG" and snap.rsi_overbought():
         return _skip("rsi_overbought_blocks_long", conviction=2, bias=market_bias, symbol=symbol)
-    if snap.volume_ratio < 1.0:
-        return _skip("volume_ratio_below_1_0", conviction=2, bias=market_bias, symbol=symbol)
+    # Soft volume handling: rather than a hard skip at <1.0, treat low volume as
+    # a conviction penalty. Extremely low volume (<0.5×) remains a hard skip.
+    if snap.volume_ratio < 0.5:
+        return _skip("volume_ratio_below_0_5", conviction=2, bias=market_bias, symbol=symbol)
 
     # ── Step 4: Conviction scoring ─────────────────────────────────────
     score = _Score()
@@ -209,19 +246,28 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     else:
         score.adjust(-1, "supertrend_misaligned")
 
-    # VWAP position — institutions use VWAP as reference; misalignment is a real headwind
-    if direction == "LONG":
-        if snap.above_vwap():
-            vwap_confirmed = True
-            score.adjust(+1, "above_vwap")
+    # VWAP position — institutions use VWAP as reference; misalignment is a real headwind.
+    # Only counts on timeframes where VWAP resets per session (intraday). On a
+    # daily series the computed VWAP is just cumulative-since-history-start
+    # and correlates with trend, so it adds noise rather than information.
+    if getattr(snap, "vwap_is_meaningful", lambda: True)():
+        if direction == "LONG":
+            if snap.above_vwap():
+                vwap_confirmed = True
+                score.adjust(+1, "above_vwap")
+            else:
+                score.adjust(-1, "below_vwap_long")
         else:
-            score.adjust(-1, "below_vwap_long")
+            if not snap.above_vwap():
+                vwap_confirmed = True
+                score.adjust(+1, "below_vwap")
+            else:
+                score.adjust(-1, "above_vwap_short")
     else:
-        if not snap.above_vwap():
-            vwap_confirmed = True
-            score.adjust(+1, "below_vwap")
-        else:
-            score.adjust(-1, "above_vwap_short")
+        # Treat the VWAP confirmation slot as neutral — neither a vote up nor
+        # a penalty. The remaining trend / MACD / EMA20 votes carry the
+        # alignment check.
+        vwap_confirmed = True
 
     # MACD direction — momentum confirmation bonus (no penalty: pattern already carries this)
     if direction == "LONG" and snap.macd_bull:
@@ -239,14 +285,13 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         ema_confirmed = True
         score.adjust(+1, "below_ema20")
 
-    confirmation_count = sum((trend_confirmed, vwap_confirmed, macd_confirmed, ema_confirmed))
-    if confirmation_count < 3:
-        return _skip(
-            f"confirmation_count_{confirmation_count}_below_3",
-            conviction=score.clamp(),
-            bias=market_bias,
-            symbol=symbol,
-        )
+    # Require trend alignment plus at least one momentum/structure vote.
+    # This replaces the previous 3-of-4 confirmation gate which counted
+    # correlated votes and could be overly strict.
+    if not trend_confirmed:
+        return _skip("trend_not_confirmed", conviction=score.clamp(), bias=market_bias, symbol=symbol)
+    if not (macd_confirmed or ema_confirmed or vwap_confirmed):
+        return _skip("no_momentum_or_structure_confirmation", conviction=score.clamp(), bias=market_bias, symbol=symbol)
 
     # Elevated VIX — markets are nervous, reduce conviction (not a hard stop below 30)
     if india_vix is not None and india_vix >= 20:
@@ -311,9 +356,22 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     entry = snap.close
     atr   = snap.atr
 
+    # Detect timeframe from the snapshot to choose appropriate SL/target ratios.
+    # Daily candles need tighter stops and closer targets because they are held
+    # for a limited number of bars (1-2 weeks); intraday can afford wider ratios.
+    is_daily_tf = getattr(snap, "timeframe", "5m") == "daily"
+
     # Widen SL multiplier when options market shows elevated IV (system prompt rule)
     atm_iv = getattr(macro, "nifty_atm_iv", None)
-    sl_mult = 2.0 if (atm_iv is not None and atm_iv > 25) else 1.5
+    if is_daily_tf:
+        # Daily/swing: 1.2× ATR gives room for normal daily noise while keeping
+        # losses manageable. T1 at 1.5R = 1.8 ATR is achievable in 3-5 days.
+        sl_mult = 1.5 if (atm_iv is not None and atm_iv > 25) else 1.2
+    else:
+        # Intraday: tighter SL so T1 is reachable within the session.
+        # 1.5×ATR SL → T1 at 3×ATR was unreachable on 5m charts (needed ~3% move).
+        # 1.0×ATR SL → T1 at 1.5×ATR = achievable in a normal trending session.
+        sl_mult = 1.5 if (atm_iv is not None and atm_iv > 25) else 1.0
 
     if direction == "LONG":
         sl         = max(entry - sl_mult * atr, snap.nearest_swing_low * 0.995)
@@ -330,12 +388,22 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     if stop_dist <= 0:
         return _skip("zero_stop_distance", conviction=conviction, bias=market_bias, symbol=symbol)
 
-    if direction == "LONG":
-        t1 = entry + 2.0 * stop_dist
-        t2 = entry + 3.0 * stop_dist
+    # Daily targets must be reachable within a 1-2 week holding window.
+    # Intraday keeps the wider 2R/3R ratios for momentum plays.
+    if is_daily_tf:
+        t1_r = 1.2
+        t2_r = 2.0
     else:
-        t1 = entry - 2.0 * stop_dist
-        t2 = entry - 3.0 * stop_dist
+        # Intraday: T1 at 1.5R (was 2R) so break-even WR drops from ~37% to ~30%.
+        # T2 at 2.5R keeps the runner meaningful without requiring extreme moves.
+        t1_r = 1.5
+        t2_r = 2.5
+    if direction == "LONG":
+        t1 = entry + t1_r * stop_dist
+        t2 = entry + t2_r * stop_dist
+    else:
+        t1 = entry - t1_r * stop_dist
+        t2 = entry - t2_r * stop_dist
 
     vwap_side = "above" if snap.above_vwap() else "below"
     iv_note   = f" IV={atm_iv:.0f}% sl×{sl_mult}" if atm_iv else ""
@@ -362,6 +430,6 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         target_1=round(t1, 2),
         target_2=round(t2, 2),
         conviction=conviction,
-        risk_reward=2.0,
-        holding_period="intraday",
+        risk_reward=t2_r,  # RR based on full target (T2); T1 is a partial exit
+        holding_period="swing" if is_daily_tf else "intraday",
     )

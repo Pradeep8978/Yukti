@@ -42,6 +42,21 @@ class SimPosition:
     pnl:          float = 0.0
     pnl_pct:      float = 0.0
     exit_time:    datetime | None = None
+    # Partial-exit / breakeven-trail state.
+    # original_quantity records the size at entry so pnl_pct can be normalized
+    # against full exposure even after a T1 partial.
+    # partial_pnl is the realized PnL from the T1 partial; total pnl =
+    # partial_pnl + runner_pnl_at_close. partial_exit_price > 0 signals
+    # "phase 2" (stop is now at breakeven, target is T2).
+    original_quantity:   int   = 0
+    partial_exit_price:  float = 0.0
+    partial_exit_qty:    int   = 0
+    partial_pnl:         float = 0.0
+    # Trailing stop state: tracks the most favorable price since entry and
+    # a bar counter so the trail can activate after N bars in profit.
+    high_water_mark:     float = 0.0   # highest high (LONG) or lowest low (SHORT)
+    bars_held:           int   = 0
+    atr_at_entry:        float = 0.0   # ATR at entry for trailing calculation
 
 
 class PaperBroker:
@@ -51,10 +66,17 @@ class PaperBroker:
     GTT orders trigger when price crosses the trigger level.
     """
 
-    def __init__(self, account_value: float = 500_000.0, slippage_pct: float = 0.001) -> None:
+    # NSE intraday round-trip transaction cost estimate:
+    #   STT 0.025% (sell side only) + exchange fees ~0.004% + brokerage ~0.004%
+    #   ≈ 0.033% per trade, applied as a flat deduction on close.
+    TRANSACTION_COST_PCT: float = 0.00033
+
+    def __init__(self, account_value: float = 500_000.0, slippage_pct: float = 0.002) -> None:
         self.initial_account_value = account_value
         self.account_value  = account_value
-        self.slippage_pct   = slippage_pct          # 0.1% default slippage
+        # 0.2% slippage: covers bid-ask spread (0.15-0.4% on NSE mid-caps) for
+        # market orders (SL-M, EOD squareoff). Limit entries/targets are exempt.
+        self.slippage_pct   = slippage_pct
         self.positions:     dict[str, SimPosition] = {}
         self.closed_trades: list[SimPosition]      = []
         self.order_counter  = 0
@@ -78,7 +100,10 @@ class PaperBroker:
         lows:  dict[str, float],
     ) -> None:
         """Check if any position's SL or target has been hit.
-        Uses intraday high/low when available (daily candles); falls back to close."""
+        Uses intraday high/low when available (daily candles); falls back to close.
+        On a same-bar SL+target hit we conservatively assume SL fired first.
+        After T1 partial, a trailing stop activates: after 3 bars in profit the
+        stop trails at (high_water_mark - 1.0×ATR) for longs."""
         for symbol, pos in list(self.positions.items()):
             if pos.status != "OPEN":
                 continue
@@ -88,29 +113,101 @@ class PaperBroker:
             high = highs.get(symbol, close)
             low  = lows.get(symbol, close)
 
+            # Update bar counter and high/low water mark each bar
+            pos.bars_held += 1
             if pos.direction == "LONG":
+                pos.high_water_mark = max(pos.high_water_mark, high)
+            else:
+                pos.high_water_mark = min(pos.high_water_mark, low) if pos.high_water_mark > 0 else low
+
+            # Trailing stop logic: after partial exit and 3+ bars, trail the stop
+            atr = pos.atr_at_entry if pos.atr_at_entry > 0 else 0
+            if pos.partial_exit_price > 0 and pos.quantity > 0 and pos.bars_held >= 3 and atr > 0:
+                if pos.direction == "LONG":
+                    trail_stop = pos.high_water_mark - 1.0 * atr
+                    if trail_stop > pos.stop_loss:
+                        pos.stop_loss = trail_stop
+                else:
+                    trail_stop = pos.high_water_mark + 1.0 * atr
+                    if trail_stop < pos.stop_loss:
+                        pos.stop_loss = trail_stop
+
+            if pos.direction == "LONG":
+                # Stop loss check (assume stop fires before targets on same bar)
                 if low <= pos.stop_loss:
                     self._close_position(symbol, pos.stop_loss * (1 - self.slippage_pct), "stop_loss_hit", current_time)
+                # Target 1: partial exit
                 elif high >= pos.target_1:
-                    self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
+                    if getattr(pos, 'partial_exit_price', 0.0) <= 0.0 and pos.target_1 is not None:
+                        partial_qty = max(1, int((pos.original_quantity or pos.quantity) // 2))
+                        realized = (pos.target_1 - pos.entry_price) * partial_qty
+                        pos.partial_exit_price = pos.target_1
+                        pos.partial_exit_qty = partial_qty
+                        pos.partial_pnl += realized
+                        pos.quantity = max(0, pos.quantity - partial_qty)
+                        self.account_value += realized
+                        if pos.quantity > 0:
+                            pos.stop_loss = pos.entry_price
+                        log.debug("Partial exit %s qty=%d at ₹%.2f realized=%.2f; runner_qty=%d stop→₹%.2f", symbol, partial_qty, pos.target_1, realized, pos.quantity, pos.stop_loss)
+                        if pos.quantity == 0:
+                            self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
+                    else:
+                        pass
+                # Target 2: close remaining runner
+                elif pos.target_2 is not None and high >= pos.target_2 and pos.quantity > 0:
+                    self._close_position(symbol, pos.target_2, "target_2_hit", current_time)
             else:  # SHORT
                 if high >= pos.stop_loss:
                     self._close_position(symbol, pos.stop_loss * (1 + self.slippage_pct), "stop_loss_hit", current_time)
                 elif low <= pos.target_1:
-                    self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
+                    if getattr(pos, 'partial_exit_price', 0.0) <= 0.0 and pos.target_1 is not None:
+                        partial_qty = max(1, int((pos.original_quantity or pos.quantity) // 2))
+                        realized = (pos.entry_price - pos.target_1) * partial_qty
+                        pos.partial_exit_price = pos.target_1
+                        pos.partial_exit_qty = partial_qty
+                        pos.partial_pnl += realized
+                        pos.quantity = max(0, pos.quantity - partial_qty)
+                        self.account_value += realized
+                        if pos.quantity > 0:
+                            pos.stop_loss = pos.entry_price
+                        log.debug("Partial exit SHORT %s qty=%d at ₹%.2f realized=%.2f", symbol, partial_qty, pos.target_1, realized)
+                        if pos.quantity == 0:
+                            self._close_position(symbol, pos.target_1, "target_1_hit", current_time)
+                    else:
+                        pass
+                elif pos.target_2 is not None and low <= pos.target_2 and pos.quantity > 0:
+                    self._close_position(symbol, pos.target_2, "target_2_hit", current_time)
 
     def _close_position(self, symbol: str, exit_price: float, reason: str, exit_time: datetime | None = None) -> None:
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
         is_long = pos.direction == "LONG"
+
+        # EOD squareoff is a market order — apply slippage.
+        # Limit targets (T1/T2) fill at the trigger price; no adverse slippage.
+        if reason == "eod_squareoff":
+            exit_price = exit_price * (1 - self.slippage_pct) if is_long \
+                else exit_price * (1 + self.slippage_pct)
+
+        runner_pnl = (exit_price - pos.entry_price) * pos.quantity if is_long \
+            else (pos.entry_price - exit_price) * pos.quantity
+
+        # Deduct NSE transaction costs (STT + exchange fees + brokerage) on close.
+        # Applied per-trade on full original notional to match how NSE charges work.
+        denom_qty = pos.original_quantity if pos.original_quantity > 0 else pos.quantity
+        notional = pos.entry_price * max(denom_qty, 1)
+        transaction_cost = notional * self.TRANSACTION_COST_PCT
+
         pos.exit_price  = exit_price
         pos.exit_reason = reason
-        pos.pnl         = (exit_price - pos.entry_price) * pos.quantity if is_long else (pos.entry_price - exit_price) * pos.quantity
-        pos.pnl_pct     = pos.pnl / (pos.entry_price * pos.quantity) * 100
+        pos.pnl         = runner_pnl + pos.partial_pnl - transaction_cost
+        # pnl_pct is computed against the *original* exposure so partial-exit
+        # winners show a comparable % regardless of how the position was scaled.
+        pos.pnl_pct     = pos.pnl / notional * 100
         pos.exit_time   = exit_time
         pos.status      = "CLOSED"
-        self.account_value += pos.pnl
+        self.account_value += runner_pnl - transaction_cost
         self.closed_trades.append(pos)
         log.debug("Paper closed: %s %s P&L=%.1f%%", symbol, reason, pos.pnl_pct)
 
@@ -128,12 +225,14 @@ class PaperBroker:
         tag: str = "",
     ) -> dict[str, Any]:
         self.order_counter += 1
-        # Simulate fill at price + slippage
         fill_price = price if price > 0 else self._current_prices.get(security_id, price)
-        if transaction_type == "BUY":
-            fill_price *= (1 + self.slippage_pct)
-        else:
-            fill_price *= (1 - self.slippage_pct)
+        # LIMIT entries fill at the limit price (no adverse slippage — price must
+        # come to us). MARKET orders pay the spread.
+        if order_type == "MARKET":
+            if transaction_type == "BUY":
+                fill_price *= (1 + self.slippage_pct)
+            else:
+                fill_price *= (1 - self.slippage_pct)
 
         return {
             "orderId": f"SIM-{self.order_counter:06d}",
@@ -163,6 +262,14 @@ class PaperBroker:
 
     async def market_exit(self, security_id: str, direction: str, quantity: int, product_type: str) -> dict[str, Any]:
         price = self._current_prices.get(security_id, 0.0)
+        if price <= 0:
+            pos = self.positions.get(security_id)
+            if pos is not None:
+                log.warning(
+                    "market_exit %s: no current price — using entry ₹%.2f (PnL=0)",
+                    security_id, pos.entry_price,
+                )
+                price = pos.entry_price
         self._close_position(security_id, price, "eod_squareoff")
         return {"orderId": f"EXIT-{self.order_counter}", "status": "TRADED"}
 
@@ -190,12 +297,14 @@ class BacktestEngine:
         account_value:     float = 500_000.0,
         claude_sample_rate: float = 1.0,   # fraction of candles sent to AI (reduce to cut cost)
         use_rules_engine:  bool  = False,  # True → deterministic rules, no API calls
+        decision_start:    date | None = None,  # only open new trades on/after this date
     ) -> None:
         self.candles             = candles
         self.nifty_candles       = nifty_candles
         self.broker              = PaperBroker(account_value)
         self.claude_sample_rate  = claude_sample_rate
         self.use_rules_engine    = use_rules_engine
+        self.decision_start      = decision_start
         self._equity_curve:      list[dict] = []
         self._cooldowns:         dict[str, datetime] = {}
         self._closed_trades_seen = 0
@@ -255,28 +364,89 @@ class BacktestEngine:
             return False
         return True
 
+    def _squareoff(self, sym: str, prices: dict[str, float], ts: datetime) -> None:
+        """End-of-period forced exit. Pick the best available price:
+        1) this bar's close if the symbol has a candle here,
+        2) the broker's last-known close (forward-filled across prior bars),
+        3) the position's entry price as a final safety fallback (PnL=0).
+        Exiting at 0.0 — which is what a naive prices.get(sym, 0.0) would do —
+        registers a fake -100% loss whenever a position's symbol has a data
+        gap on the squareoff bar (holiday, halt, late-listed peer, etc.)."""
+        pos = self.broker.positions.get(sym)
+        if pos is None:
+            return
+        exit_price = prices.get(sym)
+        if exit_price is None or exit_price <= 0:
+            exit_price = self.broker._current_prices.get(sym)
+        if exit_price is None or exit_price <= 0:
+            log.warning(
+                "Squareoff %s @ %s: no price available — using entry price ₹%.2f (PnL=0)",
+                sym, ts, pos.entry_price,
+            )
+            exit_price = pos.entry_price
+        self.broker._close_position(sym, exit_price, "eod_squareoff", ts)
+
     async def run(self) -> "BacktestReport":
         """Run the full backtest and return a report."""
-        from yukti.signals.indicators import compute
+        from yukti.signals.indicators import compute_full, snapshot_at
         from yukti.risk import Portfolio, calculate_position, calculate_levels, run_gates
 
         if self.use_rules_engine:
             from yukti.agents.rules_engine import decide as rules_decide
-            from yukti.services.macro_context_service import MacroContext
+            from yukti.services.macro_context_service import MacroContext, fetch_macro_context
             from yukti.signals.patterns import (
                 breakout, breakdown,
                 trend_pullback_long, trend_pullback_short,
                 reversal_long, reversal_short,
-                momentum_long,
+                momentum_long, momentum_short,
+                orb_breakout, vwap_bounce, gap_go,
             )
 
-            def _detect_pattern(snap):
-                candidates = [
-                    breakout(snap), breakdown(snap),
-                    trend_pullback_long(snap), trend_pullback_short(snap),
-                    reversal_long(snap), reversal_short(snap),
-                    momentum_long(snap),
-                ]
+            def _detect_pattern(snap, candles_today=None, current_time=None, snap_daily=None):
+                if not is_daily:
+                    if candles_today is None or current_time is None:
+                        return None
+                    # Base intraday set: ORB and VWAP bounce (session-aware patterns).
+                    # Reversal patterns added unconditionally — they have hard RSI gates
+                    # (RSI<36 for long, RSI>64 for short) so they only fire at genuine
+                    # extremes and are not noise-prone on 5m.
+                    candidates = [
+                        gap_go(snap, candles_today, current_time, snap_daily),
+                        orb_breakout(snap, candles_today, current_time, snap_daily),
+                        vwap_bounce(snap, candles_today, current_time, snap_daily),
+                        reversal_long(snap),
+                        reversal_short(snap),
+                    ]
+                    # When the daily trend confirms a direction, unlock trend-following
+                    # patterns on that side only. Without daily confirmation these patterns
+                    # fire on market-open noise and produce near-instant stop-outs.
+                    # This is also the fix for "daily downtrend should generate shorts":
+                    # breakdown / momentum_short / trend_pullback_short are now active
+                    # whenever the daily trend is confirmed DOWNTREND.
+                    if snap_daily is not None:
+                        daily_trend = getattr(snap_daily, "trend", "SIDEWAYS")
+                        if daily_trend == "DOWNTREND":
+                            candidates.extend([
+                                breakdown(snap),
+                                momentum_short(snap),
+                                trend_pullback_short(snap),
+                            ])
+                        elif daily_trend == "UPTREND":
+                            candidates.extend([
+                                breakout(snap),
+                                momentum_long(snap),
+                                trend_pullback_long(snap),
+                            ])
+                else:
+                    candidates = [
+                        breakout(snap), breakdown(snap),
+                        trend_pullback_long(snap), trend_pullback_short(snap),
+                        reversal_long(snap), reversal_short(snap),
+                        momentum_long(snap), momentum_short(snap),
+                    ]
+                    if candles_today is not None and current_time is not None:
+                        candidates.append(orb_breakout(snap, candles_today, current_time, snap_daily))
+                        candidates.append(vwap_bounce(snap, candles_today, current_time, snap_daily))
                 detected = [p for p in candidates if p.detected]
                 return max(detected, key=lambda p: p.strength) if detected else None
         else:
@@ -306,6 +476,41 @@ class BacktestEngine:
             tf_label,
         )
 
+        # Precompute indicators once per symbol on the full series.
+        # Avoids the O(n²) cost of running pandas_ta.supertrend (Python loop) on
+        # a growing slice for every (ts, symbol). Daily backtest with 220-day
+        # warmup × 50 symbols was ~3 min before this; now well under 10 sec.
+        full_indicators: dict[str, pd.DataFrame] = {}
+        tf_for_indicators = "daily" if is_daily else "5m"
+        for sym, df in self.candles.items():
+            if len(df) < 60:
+                continue
+            try:
+                full_indicators[sym] = compute_full(df, timeframe=tf_for_indicators)
+            except Exception as exc:
+                log.debug("precompute failed for %s: %s", sym, exc)
+
+        # Additionally precompute daily indicators for multi-timeframe alignment
+        # when running intraday backtests. This enables rules_engine to consult
+        # a true daily snapshot (rsi, adx, daily S/R) and for patterns that
+        # depend on daily alignment.
+        full_indicators_daily: dict[str, pd.DataFrame] = {}
+        if not is_daily:
+            for sym, df in self.candles.items():
+                try:
+                    # Resample to calendar-day bars using volume-weighted aggregation
+                    daily = df.resample('D').agg({
+                        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                    }).dropna()
+                    # Lower threshold for intraday: 5m data window is shorter (~37
+                    # trading days) so 30 bars is enough for indicator warmup.
+                    if len(daily) < 30:
+                        continue
+                    full_indicators_daily[sym] = compute_full(daily, timeframe='daily')
+                except Exception:
+                    # best-effort: missing daily series degrades gracefully
+                    continue
+
         for ts in all_dates:
             nifty_slice = self.nifty_candles.loc[:ts]
             if len(nifty_slice) < 50:
@@ -325,16 +530,62 @@ class BacktestEngine:
                     lows[sym]   = float(df.loc[ts, "low"])
             self.broker.update_prices(ts, prices, highs, lows)
 
-            # Daily candles: square off at end of each week (Friday)
-            if is_daily and hasattr(ts, "dayofweek") and ts.dayofweek == 4:
+            # Daily candles: squareoff positions that have been held ≥10 bars
+            # (≈2 trading weeks). This replaces the old every-Friday squareoff
+            # which was killing winners after only 1-5 days before targets could
+            # be reached. Positions that hit SL/T1/T2 before 10 bars are
+            # handled by _check_gtts as usual.
+            if is_daily:
+                max_hold_bars = 10
                 for sym in list(self.broker.positions.keys()):
-                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff", ts)
+                    pos = self.broker.positions[sym]
+                    if pos.bars_held >= max_hold_bars:
+                        self._squareoff(sym, prices, ts)
             # Intraday: square off at 15:15 IST
             elif not is_daily and hasattr(ts, "time") and ts.time().hour == 15 and ts.time().minute >= 15:
                 for sym in list(self.broker.positions.keys()):
-                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff", ts)
+                    self._squareoff(sym, prices, ts)
 
             self._register_new_cooldowns(ts, cycle_delta)
+
+            # Warmup pre-roll: feed indicator history but don't open new trades.
+            ts_date = ts.date() if hasattr(ts, "date") else None
+            if self.decision_start is not None and ts_date is not None and ts_date < self.decision_start:
+                continue
+
+            # Cutoff: block new intraday entries inside the last 20 min before
+            # squareoff (matches the live scanner's _entry_cutoff). Without
+            # this, a trade opened at 14:56 has no room to reach a 2R target.
+            if not is_daily and hasattr(ts, "time"):
+                t = ts.time()
+                if t.hour > 14 or (t.hour == 14 and t.minute >= 55):
+                    continue
+
+            current_time = ts.time() if (not is_daily and hasattr(ts, "time")) else None
+
+            # ── Per-bar macro context (fetched once per day, shared by all symbols) ──
+            # VIX/PCR/sentiment don't change bar-by-bar on intraday charts; caching
+            # per calendar date gives a 78× speedup for 5-minute backtests.
+            bar_macro: MacroContext | None = None
+            if self.use_rules_engine:
+                macro_cache_key = ts_date if ts_date is not None else ts
+                if not hasattr(self, "_macro_day_cache"):
+                    self._macro_day_cache: dict = {}
+                if macro_cache_key not in self._macro_day_cache:
+                    try:
+                        self._macro_day_cache[macro_cache_key] = await fetch_macro_context(nifty_chg, nifty_trend)
+                    except Exception:
+                        self._macro_day_cache[macro_cache_key] = MacroContext(nifty_chg_pct=nifty_chg, nifty_trend=nifty_trend)
+                bar_macro = self._macro_day_cache[macro_cache_key]
+
+            # Performance metrics are bar-level (portfolio state doesn't change mid-bar)
+            bar_perf = {
+                "consecutive_losses": self._consecutive_losses(),
+                "daily_pnl_pct":      self._daily_pnl_pct(ts),
+                "win_rate_last_10":   self._win_rate_last_10()[0] if self._win_rate_last_10()[0] is not None else 0.5,
+                "win_rate_last_10_count": self._win_rate_last_10()[1],
+                "trades_today":       self._trades_today(ts),
+            }
 
             for symbol in symbols:
                 if symbol in self.broker.positions:
@@ -351,27 +602,48 @@ class BacktestEngine:
                     if random.random() > self.claude_sample_rate:
                         continue
 
+                full_df = full_indicators.get(symbol)
+                if full_df is None:
+                    continue
                 try:
-                    snap = compute(df, timeframe="daily" if is_daily else "5m")
+                    snap = snapshot_at(full_df, ts, timeframe=tf_for_indicators)
                 except Exception:
                     continue
 
-                perf = {
-                    "consecutive_losses": self._consecutive_losses(),
-                    "daily_pnl_pct":      self._daily_pnl_pct(ts),
-                    "win_rate_last_10":   self._win_rate_last_10()[0] if self._win_rate_last_10()[0] is not None else 0.5,
-                    "win_rate_last_10_count": self._win_rate_last_10()[1],
-                    "trades_today":       self._trades_today(ts),
-                }
+                perf = bar_perf
 
                 # ── Decision ──────────────────────────────────────────
                 if self.use_rules_engine:
-                    macro = MacroContext(
-                        nifty_chg_pct=nifty_chg,
-                        nifty_trend=nifty_trend,
-                    )
-                    pattern = _detect_pattern(snap)
-                    decision, _ = rules_decide(symbol, snap, macro, perf, pattern)
+                    macro = bar_macro or MacroContext(nifty_chg_pct=nifty_chg, nifty_trend=nifty_trend)
+
+                    # Same-day candle slice enables ORB / VWAP-bounce detection.
+                    candles_today = None
+                    if not is_daily and ts_date is not None:
+                        try:
+                            sym_df = self.candles[symbol]
+                            mask = sym_df.index.normalize() == pd.Timestamp(ts_date)
+                            today_slice = sym_df.loc[mask]
+                            if len(today_slice) >= 1:
+                                candles_today = today_slice
+                        except Exception:
+                            candles_today = None
+
+                    # Build a daily snapshot (snap_daily) for multi-timeframe checks
+                    snap_daily = None
+                    try:
+                        if is_daily:
+                            daily_full = full_indicators.get(symbol)
+                            if daily_full is not None:
+                                snap_daily = snapshot_at(daily_full, ts, timeframe='daily')
+                        else:
+                            daily_full = full_indicators_daily.get(symbol) if 'full_indicators_daily' in locals() else None
+                            if daily_full is not None and ts_date is not None:
+                                snap_daily = snapshot_at(daily_full, pd.Timestamp(ts_date), timeframe='daily')
+                    except Exception:
+                        snap_daily = None
+
+                    pattern = _detect_pattern(snap, candles_today, current_time, snap_daily)
+                    decision, _ = rules_decide(symbol, snap, macro, perf, pattern, snap_daily)
                 else:
                     context = build_context(
                         symbol, snap,
@@ -416,6 +688,7 @@ class BacktestEngine:
                     portfolio,
                     ignore_cooldown=True,
                     ignore_market_halt=True,
+                    ignore_swing_short=True,
                 )
                 if not gate.passed:
                     continue
@@ -432,7 +705,10 @@ class BacktestEngine:
                 except ValueError:
                     continue
 
-                if decision.risk_reward < settings.min_rr or position.quantity == 0:
+                # For daily/swing trades min_rr is 1.5 (T1 at 1.5R), for
+                # intraday it stays at settings.min_rr (default 2.0).
+                effective_min_rr = 1.0 if is_daily else settings.min_rr
+                if decision.risk_reward < effective_min_rr or position.quantity == 0:
                     continue
 
                 # Simulate fill
@@ -457,7 +733,16 @@ class BacktestEngine:
                     target_2     = decision.target_2,
                     holding      = decision.holding_period,
                     entry_time   = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts)),
+                    original_quantity = position.quantity,
+                    high_water_mark   = fill_price,
+                    atr_at_entry      = snap.atr,
                 )
+                # Attach decision metadata so the trade log surfaces which
+                # pattern fired and at what conviction. Used for offline
+                # analysis (per-pattern win-rate, conviction calibration, …);
+                # not part of the broker contract so we attach lazily.
+                setattr(sim_pos, "setup_type", getattr(decision, "setup_type", "") or "")
+                setattr(sim_pos, "conviction", getattr(decision, "conviction", 0) or 0)
                 self.broker.positions[symbol] = sim_pos
 
             # Record equity point
@@ -533,11 +818,14 @@ class BacktestReport:
                 "direction":   t.direction,
                 "entry":       t.entry_price,
                 "exit":        t.exit_price,
-                "qty":         t.quantity,
+                "qty":         t.original_quantity or t.quantity,
                 "pnl":         round(t.pnl, 2),
                 "pnl_pct":     round(t.pnl_pct, 4),
                 "exit_reason": t.exit_reason,
                 "entry_time":  t.entry_time,
+                "exit_time":   t.exit_time,
+                "setup":       getattr(t, "setup_type", ""),
+                "conviction":  getattr(t, "conviction", 0),
             }
             for t in self.trades
         ]).to_csv(path, index=False)
@@ -583,6 +871,14 @@ async def _run_backtest(
     daily_intervals = {"D", "1D", "d", "1d", "day", "daily"}
     normalized_interval = "D" if candle_interval in daily_intervals else candle_interval
 
+    # Indicator warmup. 50-EMA needs ≥50 bars and the engine skips symbols with
+    # <60 bars; without pre-roll a 1-month daily backtest would produce zero
+    # trades because every symbol's slice has only ~22 candles.
+    # The engine still iterates only over candles inside [start, end] — the
+    # warmup tail is used purely to seed indicator state.
+    warmup_days = 220 if normalized_interval == "D" else 14
+    db_window_start = start_date - timedelta(days=warmup_days)
+
     # Load universe or use provided symbols
     if symbols:
         universe = symbols
@@ -600,7 +896,9 @@ async def _run_backtest(
         except Exception:
             universe = ["RELIANCE", "HDFCBANK", "INFY", "TCS", "ICICIBANK"]
 
-    # Load candles — try DB first, fall back to yfinance (daily) when DB is unreachable
+    # Load candles — try DB first, fall back to yfinance (daily) when DB is unreachable.
+    # The DB window includes warmup history (db_window_start..start_date) so
+    # indicators have enough lookback before the first decision bar.
     candles: dict[str, pd.DataFrame] = {}
     try:
         from yukti.data.database import create_all_tables, get_db
@@ -613,7 +911,7 @@ async def _run_backtest(
                         and_(
                             Candle.symbol == symbol,
                             Candle.interval == normalized_interval,
-                            sa_func.date(Candle.time) >= start_date,
+                            sa_func.date(Candle.time) >= db_window_start,
                             sa_func.date(Candle.time) <= end_date,
                         )
                     )
@@ -624,7 +922,7 @@ async def _run_backtest(
                         [(r.time, r.open, r.high, r.low, r.close, r.volume) for r in rows],
                         columns=["time", "open", "high", "low", "close", "volume"],
                     ).set_index("time")
-                    candles[symbol] = df.astype(float)
+                    candles[symbol] = df.astype(float).loc[~df.index.duplicated(keep='last')]
     except Exception as db_err:
         log.warning("DB unavailable (%s) — falling back to yfinance daily data", db_err)
 
@@ -633,7 +931,6 @@ async def _run_backtest(
             import warnings
             import yfinance as yf
             warnings.filterwarnings("ignore")
-            from datetime import timedelta
             warmup_start = (
                 datetime.fromisoformat(start) - timedelta(days=180)
             ).strftime("%Y-%m-%d")
@@ -670,6 +967,7 @@ async def _run_backtest(
         account_value=settings.account_value,
         claude_sample_rate=sample_rate,
         use_rules_engine=use_rules_engine,
+        decision_start=start_date,
     )
     report = await engine.run()
     report.print_summary()

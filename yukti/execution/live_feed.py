@@ -72,10 +72,21 @@ class LiveFeedManager:
         log.info("LiveFeedManager: subscribed %s (id=%s)", symbol, security_id)
 
         if self._connected and self._feed is not None:
-            try:
-                self._feed.subscribe_symbols([("NSE", security_id, getattr(self._feed, "Ticker", None))])
-            except Exception as exc:
-                log.debug("LiveFeedManager: subscribe_symbols failed for %s: %s", symbol, exc)
+            if hasattr(self._feed, "subscribe_symbols"):
+                try:
+                    self._feed.subscribe_symbols([("NSE", security_id, getattr(self._feed, "Ticker", None))])
+                except Exception as exc:
+                    log.debug("LiveFeedManager: subscribe_symbols failed for %s: %s", symbol, exc)
+            else:
+                # MarketFeed (dhanhq>=2.0) has no subscribe_symbols — the instrument
+                # list is fixed at construction time. Trigger a reconnect so the new
+                # symbol is included in the next feed instance's instrument list.
+                log.info("LiveFeedManager: %s added — triggering feed reconnect to include new instrument", symbol)
+                if self._feed is not None:
+                    try:
+                        self._feed.disconnect()
+                    except Exception:
+                        pass
 
     async def unsubscribe(self, symbol: str) -> None:
         """Remove a symbol from LTP ticks."""
@@ -99,40 +110,84 @@ class LiveFeedManager:
     # ── Internal ─────────────────────────────────────────────────
 
     def _run_feed(self) -> None:
-        """Blocking run in daemon thread — creates the feed and calls run_forever()."""
-        try:
-            from yukti.config import settings
-            from yukti.execution.broker_factory import get_broker
+        """Blocking run in daemon thread with auto-reconnect and exponential backoff.
 
-            broker = get_broker()
-            dhan_client = getattr(broker, "_dhan", None)
+        Reconnects up to MAX_RETRIES_PER_SESSION times within a trading day before
+        giving up. Backoff resets on each clean connect so transient glitches don't
+        permanently disable the feed.
+        """
+        import time
+        from datetime import date
 
-            client_id    = getattr(dhan_client, "client_id",    None) or getattr(settings, "dhan_client_id", "")
-            access_token = getattr(dhan_client, "access_token", None) or getattr(settings, "dhan_access_token", "")
+        MAX_RETRIES_PER_SESSION = 10
+        retry_secs    = 5
+        retries_today = 0
+        last_date     = date.today()
 
-            if not client_id or not access_token:
-                log.warning("LiveFeedManager: missing client_id/access_token — feed disabled")
-                return
+        while True:
+            today = date.today()
+            if today != last_date:
+                # New calendar day — reset counters
+                retries_today = 0
+                last_date     = today
+                retry_secs    = 5
 
-            # Build pre-subscription instrument list (locked snapshot)
-            with self._lock:
-                pre_instruments = [
-                    {"ExchangeSegment": "NSE_EQ", "SecurityId": sid}
-                    for sid in self._subscriptions.values()
-                ]
+            if retries_today >= MAX_RETRIES_PER_SESSION:
+                log.warning(
+                    "LiveFeedManager: %d reconnect attempts today — feed suspended. "
+                    "REST polling remains active as fallback.",
+                    retries_today,
+                )
+                # Sleep until next calendar day
+                import datetime as _dt
+                now       = _dt.datetime.now()
+                tomorrow  = (now + _dt.timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+                time.sleep((tomorrow - now).total_seconds())
+                continue
 
-            self._feed = self._create_feed(broker, client_id, access_token, pre_instruments)
-            if self._feed is None:
-                return
+            try:
+                from yukti.config import settings
+                from yukti.execution.broker_factory import get_broker
 
-            self._connected = True
-            log.info("LiveFeedManager: WebSocket connected (LTP mode)")
-            self._feed.run_forever()   # blocks until WebSocket closes
+                broker       = get_broker()
+                dhan_client  = getattr(broker, "_dhan", None)
+                client_id    = getattr(dhan_client, "client_id",    None) or settings.dhan_client_id
+                access_token = getattr(dhan_client, "access_token", None) or settings.dhan_access_token
 
-        except Exception as exc:
-            log.warning("LiveFeedManager: feed thread error: %s", exc)
-        finally:
-            self._connected = False
+                if not client_id or not access_token:
+                    log.warning("LiveFeedManager: missing client_id/access_token — feed disabled")
+                    return
+
+                # Rebuild instrument list from current subscriptions each attempt
+                # so positions added after the last connect are included.
+                with self._lock:
+                    pre_instruments = [
+                        {"ExchangeSegment": "NSE_EQ", "SecurityId": sid}
+                        for sid in self._subscriptions.values()
+                    ]
+
+                self._feed = self._create_feed(broker, client_id, access_token, pre_instruments)
+                if self._feed is None:
+                    # Permanent failure (missing dhanhq package etc.) — don't loop
+                    return
+
+                self._connected = True
+                retry_secs    = 5   # reset backoff on successful connect
+                retries_today += 1
+                log.info(
+                    "LiveFeedManager: WebSocket connected (LTP mode, attempt %d/%d today)",
+                    retries_today, MAX_RETRIES_PER_SESSION,
+                )
+                self._feed.run_forever()   # blocks until WebSocket closes
+
+            except Exception as exc:
+                log.warning("LiveFeedManager: feed thread error: %s", exc)
+            finally:
+                self._connected = False
+
+            log.info("LiveFeedManager: reconnecting in %ds ...", retry_secs)
+            time.sleep(retry_secs)
+            retry_secs = min(retry_secs * 2, 60)   # cap at 60s
 
     def _create_feed(
         self,
@@ -194,24 +249,41 @@ class LiveFeedManager:
         return None
 
     def _on_message(self, *args: Any) -> None:
-        """Dispatch incoming tick to asyncio tick handler."""
+        """Dispatch incoming tick to asyncio tick handler.
+
+        DhanHQ payload field names vary between SDK versions and API v1/v2.
+        We try every known variant before giving up so a schema change doesn't
+        silently drop ticks.
+        """
         try:
-            data = args[-1] if args else {}
-            if not isinstance(data, dict):
+            # SDK passes either on_message(ws, data) or on_message(data)
+            data = None
+            for arg in reversed(args):
+                if isinstance(arg, dict):
+                    data = arg
+                    break
+            if data is None:
                 return
+
             security_id = str(
                 data.get("security_id")
                 or data.get("securityId")
                 or data.get("SecurityId")
+                or data.get("sym")
                 or ""
             )
-            ltp = float(
+            # LTP field name differs between v1 (LTP) and v2 (last_price / ltp)
+            ltp_raw = (
                 data.get("LTP")
                 or data.get("last_price")
                 or data.get("lastPrice")
-                or 0
+                or data.get("ltp")
             )
-            if not security_id or ltp <= 0:
+            if not security_id or ltp_raw is None:
+                log.debug("LiveFeedManager: unrecognised tick payload — keys: %s", list(data.keys()))
+                return
+            ltp = float(ltp_raw)
+            if ltp <= 0:
                 return
 
             with self._lock:
