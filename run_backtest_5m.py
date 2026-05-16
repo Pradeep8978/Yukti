@@ -29,7 +29,9 @@ async def main():
             return
 
         # Signature: _run_backtest(start, end, sample_rate, symbols, use_rules_engine, interval='1')
-        start_date = "2026-04-13"
+        # Use the full Dhan 5m window (~60 days) so we get ~120-180 trades per
+        # the 3/day cap instead of 60 — a meaningful sample for PF / win-rate.
+        start_date = "2026-03-20"
         end_date = "2026-05-13"
         
         try:

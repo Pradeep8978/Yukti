@@ -302,7 +302,7 @@ def orb_breakout(
             f"| range ₹{or_range:.2f} | vol {snap.volume_ratio:.1f}×"
             f"{' | daily aligned' if daily_trend == 'UPTREND' else ''}"
         )
-        return PatternSignal(True, "orb_breakout", round(min(strength, 1.0), 2), notes)
+        return PatternSignal(True, "orb_breakout_long", round(min(strength, 1.0), 2), notes)
 
     if short_break:
         vol_ok = snap.volume_ratio >= 1.5
@@ -327,7 +327,7 @@ def orb_breakout(
             f"| range ₹{or_range:.2f} | vol {snap.volume_ratio:.1f}×"
             f"{' | daily aligned' if daily_trend == 'DOWNTREND' else ''}"
         )
-        return PatternSignal(True, "orb_breakout", round(min(strength, 1.0), 2), notes)
+        return PatternSignal(True, "orb_breakout_short", round(min(strength, 1.0), 2), notes)
 
     return PatternSignal(False, "orb_breakout", 0.0, "")
 
@@ -386,7 +386,7 @@ def vwap_bounce(
                 f"| RSI {snap.rsi:.1f} | vol {snap.volume_ratio:.1f}×"
                 f"{' | daily aligned' if daily_trend == 'UPTREND' else ''}"
             )
-            return PatternSignal(True, "vwap_bounce", round(min(strength, 1.0), 2), notes)
+            return PatternSignal(True, "vwap_bounce_long", round(min(strength, 1.0), 2), notes)
 
     # VWAP Bounce Short (Rejection)
     if snap.close < vwap and touched_above:
@@ -412,7 +412,7 @@ def vwap_bounce(
                 f"| RSI {snap.rsi:.1f} | vol {snap.volume_ratio:.1f}×"
                 f"{' | daily aligned' if daily_trend == 'DOWNTREND' else ''}"
             )
-            return PatternSignal(True, "vwap_bounce", round(min(strength, 1.0), 2), notes)
+            return PatternSignal(True, "vwap_bounce_short", round(min(strength, 1.0), 2), notes)
 
     return PatternSignal(False, "vwap_bounce", 0.0, "")
 

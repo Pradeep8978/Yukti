@@ -31,7 +31,8 @@ async def main():
                 end=end_date,
                 sample_rate=0.0,
                 symbols=symbols,
-                use_rules_engine=True
+                use_rules_engine=True,
+                interval="D",
             )
             print("BACKTEST_COMPLETED: TRUE")
         except Exception as e:

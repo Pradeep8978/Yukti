@@ -42,6 +42,16 @@ class SimPosition:
     pnl:          float = 0.0
     pnl_pct:      float = 0.0
     exit_time:    datetime | None = None
+    # Partial-exit / breakeven-trail state.
+    # original_quantity records the size at entry so pnl_pct can be normalized
+    # against full exposure even after a T1 partial.
+    # partial_pnl is the realized PnL from the T1 partial; total pnl =
+    # partial_pnl + runner_pnl_at_close. partial_exit_price > 0 signals
+    # "phase 2" (stop is now at breakeven, target is T2).
+    original_quantity:   int   = 0
+    partial_exit_price:  float = 0.0
+    partial_exit_qty:    int   = 0
+    partial_pnl:         float = 0.0
 
 
 class PaperBroker:
@@ -78,7 +88,8 @@ class PaperBroker:
         lows:  dict[str, float],
     ) -> None:
         """Check if any position's SL or target has been hit.
-        Uses intraday high/low when available (daily candles); falls back to close."""
+        Uses intraday high/low when available (daily candles); falls back to close.
+        On a same-bar SL+target hit we conservatively assume SL fired first."""
         for symbol, pos in list(self.positions.items()):
             if pos.status != "OPEN":
                 continue
@@ -104,13 +115,18 @@ class PaperBroker:
         if not pos:
             return
         is_long = pos.direction == "LONG"
+        runner_pnl = (exit_price - pos.entry_price) * pos.quantity if is_long \
+            else (pos.entry_price - exit_price) * pos.quantity
         pos.exit_price  = exit_price
         pos.exit_reason = reason
-        pos.pnl         = (exit_price - pos.entry_price) * pos.quantity if is_long else (pos.entry_price - exit_price) * pos.quantity
-        pos.pnl_pct     = pos.pnl / (pos.entry_price * pos.quantity) * 100
+        pos.pnl         = runner_pnl + pos.partial_pnl
+        # pnl_pct is computed against the *original* exposure so partial-exit
+        # winners show a comparable % regardless of how the position was scaled.
+        denom_qty = pos.original_quantity if pos.original_quantity > 0 else pos.quantity
+        pos.pnl_pct     = pos.pnl / (pos.entry_price * max(denom_qty, 1)) * 100
         pos.exit_time   = exit_time
         pos.status      = "CLOSED"
-        self.account_value += pos.pnl
+        self.account_value += runner_pnl
         self.closed_trades.append(pos)
         log.debug("Paper closed: %s %s P&L=%.1f%%", symbol, reason, pos.pnl_pct)
 
@@ -294,21 +310,29 @@ class BacktestEngine:
 
         if self.use_rules_engine:
             from yukti.agents.rules_engine import decide as rules_decide
-            from yukti.services.macro_context_service import MacroContext
+            from yukti.services.macro_context_service import MacroContext, fetch_macro_context
             from yukti.signals.patterns import (
                 breakout, breakdown,
                 trend_pullback_long, trend_pullback_short,
                 reversal_long, reversal_short,
-                momentum_long,
+                momentum_long, momentum_short,
+                orb_breakout, vwap_bounce,
             )
 
-            def _detect_pattern(snap):
+            def _detect_pattern(snap, candles_today=None, current_time=None, snap_daily=None):
+                # Mirror the live scanner's coverage: include all 10 patterns,
+                # including momentum_short (which was previously missing and
+                # tilted the backtest LONG-heavy), and the intraday ORB / VWAP
+                # bounce patterns when we have intraday candles + a clock.
                 candidates = [
                     breakout(snap), breakdown(snap),
                     trend_pullback_long(snap), trend_pullback_short(snap),
                     reversal_long(snap), reversal_short(snap),
-                    momentum_long(snap),
+                    momentum_long(snap), momentum_short(snap),
                 ]
+                if candles_today is not None and current_time is not None:
+                    candidates.append(orb_breakout(snap, candles_today, current_time, snap_daily))
+                    candidates.append(vwap_bounce(snap, candles_today, current_time, snap_daily))
                 detected = [p for p in candidates if p.detected]
                 return max(detected, key=lambda p: p.strength) if detected else None
         else:
@@ -352,6 +376,25 @@ class BacktestEngine:
             except Exception as exc:
                 log.debug("precompute failed for %s: %s", sym, exc)
 
+        # Additionally precompute daily indicators for multi-timeframe alignment
+        # when running intraday backtests. This enables rules_engine to consult
+        # a true daily snapshot (rsi, adx, daily S/R) and for patterns that
+        # depend on daily alignment.
+        full_indicators_daily: dict[str, pd.DataFrame] = {}
+        if not is_daily:
+            for sym, df in self.candles.items():
+                try:
+                    # Resample to calendar-day bars using volume-weighted aggregation
+                    daily = df.resample('D').agg({
+                        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                    }).dropna()
+                    if len(daily) < 60:
+                        continue
+                    full_indicators_daily[sym] = compute_full(daily, timeframe='daily')
+                except Exception:
+                    # best-effort: missing daily series degrades gracefully
+                    continue
+
         for ts in all_dates:
             nifty_slice = self.nifty_candles.loc[:ts]
             if len(nifty_slice) < 50:
@@ -387,6 +430,16 @@ class BacktestEngine:
             if self.decision_start is not None and ts_date is not None and ts_date < self.decision_start:
                 continue
 
+            # Cutoff: block new intraday entries inside the last 20 min before
+            # squareoff (matches the live scanner's _entry_cutoff). Without
+            # this, a trade opened at 14:56 has no room to reach a 2R target.
+            if not is_daily and hasattr(ts, "time"):
+                t = ts.time()
+                if t.hour > 14 or (t.hour == 14 and t.minute >= 55):
+                    continue
+
+            current_time = ts.time() if (not is_daily and hasattr(ts, "time")) else None
+
             for symbol in symbols:
                 if symbol in self.broker.positions:
                     continue
@@ -420,12 +473,44 @@ class BacktestEngine:
 
                 # ── Decision ──────────────────────────────────────────
                 if self.use_rules_engine:
-                    macro = MacroContext(
-                        nifty_chg_pct=nifty_chg,
-                        nifty_trend=nifty_trend,
-                    )
-                    pattern = _detect_pattern(snap)
-                    decision, _ = rules_decide(symbol, snap, macro, perf, pattern)
+                    # Build a rich MacroContext using the same fetcher the live
+                    # scanner uses. This loads VIX, PCR, option metrics, and
+                    # headlines (best-effort, cached) so the rules engine has full
+                    # multi-source signals available during backtests.
+                    try:
+                        macro = await fetch_macro_context(nifty_chg, nifty_trend)
+                    except Exception:
+                        # Fallback to minimal context if the async fetch fails
+                        macro = MacroContext(nifty_chg_pct=nifty_chg, nifty_trend=nifty_trend)
+
+                    # Same-day candle slice enables ORB / VWAP-bounce detection.
+                    candles_today = None
+                    if not is_daily and ts_date is not None:
+                        try:
+                            sym_df = self.candles[symbol]
+                            mask = sym_df.index.normalize() == pd.Timestamp(ts_date)
+                            today_slice = sym_df.loc[mask]
+                            if len(today_slice) >= 3:
+                                candles_today = today_slice
+                        except Exception:
+                            candles_today = None
+
+                    # Build a daily snapshot (snap_daily) for multi-timeframe checks
+                    snap_daily = None
+                    try:
+                        if is_daily:
+                            daily_full = full_indicators.get(symbol)
+                            if daily_full is not None:
+                                snap_daily = snapshot_at(daily_full, ts, timeframe='daily')
+                        else:
+                            daily_full = full_indicators_daily.get(symbol) if 'full_indicators_daily' in locals() else None
+                            if daily_full is not None and ts_date is not None:
+                                snap_daily = snapshot_at(daily_full, pd.Timestamp(ts_date), timeframe='daily')
+                    except Exception:
+                        snap_daily = None
+
+                    pattern = _detect_pattern(snap, candles_today, current_time, snap_daily)
+                    decision, _ = rules_decide(symbol, snap, macro, perf, pattern, snap_daily)
                 else:
                     context = build_context(
                         symbol, snap,
@@ -511,7 +596,14 @@ class BacktestEngine:
                     target_2     = decision.target_2,
                     holding      = decision.holding_period,
                     entry_time   = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts)),
+                    original_quantity = position.quantity,
                 )
+                # Attach decision metadata so the trade log surfaces which
+                # pattern fired and at what conviction. Used for offline
+                # analysis (per-pattern win-rate, conviction calibration, …);
+                # not part of the broker contract so we attach lazily.
+                setattr(sim_pos, "setup_type", getattr(decision, "setup_type", "") or "")
+                setattr(sim_pos, "conviction", getattr(decision, "conviction", 0) or 0)
                 self.broker.positions[symbol] = sim_pos
 
             # Record equity point
@@ -587,11 +679,14 @@ class BacktestReport:
                 "direction":   t.direction,
                 "entry":       t.entry_price,
                 "exit":        t.exit_price,
-                "qty":         t.quantity,
+                "qty":         t.original_quantity or t.quantity,
                 "pnl":         round(t.pnl, 2),
                 "pnl_pct":     round(t.pnl_pct, 4),
                 "exit_reason": t.exit_reason,
                 "entry_time":  t.entry_time,
+                "exit_time":   t.exit_time,
+                "setup":       getattr(t, "setup_type", ""),
+                "conviction":  getattr(t, "conviction", 0),
             }
             for t in self.trades
         ]).to_csv(path, index=False)

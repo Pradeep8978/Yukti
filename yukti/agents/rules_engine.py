@@ -19,10 +19,18 @@ from yukti.config import settings
 
 log = logging.getLogger(__name__)
 
-# Pattern types that imply a LONG direction
-_LONG_PATTERNS  = frozenset({"breakout", "trend_pullback", "reversal_long", "momentum", "orb_breakout"})
-# Pattern types that imply a SHORT direction
-_SHORT_PATTERNS = frozenset({"breakdown", "trend_pullback_short", "reversal_short", "momentum_short"})
+# Pattern types that imply a LONG direction.
+# orb_breakout previously emitted the same pattern_type for both up- and
+# down-breaks, so an ORB *short* breakdown was being routed here as a LONG
+# entry. patterns.py now emits orb_breakout_long / orb_breakout_short.
+_LONG_PATTERNS  = frozenset({
+    "breakout", "trend_pullback", "reversal_long", "momentum",
+    "orb_breakout_long", "vwap_bounce",
+})
+_SHORT_PATTERNS = frozenset({
+    "breakdown", "trend_pullback_short", "reversal_short", "momentum_short",
+    "orb_breakout_short",
+})
 
 
 @dataclass
@@ -339,12 +347,14 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     if stop_dist <= 0:
         return _skip("zero_stop_distance", conviction=conviction, bias=market_bias, symbol=symbol)
 
+    t1_r = 2.0
+    t2_r = 3.0
     if direction == "LONG":
-        t1 = entry + 2.0 * stop_dist
-        t2 = entry + 3.0 * stop_dist
+        t1 = entry + t1_r * stop_dist
+        t2 = entry + t2_r * stop_dist
     else:
-        t1 = entry - 2.0 * stop_dist
-        t2 = entry - 3.0 * stop_dist
+        t1 = entry - t1_r * stop_dist
+        t2 = entry - t2_r * stop_dist
 
     vwap_side = "above" if snap.above_vwap() else "below"
     iv_note   = f" IV={atm_iv:.0f}% sl×{sl_mult}" if atm_iv else ""
@@ -371,6 +381,6 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         target_1=round(t1, 2),
         target_2=round(t2, 2),
         conviction=conviction,
-        risk_reward=2.0,
+        risk_reward=t1_r,
         holding_period="intraday",
     )
