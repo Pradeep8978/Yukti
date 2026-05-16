@@ -239,6 +239,7 @@ async def run_gates(
     *,
     ignore_cooldown: bool = False,
     ignore_market_halt: bool = False,
+    ignore_swing_short: bool = False,
 ) -> GateResult:
     """
     Run up to 9 pre-trade risk checks in order. Return first failure.
@@ -352,7 +353,7 @@ async def run_gates(
     # total_exposure_cap — disabled alongside it
     pass
 
-    if trade_decision.holding_period == "swing" and trade_decision.direction == "SHORT":
+    if not ignore_swing_short and trade_decision.holding_period == "swing" and trade_decision.direction == "SHORT":
         return GateResult(False, "swing_short_blocked: NSE equity delivery cannot carry overnight shorts")
 
     # 8. Sector concentration cap — only enforced when caller passed sector info.

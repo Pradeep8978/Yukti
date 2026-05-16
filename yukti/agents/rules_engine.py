@@ -339,8 +339,9 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     # Widen SL multiplier when options market shows elevated IV (system prompt rule)
     atm_iv = getattr(macro, "nifty_atm_iv", None)
     if is_daily_tf:
-        # Daily/swing: tighter SL so losses are smaller and targets reachable
-        sl_mult = 1.5 if (atm_iv is not None and atm_iv > 25) else 1.0
+        # Daily/swing: 1.2× ATR gives room for normal daily noise while keeping
+        # losses manageable. T1 at 1.5R = 1.8 ATR is achievable in 3-5 days.
+        sl_mult = 1.5 if (atm_iv is not None and atm_iv > 25) else 1.2
     else:
         sl_mult = 2.0 if (atm_iv is not None and atm_iv > 25) else 1.5
 
@@ -362,8 +363,8 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     # Daily targets must be reachable within a 1-2 week holding window.
     # Intraday keeps the wider 2R/3R ratios for momentum plays.
     if is_daily_tf:
-        t1_r = 1.5
-        t2_r = 2.5
+        t1_r = 1.2
+        t2_r = 2.0
     else:
         t1_r = 2.0
         t2_r = 3.0
@@ -399,6 +400,6 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         target_1=round(t1, 2),
         target_2=round(t2, 2),
         conviction=conviction,
-        risk_reward=t1_r,
+        risk_reward=t2_r,  # RR based on full target (T2); T1 is a partial exit
         holding_period="swing" if is_daily_tf else "intraday",
     )

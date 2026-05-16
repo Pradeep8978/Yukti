@@ -25,11 +25,20 @@ async def main():
         from yukti.config import settings
         orig_max_pos = settings.max_open_positions
         orig_cooldown = settings.cooldown_cycles
-        settings.max_open_positions = 5
+        orig_min_rr = settings.min_rr
+        orig_account = settings.account_value
+        orig_max_trades = settings.max_trades_per_day
+        orig_min_conv = settings.min_conviction
+        settings.max_open_positions = 8
         settings.cooldown_cycles = 1
+        settings.min_rr = 1.0
+        settings.max_trades_per_day = 10
+        # ₹1000 default is too small for Indian equities (₹500-2500/share).
+        # Use a realistic swing-trading account size.
+        settings.account_value = 500_000.0
 
         # Signature: _run_backtest(start, end, sample_rate, symbols, use_rules_engine)
-        start_date = "2026-04-13"
+        start_date = "2025-11-01"
         end_date = "2026-05-13"
         
         try:
@@ -48,6 +57,10 @@ async def main():
         finally:
             settings.max_open_positions = orig_max_pos
             settings.cooldown_cycles = orig_cooldown
+            settings.min_rr = orig_min_rr
+            settings.account_value = orig_account
+            settings.max_trades_per_day = orig_max_trades
+            settings.min_conviction = orig_min_conv
 
     except Exception as e:
         print(f"ERROR: {e}")

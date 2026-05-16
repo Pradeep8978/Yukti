@@ -484,8 +484,7 @@ class BacktestEngine:
                 max_hold_bars = 10
                 for sym in list(self.broker.positions.keys()):
                     pos = self.broker.positions[sym]
-                    bars_held = (ts - pos.entry_time).days if hasattr(ts, '__sub__') else 0
-                    if bars_held >= max_hold_bars:
+                    if pos.bars_held >= max_hold_bars:
                         self._squareoff(sym, prices, ts)
             # Intraday: square off at 15:15 IST
             elif not is_daily and hasattr(ts, "time") and ts.time().hour == 15 and ts.time().minute >= 15:
@@ -508,6 +507,23 @@ class BacktestEngine:
                     continue
 
             current_time = ts.time() if (not is_daily and hasattr(ts, "time")) else None
+
+            # ── Per-bar macro context (fetched once, shared by all symbols) ──
+            bar_macro: MacroContext | None = None
+            if self.use_rules_engine:
+                try:
+                    bar_macro = await fetch_macro_context(nifty_chg, nifty_trend)
+                except Exception:
+                    bar_macro = MacroContext(nifty_chg_pct=nifty_chg, nifty_trend=nifty_trend)
+
+            # Performance metrics are bar-level (portfolio state doesn't change mid-bar)
+            bar_perf = {
+                "consecutive_losses": self._consecutive_losses(),
+                "daily_pnl_pct":      self._daily_pnl_pct(ts),
+                "win_rate_last_10":   self._win_rate_last_10()[0] if self._win_rate_last_10()[0] is not None else 0.5,
+                "win_rate_last_10_count": self._win_rate_last_10()[1],
+                "trades_today":       self._trades_today(ts),
+            }
 
             for symbol in symbols:
                 if symbol in self.broker.positions:
@@ -532,25 +548,11 @@ class BacktestEngine:
                 except Exception:
                     continue
 
-                perf = {
-                    "consecutive_losses": self._consecutive_losses(),
-                    "daily_pnl_pct":      self._daily_pnl_pct(ts),
-                    "win_rate_last_10":   self._win_rate_last_10()[0] if self._win_rate_last_10()[0] is not None else 0.5,
-                    "win_rate_last_10_count": self._win_rate_last_10()[1],
-                    "trades_today":       self._trades_today(ts),
-                }
+                perf = bar_perf
 
                 # ── Decision ──────────────────────────────────────────
                 if self.use_rules_engine:
-                    # Build a rich MacroContext using the same fetcher the live
-                    # scanner uses. This loads VIX, PCR, option metrics, and
-                    # headlines (best-effort, cached) so the rules engine has full
-                    # multi-source signals available during backtests.
-                    try:
-                        macro = await fetch_macro_context(nifty_chg, nifty_trend)
-                    except Exception:
-                        # Fallback to minimal context if the async fetch fails
-                        macro = MacroContext(nifty_chg_pct=nifty_chg, nifty_trend=nifty_trend)
+                    macro = bar_macro or MacroContext(nifty_chg_pct=nifty_chg, nifty_trend=nifty_trend)
 
                     # Same-day candle slice enables ORB / VWAP-bounce detection.
                     candles_today = None
@@ -624,6 +626,7 @@ class BacktestEngine:
                     portfolio,
                     ignore_cooldown=True,
                     ignore_market_halt=True,
+                    ignore_swing_short=True,
                 )
                 if not gate.passed:
                     continue
@@ -642,7 +645,7 @@ class BacktestEngine:
 
                 # For daily/swing trades min_rr is 1.5 (T1 at 1.5R), for
                 # intraday it stays at settings.min_rr (default 2.0).
-                effective_min_rr = 1.3 if is_daily else settings.min_rr
+                effective_min_rr = 1.0 if is_daily else settings.min_rr
                 if decision.risk_reward < effective_min_rr or position.quantity == 0:
                     continue
 
@@ -857,7 +860,7 @@ async def _run_backtest(
                         [(r.time, r.open, r.high, r.low, r.close, r.volume) for r in rows],
                         columns=["time", "open", "high", "low", "close", "volume"],
                     ).set_index("time")
-                    candles[symbol] = df.astype(float)
+                    candles[symbol] = df.astype(float).loc[~df.index.duplicated(keep='last')]
     except Exception as db_err:
         log.warning("DB unavailable (%s) — falling back to yfinance daily data", db_err)
 
