@@ -163,6 +163,14 @@ class PaperBroker:
 
     async def market_exit(self, security_id: str, direction: str, quantity: int, product_type: str) -> dict[str, Any]:
         price = self._current_prices.get(security_id, 0.0)
+        if price <= 0:
+            pos = self.positions.get(security_id)
+            if pos is not None:
+                log.warning(
+                    "market_exit %s: no current price — using entry ₹%.2f (PnL=0)",
+                    security_id, pos.entry_price,
+                )
+                price = pos.entry_price
         self._close_position(security_id, price, "eod_squareoff")
         return {"orderId": f"EXIT-{self.order_counter}", "status": "TRADED"}
 
@@ -255,6 +263,28 @@ class BacktestEngine:
             return False
         return True
 
+    def _squareoff(self, sym: str, prices: dict[str, float], ts: datetime) -> None:
+        """End-of-period forced exit. Pick the best available price:
+        1) this bar's close if the symbol has a candle here,
+        2) the broker's last-known close (forward-filled across prior bars),
+        3) the position's entry price as a final safety fallback (PnL=0).
+        Exiting at 0.0 — which is what a naive prices.get(sym, 0.0) would do —
+        registers a fake -100% loss whenever a position's symbol has a data
+        gap on the squareoff bar (holiday, halt, late-listed peer, etc.)."""
+        pos = self.broker.positions.get(sym)
+        if pos is None:
+            return
+        exit_price = prices.get(sym)
+        if exit_price is None or exit_price <= 0:
+            exit_price = self.broker._current_prices.get(sym)
+        if exit_price is None or exit_price <= 0:
+            log.warning(
+                "Squareoff %s @ %s: no price available — using entry price ₹%.2f (PnL=0)",
+                sym, ts, pos.entry_price,
+            )
+            exit_price = pos.entry_price
+        self.broker._close_position(sym, exit_price, "eod_squareoff", ts)
+
     async def run(self) -> "BacktestReport":
         """Run the full backtest and return a report."""
         from yukti.signals.indicators import compute
@@ -328,11 +358,11 @@ class BacktestEngine:
             # Daily candles: square off at end of each week (Friday)
             if is_daily and hasattr(ts, "dayofweek") and ts.dayofweek == 4:
                 for sym in list(self.broker.positions.keys()):
-                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff", ts)
+                    self._squareoff(sym, prices, ts)
             # Intraday: square off at 15:15 IST
             elif not is_daily and hasattr(ts, "time") and ts.time().hour == 15 and ts.time().minute >= 15:
                 for sym in list(self.broker.positions.keys()):
-                    self.broker._close_position(sym, prices.get(sym, 0.0), "eod_squareoff", ts)
+                    self._squareoff(sym, prices, ts)
 
             self._register_new_cooldowns(ts, cycle_delta)
 
