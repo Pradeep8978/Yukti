@@ -192,6 +192,17 @@ async def open_trade(
     await mark_filled(intent_id, fill_price, filled_qty)
     pos["fill_price"] = fill_price
     pos["status"]     = "FILLED"
+
+    # Slippage vs. intended entry price: positive = adverse, negative = favourable.
+    intended = decision.entry_price or 0.0
+    if intended > 0 and fill_price > 0:
+        if (decision.direction or "LONG") == "LONG":
+            pos["slippage_pct"] = round((fill_price - intended) / intended * 100, 4)
+        else:
+            pos["slippage_pct"] = round((intended - fill_price) / intended * 100, 4)
+        log.info("Slippage %s: %.4f%% (intended ₹%.2f → filled ₹%.2f)",
+                 symbol, pos["slippage_pct"], intended, fill_price)
+
     await save_position(symbol, pos)
     # NOTE: increment_trades_today() moved to after ARMED — emergency-exited
     # trades should not consume the daily trade limit.

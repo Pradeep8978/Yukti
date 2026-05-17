@@ -400,6 +400,39 @@ class MarketScanService:
                 except Exception:
                     pass
 
+                # ── Existing position guard + pyramid signal ──────────
+                # Any in-flight status (PLACED/FILLED/ARMED/PARTIAL_EXITING)
+                # means we already have exposure on this symbol. Never open a
+                # second independent trade — that would create a duplicate Redis
+                # key and corrupt the running position's SL/GTT state.
+                _IN_FLIGHT = {"PLACED", "FILLED", "ARMED", "PARTIAL_EXITING"}
+                _existing = (cached_positions or {}).get(symbol)
+                if _existing and _existing.get("status") in _IN_FLIGHT:
+                    _ex_dir  = (_existing.get("direction") or "").upper()
+                    _ex_fill = float(_existing.get("fill_price") or _existing.get("entry_price") or 0)
+                    _pat_dir = "LONG" if pattern.pattern_type in {
+                        "breakout", "trend_pullback", "reversal_long", "momentum",
+                        "orb_breakout_long", "vwap_bounce_long", "gap_go_long",
+                    } else "SHORT"
+                    # Pyramid signal: same direction + meaningful profit + only on ARMED
+                    if (
+                        _existing.get("status") == "ARMED"
+                        and _ex_dir == _pat_dir
+                        and _ex_fill > 0
+                    ):
+                        _profit = (
+                            (snap.close - _ex_fill) / _ex_fill if _ex_dir == "LONG"
+                            else (_ex_fill - snap.close) / _ex_fill
+                        )
+                        if _profit >= 0.008:
+                            await self._pyramid_position(
+                                symbol, security_id, _existing, snap, macro, perf,
+                                pattern, snap_daily, live_account_value, _profit,
+                            )
+                            return
+                    record_skip("existing_position")
+                    return
+
                 if not settings.use_ai_decision:
                     # ── Rules engine path (no API calls) ─────────────
                     from yukti.agents.rules_engine import decide as rules_decide
@@ -524,7 +557,10 @@ class MarketScanService:
                     win_rate_last_10=perf.get("win_rate_last_10"),
                     win_rate_last_10_count=int(perf.get("win_rate_last_10_count", 0) or 0),
                 )
-                gate = await run_gates(decision, portfolio)
+                gate = await run_gates(
+                    decision, portfolio,
+                    trade_daily_volume=float(snap_daily.volume) if snap_daily and snap_daily.volume else None,
+                )
                 if not gate.passed:
                     record_skip(gate.reason or "gate_blocked")
                     log.info("MarketScanService: risk gate failed for %s: %s", symbol, gate.reason)
@@ -567,6 +603,53 @@ class MarketScanService:
             except Exception as exc:
                 scan_failures.labels(symbol=symbol).inc()
                 log.error("MarketScanService: scan error %s: %s", symbol, exc, exc_info=True)
+
+    async def _pyramid_position(
+        self,
+        symbol: str,
+        security_id: str,
+        existing_pos: dict,
+        snap,
+        macro,
+        perf: dict,
+        pattern,
+        snap_daily,
+        live_account_value: float,
+        profit_pct: float,
+    ) -> None:
+        """Detect a pyramid opportunity and alert the trader via Telegram.
+
+        Auto-executing a pyramid requires merging the new order into the existing
+        position record: updating qty, average price, and re-arming GTTs for the
+        combined quantity. Until that merge logic is implemented safely, we alert
+        and let the human decide rather than risk corrupting the running position's
+        Redis record and orphaning its GTT orders.
+        """
+        try:
+            from yukti.agents.rules_engine import decide as rules_decide
+
+            decision, _ = rules_decide(symbol, snap, macro, perf, pattern, snap_daily)
+            if decision.action == "SKIP" or (decision.conviction or 0) < 8:
+                log.info("PYRAMID %s: skipped — conviction %d < 8", symbol, decision.conviction or 0)
+                return
+
+            direction = existing_pos.get("direction", "LONG")
+            log.info(
+                "PYRAMID OPPORTUNITY %s: %s +%.1f%% profit, conviction=%d — alerting trader",
+                symbol, direction, profit_pct * 100, decision.conviction,
+            )
+            try:
+                from yukti.telegram.bot import alert
+                await alert(
+                    f"\U0001f4c8 *Pyramid Signal — {symbol}*\n"
+                    f"Existing {direction} position at +{profit_pct * 100:.1f}% profit\n"
+                    f"New *{pattern.pattern_type}* signal | Conviction {decision.conviction}/10\n"
+                    f"Current price ₹{snap.close:.2f} | SL ₹{existing_pos.get('stop_loss', '?')}"
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            log.debug("PYRAMID %s: signal check failed — %s", symbol, exc)
 
     @staticmethod
     def _sector_exposure(

@@ -210,6 +210,13 @@ class Position(Base):
     status: Mapped[str] = mapped_column(String(15), default="OPEN", index=True)
     reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Trailing stop state — persisted so a restart picks up where the SL left off
+    trailing_sl: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    atr_trail_distance: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Slippage vs intended entry price (positive = adverse, negative = favourable)
+    slippage_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     opened_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     filled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 

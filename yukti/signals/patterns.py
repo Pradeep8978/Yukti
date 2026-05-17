@@ -22,60 +22,109 @@ class PatternSignal:
     notes:        str
 
 
-def breakout(snap: IndicatorSnapshot) -> PatternSignal:
+# ── NSE intraday session boundaries ─────────────────────────────────────────
+# gap_go:         09:20–09:30 (own gate inside function)
+# orb_breakout:   09:30–11:00 (own gate inside function)
+# vwap_bounce:    09:45–14:40 (own gate inside function)
+# breakout/breakdown:   blocked in morning rush AND dead zone
+# trend_pullback: blocked in opening 30 min (no trend established)
+# reversal:       valid 10:00–14:30 only
+# momentum:       blocked in dead zone and EOD fade
+_MORNING_RUSH_END  = dt_time(9, 30)    # before this: only gap_go, ORB
+_DEAD_ZONE_START   = dt_time(10, 30)   # post-ORB quiet: false signals common
+_DEAD_ZONE_END     = dt_time(11, 30)   # prime trending window resumes
+_PULLBACK_START    = dt_time(9, 45)    # need at least 6 bars for trend
+_REVERSAL_START    = dt_time(10, 0)    # reversals need enough history
+_REVERSAL_END      = dt_time(14, 30)   # no new reversals in EOD fade
+_PRIME_END         = dt_time(14, 30)   # momentum/breakout must complete before this
+
+
+def _in_morning_rush(t: dt_time | None) -> bool:
+    return t is not None and t < _MORNING_RUSH_END
+
+
+def _in_dead_zone(t: dt_time | None) -> bool:
+    return t is not None and _DEAD_ZONE_START <= t < _DEAD_ZONE_END
+
+
+def _in_eod_fade(t: dt_time | None) -> bool:
+    return t is not None and t >= _PRIME_END
+
+
+def breakout(snap: IndicatorSnapshot, current_time: dt_time | None = None) -> PatternSignal:
     """
     Bullish breakout: price closes above recent swing high with volume surge.
     Classic setup: consolidation → expansion above resistance.
+    Blocked in morning rush (ORB handles that window) and dead zone (10:30-11:30).
     """
-    above_swing = snap.close > snap.nearest_swing_high
-    vol_surge   = snap.volume_ratio > 1.5
-    bull_trend  = snap.trend == "UPTREND" or snap.supertrend_bull
-    macd_bull   = snap.macd_bull
-    rsi_ok      = 50 < snap.rsi < 75  # not overbought yet
-
-    score = sum([above_swing, vol_surge, bull_trend, macd_bull, rsi_ok])
-    if score < 3 or not above_swing:
+    if _in_morning_rush(current_time) or _in_dead_zone(current_time):
         return PatternSignal(False, "breakout", 0.0, "")
 
-    strength = score / 5.0
+    above_swing  = snap.close > snap.nearest_swing_high
+    vol_surge    = snap.volume_ratio > 1.5
+    bull_trend   = snap.trend == "UPTREND" or snap.supertrend_bull
+    macd_bull    = snap.macd_bull
+    rsi_ok       = 50 < snap.rsi < 75
+    # Breakout bar must have a real body — wick-only spikes above resistance are traps
+    body_ok      = snap.body_ratio > 0.35
+    # Don't chase breakouts into bearish RSI divergence (price up, RSI down = exhaustion)
+    no_bearish_div = not snap.rsi_bearish_divergence
+
+    score = sum([above_swing, vol_surge, bull_trend, macd_bull, rsi_ok, body_ok, no_bearish_div])
+    if score < 4 or not above_swing or not body_ok:
+        return PatternSignal(False, "breakout", 0.0, "")
+
+    strength = score / 7.0
     notes = (
         f"Price ₹{snap.close:.2f} > swing high ₹{snap.nearest_swing_high:.2f} "
-        f"| vol {snap.volume_ratio:.1f}× avg"
+        f"| body {snap.body_ratio:.0%} | vol {snap.volume_ratio:.1f}× avg"
         f"{' | MACD bull' if macd_bull else ''}"
         f"{' | RSI ' + str(round(snap.rsi, 1)) if rsi_ok else ''}"
     )
     return PatternSignal(True, "breakout", round(strength, 2), notes)
 
 
-def breakdown(snap: IndicatorSnapshot) -> PatternSignal:
+def breakdown(snap: IndicatorSnapshot, current_time: dt_time | None = None) -> PatternSignal:
     """
     Bearish breakdown: price closes below recent swing low with volume surge.
     Entry for SHORT trades.
+    Blocked in morning rush and dead zone (symmetric with breakout).
     """
-    below_swing = snap.close < snap.nearest_swing_low
-    vol_surge   = snap.volume_ratio > 1.5
-    bear_trend  = snap.trend == "DOWNTREND" or not snap.supertrend_bull
-    macd_bear   = not snap.macd_bull
-    rsi_ok      = 25 < snap.rsi < 50
-
-    score = sum([below_swing, vol_surge, bear_trend, macd_bear, rsi_ok])
-    if score < 3 or not below_swing:
+    if _in_morning_rush(current_time) or _in_dead_zone(current_time):
         return PatternSignal(False, "breakdown", 0.0, "")
 
-    strength = score / 5.0
+    below_swing    = snap.close < snap.nearest_swing_low
+    vol_surge      = snap.volume_ratio > 1.5
+    bear_trend     = snap.trend == "DOWNTREND" or not snap.supertrend_bull
+    macd_bear      = not snap.macd_bull
+    rsi_ok         = 25 < snap.rsi < 50
+    body_ok        = snap.body_ratio > 0.35
+    no_bullish_div = not snap.rsi_bullish_divergence
+
+    score = sum([below_swing, vol_surge, bear_trend, macd_bear, rsi_ok, body_ok, no_bullish_div])
+    if score < 4 or not below_swing or not body_ok:
+        return PatternSignal(False, "breakdown", 0.0, "")
+
+    strength = score / 7.0
     notes = (
         f"Price ₹{snap.close:.2f} < swing low ₹{snap.nearest_swing_low:.2f} "
-        f"| vol {snap.volume_ratio:.1f}× avg"
+        f"| body {snap.body_ratio:.0%} | vol {snap.volume_ratio:.1f}× avg"
         f"{' | MACD bear' if macd_bear else ''}"
     )
     return PatternSignal(True, "breakdown", round(strength, 2), notes)
 
 
-def trend_pullback_long(snap: IndicatorSnapshot) -> PatternSignal:
+def trend_pullback_long(snap: IndicatorSnapshot, current_time: dt_time | None = None) -> PatternSignal:
     """
     Pullback to EMA in an uptrend: buy the dip.
     Price retreats to EMA20/EMA50, RSI cools to 40-55 zone, then bounces.
+    Blocked in first 30 minutes (trend not yet established) and dead zone.
     """
+    if current_time is not None and current_time < _PULLBACK_START:
+        return PatternSignal(False, "trend_pullback", 0.0, "")
+    if _in_dead_zone(current_time):
+        return PatternSignal(False, "trend_pullback", 0.0, "")
+
     uptrend       = snap.trend == "UPTREND" and snap.supertrend_bull
     near_ema20    = abs(snap.close - snap.ema20) / snap.ema20 < 0.008   # within 0.8%
     near_ema50    = abs(snap.close - snap.ema50) / snap.ema50 < 0.012
@@ -98,11 +147,17 @@ def trend_pullback_long(snap: IndicatorSnapshot) -> PatternSignal:
     return PatternSignal(True, "trend_pullback", round(strength, 2), notes)
 
 
-def trend_pullback_short(snap: IndicatorSnapshot) -> PatternSignal:
+def trend_pullback_short(snap: IndicatorSnapshot, current_time: dt_time | None = None) -> PatternSignal:
     """
     Rally to EMA in a downtrend: sell the bounce.
     Price rallies up to EMA20/EMA50 in a downtrend, then rolls over.
+    Blocked in opening 30 min and dead zone (symmetric with long).
     """
+    if current_time is not None and current_time < _PULLBACK_START:
+        return PatternSignal(False, "trend_pullback_short", 0.0, "")
+    if _in_dead_zone(current_time):
+        return PatternSignal(False, "trend_pullback_short", 0.0, "")
+
     downtrend    = snap.trend == "DOWNTREND" and not snap.supertrend_bull
     near_ema20   = abs(snap.close - snap.ema20) / snap.ema20 < 0.008
     near_ema50   = abs(snap.close - snap.ema50) / snap.ema50 < 0.012
@@ -125,11 +180,16 @@ def trend_pullback_short(snap: IndicatorSnapshot) -> PatternSignal:
     return PatternSignal(True, "trend_pullback_short", round(strength, 2), notes)
 
 
-def reversal_long(snap: IndicatorSnapshot) -> PatternSignal:
+def reversal_long(snap: IndicatorSnapshot, current_time: dt_time | None = None) -> PatternSignal:
     """
     Bullish reversal from oversold: RSI < 35, MACD turning up, at support.
     High risk / high reward — requires high conviction from Claude.
+    Valid 10:00–14:30 only: too early = opening volatility, too late = EOD drift.
+    Bullish divergence or hammer candle upgrades strength significantly.
     """
+    if current_time is not None and (current_time < _REVERSAL_START or current_time >= _REVERSAL_END):
+        return PatternSignal(False, "reversal_long", 0.0, "")
+
     oversold      = snap.rsi < 36
     # Histogram improving = less negative than -30% of the MACD line magnitude.
     # In oversold conditions MACD is negative; we want it "turning up", not
@@ -138,51 +198,73 @@ def reversal_long(snap: IndicatorSnapshot) -> PatternSignal:
     macd_turning  = snap.macd_hist > -(macd_ref * 0.3)
     at_bb_lower   = snap.close < snap.bb_lower * 1.005     # near/below BB lower
     near_swing_lo = abs(snap.close - snap.nearest_swing_low) / snap.nearest_swing_low < 0.01
-    candle_green  = snap.close > snap.open  # current candle is green
+    candle_green  = snap.close > snap.open
+    # Hammer or bullish divergence: highest-quality reversal confirmation
+    hammer_or_div = snap.is_hammer or snap.rsi_bullish_divergence
 
-    score = sum([oversold, macd_turning, at_bb_lower, near_swing_lo, candle_green])
+    score = sum([oversold, macd_turning, at_bb_lower, near_swing_lo, candle_green, hammer_or_div])
     if score < 3 or not oversold:
         return PatternSignal(False, "reversal_long", 0.0, "")
 
-    strength = score / 5.0
+    strength = score / 6.0
+    # Strong bonus for hammer or bullish divergence — these are high-quality signals
+    if hammer_or_div:
+        strength = min(strength + 0.10, 1.0)
     notes = (
         f"Oversold reversal: RSI {snap.rsi:.1f}"
         f"{' | near BB lower' if at_bb_lower else ''}"
         f"{' | at swing low ₹' + str(round(snap.nearest_swing_low, 2)) if near_swing_lo else ''}"
+        f"{' | HAMMER' if snap.is_hammer else (' | bullish-div' if snap.rsi_bullish_divergence else '')}"
         f"{' | green candle' if candle_green else ''}"
     )
     return PatternSignal(True, "reversal_long", round(strength, 2), notes)
 
 
-def reversal_short(snap: IndicatorSnapshot) -> PatternSignal:
+def reversal_short(snap: IndicatorSnapshot, current_time: dt_time | None = None) -> PatternSignal:
     """
     Bearish reversal from overbought: RSI > 65, at resistance, MACD rolling over.
+    Valid 10:00–14:30 only (symmetric with reversal_long).
+    Shooting star or bearish divergence upgrades strength.
     """
+    if current_time is not None and (current_time < _REVERSAL_START or current_time >= _REVERSAL_END):
+        return PatternSignal(False, "reversal_short", 0.0, "")
+
     overbought    = snap.rsi > 64
     at_bb_upper   = snap.close > snap.bb_upper * 0.995
     near_swing_hi = abs(snap.close - snap.nearest_swing_high) / snap.nearest_swing_high < 0.01
     candle_red    = snap.close < snap.open
     macd_hist_neg = snap.macd_hist < 0
+    star_or_div   = snap.is_shooting_star or snap.rsi_bearish_divergence
 
-    score = sum([overbought, at_bb_upper, near_swing_hi, candle_red, macd_hist_neg])
+    score = sum([overbought, at_bb_upper, near_swing_hi, candle_red, macd_hist_neg, star_or_div])
     if score < 3 or not overbought:
         return PatternSignal(False, "reversal_short", 0.0, "")
 
-    strength = score / 5.0
+    strength = score / 6.0
+    if star_or_div:
+        strength = min(strength + 0.10, 1.0)
     notes = (
         f"Overbought reversal: RSI {snap.rsi:.1f}"
         f"{' | at BB upper' if at_bb_upper else ''}"
         f"{' | near swing high ₹' + str(round(snap.nearest_swing_high, 2)) if near_swing_hi else ''}"
+        f"{' | SHOOTING STAR' if snap.is_shooting_star else (' | bearish-div' if snap.rsi_bearish_divergence else '')}"
         f"{' | red candle' if candle_red else ''}"
     )
     return PatternSignal(True, "reversal_short", round(strength, 2), notes)
 
 
-def momentum_long(snap: IndicatorSnapshot) -> PatternSignal:
+def momentum_long(snap: IndicatorSnapshot, current_time: dt_time | None = None) -> PatternSignal:
     """
     Strong bullish momentum: everything aligned — trend, MACD, RSI, volume, VWAP.
-    Chase only with confirmation; best on strong opening moves.
+    Blocked in dead zone (10:30-11:30) and EOD fade (14:30+).
+    Bearish divergence is a hard block — momentum is exhausted when RSI diverges.
     """
+    if _in_dead_zone(current_time) or _in_eod_fade(current_time):
+        return PatternSignal(False, "momentum", 0.0, "")
+    # Bearish divergence signals momentum exhaustion — do not chase
+    if snap.rsi_bearish_divergence:
+        return PatternSignal(False, "momentum", 0.0, "")
+
     rsi_momentum  = 58 <= snap.rsi <= 72
     macd_bull     = snap.macd_bull and snap.macd_hist > 0
     above_vwap    = snap.above_vwap()
@@ -204,11 +286,18 @@ def momentum_long(snap: IndicatorSnapshot) -> PatternSignal:
     return PatternSignal(True, "momentum", round(strength, 2), notes)
 
 
-def momentum_short(snap: IndicatorSnapshot) -> PatternSignal:
+def momentum_short(snap: IndicatorSnapshot, current_time: dt_time | None = None) -> PatternSignal:
     """
     Strong bearish momentum: RSI oversold zone, MACD bearish, below VWAP/EMA20, volume surge.
     Intraday only — swing shorts are blocked at the risk layer per NSE rules.
+    Blocked in dead zone and EOD fade (symmetric with momentum_long).
+    Bullish divergence is a hard block — selling momentum is exhausted.
     """
+    if _in_dead_zone(current_time) or _in_eod_fade(current_time):
+        return PatternSignal(False, "momentum_short", 0.0, "")
+    if snap.rsi_bullish_divergence:
+        return PatternSignal(False, "momentum_short", 0.0, "")
+
     rsi_momentum  = 28 <= snap.rsi <= 42
     macd_bear     = not snap.macd_bull and snap.macd_hist < 0
     below_vwap    = not snap.above_vwap()
@@ -540,14 +629,14 @@ def scan_all(
     Run all pattern detectors and return detected signals sorted by strength.
     """
     all_patterns = [
-        breakout(snap),
-        breakdown(snap),
-        trend_pullback_long(snap),
-        trend_pullback_short(snap),
-        reversal_long(snap),
-        reversal_short(snap),
-        momentum_long(snap),
-        momentum_short(snap),
+        breakout(snap, current_time),
+        breakdown(snap, current_time),
+        trend_pullback_long(snap, current_time),
+        trend_pullback_short(snap, current_time),
+        reversal_long(snap, current_time),
+        reversal_short(snap, current_time),
+        momentum_long(snap, current_time),
+        momentum_short(snap, current_time),
         orb_breakout(snap, candles, current_time, indicators_daily),
         vwap_bounce(snap, candles, current_time, indicators_daily),
         gap_go(snap, candles, current_time, indicators_daily),
