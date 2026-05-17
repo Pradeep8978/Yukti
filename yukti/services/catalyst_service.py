@@ -46,15 +46,53 @@ _TTL_SECONDS = 24 * 3600
 _HARD_CATEGORIES = {"M&A", "GUIDANCE", "RESULTS"}
 _SOFT_CATEGORIES = {"BOARD"}
 
+# Sentiment thresholds for catalyst scoring adjustments
+_SENT_STRONG_POS =  0.5   # beat estimates, record profit → +3 pts bonus
+_SENT_MILD_POS   =  0.2   # order win, dividend → +1 pt
+_SENT_MILD_NEG   = -0.2   # misses, weak results → score capped at 3
+_SENT_STRONG_NEG = -0.5   # fraud, SEBI notice, default → score zeroed
+
 
 def _score_items(items: Iterable[NewsItem]) -> int:
+    """Base category score plus sentiment adjustment.
+
+    Positive sentiment on a hard catalyst (e.g. beat estimates) earns bonus
+    pts — the news quality matters, not just the presence of news.
+    Negative sentiment caps or zeroes the score — negative news should not
+    promote a stock into the scan queue.
+    """
+    item_list = list(items)
+    has_hard = any(i.category in _HARD_CATEGORIES for i in item_list)
+    has_soft = any(i.category in _SOFT_CATEGORIES for i in item_list)
+
     pts = 0
-    has_hard = any(i.category in _HARD_CATEGORIES for i in items)
-    has_soft = any(i.category in _SOFT_CATEGORIES for i in items)
     if has_hard:
         pts += 8
     if has_soft:
         pts += 3
+
+    # Aggregate sentiment: use the strongest signal across all items.
+    sentiments = [i.sentiment for i in item_list if i.sentiment is not None]
+    if sentiments:
+        # Worst and best sentiment across the batch
+        worst = min(sentiments)
+        best  = max(sentiments)
+
+        if worst <= _SENT_STRONG_NEG:
+            # Strongly negative news (fraud, SEBI ban) → zero out entirely.
+            # Don't trade stocks with active regulatory/fraud risk.
+            return 0
+        if worst <= _SENT_MILD_NEG:
+            # Mildly negative (missed estimates, weak guidance) →
+            # cap at 3 so it doesn't rank ahead of clean setups.
+            pts = min(pts, 3)
+        elif best >= _SENT_STRONG_POS:
+            # Strongly positive (beat estimates, record profit) → +3 bonus
+            pts += 3
+        elif best >= _SENT_MILD_POS:
+            # Mildly positive (order win, dividend) → +1 bonus
+            pts += 1
+
     return pts
 
 
@@ -69,6 +107,12 @@ def score_catalyst_for_symbol(
     if in_results_window:
         base += 4
     return min(base, 15)
+
+
+def worst_sentiment(items: Iterable[NewsItem]) -> float:
+    """Return the most negative sentiment across items, or 0.0 if none scored."""
+    scores = [i.sentiment for i in items if i.sentiment is not None]
+    return min(scores) if scores else 0.0
 
 
 # ── Refresh: pull provider + earnings calendar, write per-symbol cache ──────

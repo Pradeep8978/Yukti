@@ -107,6 +107,9 @@ async def get_position(symbol: str) -> dict[str, Any] | None:
                 "target_gtt_id": pos.target_gtt_id,
                 "status": pos.status,
                 "reasoning": pos.reasoning,
+                "trailing_sl": pos.trailing_sl,
+                "atr_trail_distance": pos.atr_trail_distance,
+                "slippage_pct": pos.slippage_pct,
                 "opened_at": pos.opened_at.isoformat(),
                 "filled_at": pos.filled_at.isoformat() if pos.filled_at else None,
             }
@@ -158,6 +161,9 @@ async def get_all_positions() -> dict[str, dict[str, Any]]:
                 "target_gtt_id": pos.target_gtt_id,
                 "status": pos.status,
                 "reasoning": pos.reasoning,
+                "trailing_sl": pos.trailing_sl,
+                "atr_trail_distance": pos.atr_trail_distance,
+                "slippage_pct": pos.slippage_pct,
                 "opened_at": pos.opened_at.isoformat(),
                 "filled_at": pos.filled_at.isoformat() if pos.filled_at else None,
             }

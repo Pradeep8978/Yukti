@@ -417,6 +417,11 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
 
     # 5 — Update position record; promote T2 → T1 for next monitor check
     old_t2 = float(pos.get("target_2") or 0)
+    # Compute ATR proxy from original stop distance BEFORE overwriting stop_loss.
+    # This becomes the per-stock trailing distance (adapts to volatility at entry).
+    orig_stop    = float(pos.get("stop_loss", 0))
+    atr_trail    = round(abs(fill_price - orig_stop), 2) if orig_stop and fill_price else 0.0
+
     pos["status"]        = "ARMED"            # clear PARTIAL_EXITING marker set in step 0
     pos.pop("partial_exit_started_at", None)  # in-flight marker no longer relevant
     pos["quantity"]      = remaining
@@ -425,7 +430,12 @@ async def _partial_exit_t1(symbol: str, pos: dict[str, Any], exit_price: float) 
     pos["target_2"]      = None
     pos["sl_gtt_id"]     = new_sl_gtt_id
     pos["target_gtt_id"] = None
+    # Initial trailing SL = 1×ATR (stop distance) behind T1 exit price.
+    # Stored alongside atr_trail_distance so _update_trailing_sl can stay adaptive.
+    pos["atr_trail_distance"] = atr_trail
     pos["trailing_sl"]   = round(
+        exit_price - atr_trail if is_long else exit_price + atr_trail, 2
+    ) if atr_trail > 0 else round(
         exit_price * (1 - TRAIL_PCT) if is_long else exit_price * (1 + TRAIL_PCT), 2
     )
     await save_position(symbol, pos)
@@ -455,21 +465,36 @@ async def _update_trailing_sl(
     last_low: float,
     is_long: bool,
 ) -> None:
-    """Tighten trailing stop behind the high-water mark. Redis-only update."""
-    current = float(pos.get("trailing_sl") or pos.get("stop_loss", 0))
+    """Tighten trailing stop behind the high-water mark. Redis-only update.
+
+    Uses the original stop distance as the ATR proxy (stored at partial-exit time
+    as `atr_trail_distance`). This adapts the trail width to each stock's volatility
+    at entry rather than using a flat 1.5% for all stocks. Falls back to TRAIL_PCT
+    for positions opened before this field was introduced.
+    """
+    current    = float(pos.get("trailing_sl") or pos.get("stop_loss", 0))
+    fill_price = float(pos.get("fill_price") or pos.get("entry_price", 0))
+    atr_trail  = float(pos.get("atr_trail_distance") or 0)
+    if atr_trail <= 0:
+        atr_trail = fill_price * TRAIL_PCT  # fallback for legacy positions
+
     if is_long:
-        candidate = round(last_high * (1 - TRAIL_PCT), 2)
+        candidate = round(last_high - atr_trail, 2)
+        # Never trail the SL below breakeven (fill_price) — protect against loss
+        candidate = max(candidate, fill_price)
         if candidate <= current:
             return
     else:
-        candidate = round(last_low * (1 + TRAIL_PCT), 2)
+        candidate = round(last_low + atr_trail, 2)
+        if fill_price > 0:
+            candidate = min(candidate, fill_price)  # never trail above breakeven (short)
         if candidate >= current:
             return
 
     pos["trailing_sl"] = candidate
     r = await get_redis()
     await r.set(f"yukti:positions:{symbol}", json.dumps(pos), ex=86_400)
-    log.debug("Trailing SL %s: ₹%.2f → ₹%.2f", symbol, current, candidate)
+    log.debug("Trailing SL %s: ₹%.2f → ₹%.2f (atr_trail=₹%.2f)", symbol, current, candidate, atr_trail)
 
 
 # ═══════════════════════════════════════════════════════════════

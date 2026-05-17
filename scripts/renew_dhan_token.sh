@@ -61,7 +61,7 @@ Response: ${BODY:0:300}
 Please generate a new token at https://dhanhq.co and run:
 \`\`\`
 sed -i 's|^DHAN_ACCESS_TOKEN=.*|DHAN_ACCESS_TOKEN=NEW_TOKEN|' /opt/yukti/.env
-docker compose -f /opt/yukti/docker-compose.yml up -d --force-recreate yukti
+docker compose -f /opt/yukti/docker-compose.yml up -d --no-deps yukti
 \`\`\`"
     log "FAIL: renewal API returned $HTTP_CODE"
     send_telegram "$msg"
@@ -122,7 +122,7 @@ done
 # ── Step 4: Recreate container so it picks up the new token ──────────────────
 log "Restarting Yukti container..."
 cd "$REPO_DIR"
-docker compose up -d --force-recreate yukti >> "$LOG_FILE" 2>&1
+docker compose up -d --no-deps yukti >> "$LOG_FILE" 2>&1
 
 # ── Step 5: Health check (with retry) ────────────────────────────────────────
 _health_check() {
@@ -157,7 +157,7 @@ Both health check attempts failed. Trading is likely DOWN.
 Investigate immediately:
 \`\`\`
 docker compose logs yukti --tail 50
-docker compose up -d --force-recreate yukti
+docker compose up -d --no-deps yukti
 \`\`\`"
     exit 1
 fi

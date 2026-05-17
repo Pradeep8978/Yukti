@@ -414,28 +414,25 @@ class BacktestEngine:
                         gap_go(snap, candles_today, current_time, snap_daily),
                         orb_breakout(snap, candles_today, current_time, snap_daily),
                         vwap_bounce(snap, candles_today, current_time, snap_daily),
-                        reversal_long(snap),
-                        reversal_short(snap),
+                        reversal_long(snap, current_time),
+                        reversal_short(snap, current_time),
                     ]
                     # When the daily trend confirms a direction, unlock trend-following
                     # patterns on that side only. Without daily confirmation these patterns
                     # fire on market-open noise and produce near-instant stop-outs.
-                    # This is also the fix for "daily downtrend should generate shorts":
-                    # breakdown / momentum_short / trend_pullback_short are now active
-                    # whenever the daily trend is confirmed DOWNTREND.
                     if snap_daily is not None:
                         daily_trend = getattr(snap_daily, "trend", "SIDEWAYS")
                         if daily_trend == "DOWNTREND":
                             candidates.extend([
-                                breakdown(snap),
-                                momentum_short(snap),
-                                trend_pullback_short(snap),
+                                breakdown(snap, current_time),
+                                momentum_short(snap, current_time),
+                                trend_pullback_short(snap, current_time),
                             ])
                         elif daily_trend == "UPTREND":
                             candidates.extend([
-                                breakout(snap),
-                                momentum_long(snap),
-                                trend_pullback_long(snap),
+                                breakout(snap, current_time),
+                                momentum_long(snap, current_time),
+                                trend_pullback_long(snap, current_time),
                             ])
                 else:
                     candidates = [

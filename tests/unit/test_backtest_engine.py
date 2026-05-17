@@ -76,8 +76,10 @@ class TestSquareoffPriceFallback:
         engine._squareoff("A", {"B": 305.0}, friday)
 
         closed = engine.broker.closed_trades[0]
-        assert closed.exit_price == entry, "should reuse last-known close, not 0.0"
-        assert closed.pnl == 0.0
+        # EOD squareoff applies slippage to the cached price — verify not 0.0
+        slip = engine.broker.slippage_pct
+        assert closed.exit_price > 0, "exit_price must not be 0.0 — that would fake a -100% loss"
+        assert closed.exit_price == pytest.approx(entry * (1 - slip), rel=1e-6)
 
     def test_falls_back_to_entry_when_no_cache(self, engine_with_gap, caplog):
         engine, friday = engine_with_gap
@@ -89,8 +91,9 @@ class TestSquareoffPriceFallback:
             engine._squareoff("A", {"B": 305.0}, friday)
 
         closed = engine.broker.closed_trades[0]
-        assert closed.exit_price == entry
-        assert closed.pnl == 0.0
+        slip = engine.broker.slippage_pct
+        assert closed.exit_price > 0, "exit_price must not be 0.0"
+        assert closed.exit_price == pytest.approx(entry * (1 - slip), rel=1e-6)
         assert any("no price available" in r.message for r in caplog.records)
 
     def test_uses_todays_close_when_present(self, engine_with_gap):
@@ -102,5 +105,9 @@ class TestSquareoffPriceFallback:
         engine._squareoff("A", {"A": 105.5}, friday)
 
         closed = engine.broker.closed_trades[0]
-        assert closed.exit_price == 105.5
-        assert closed.pnl == pytest.approx((105.5 - entry) * 100)
+        slip = engine.broker.slippage_pct
+        tc = engine.broker.TRANSACTION_COST_PCT
+        expected_exit = 105.5 * (1 - slip)
+        assert closed.exit_price == pytest.approx(expected_exit, rel=1e-6)
+        expected_pnl = (expected_exit - entry) * 100 - entry * 100 * tc
+        assert closed.pnl == pytest.approx(expected_pnl, rel=1e-3)

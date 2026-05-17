@@ -60,12 +60,22 @@ async def test_retrieve_similar_formats_results(monkeypatch):
 
     class FakeRow:
         def __init__(self):
+            self.id = 1
+            self.trade_id = 42
             self.entry_text = "sample journal text"
             self.pnl_pct = 1.5
             self.setup_type = "ORB"
             self.direction = "LONG"
             self.symbol = "ABC"
             self.similarity = 0.87
+            self.quality_score = 8
+            self.one_actionable_lesson = "Wait for volume confirmation"
+            self.setup_summary = "ORB breakout above open"
+            self.outcome = "WIN"
+            self.reason = "Strong volume"
+            self.market_regime = "BULLISH"
+            self.is_high_conviction = True
+            self.created_at = None
 
     def fake_get_db():
         class DBCtx:

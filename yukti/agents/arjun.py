@@ -564,6 +564,67 @@ class ABTestProvider(BaseProvider):
 
         return primary_decision, primary_meta
 
+    async def _safe_call(
+        self,
+        provider: "BaseProvider",
+        context: str,
+    ) -> tuple[TradeDecision, CallMeta]:
+        """Call a provider, return a safe SKIP on any error."""
+        try:
+            return await provider.call(context)
+        except Exception as exc:
+            log.warning("AB provider call failed: %s", exc)
+            skip = TradeDecision(
+                symbol      = "UNKNOWN",
+                action      = "SKIP",
+                reasoning   = f"Provider error: {exc}",
+                skip_reason = "provider_error",
+                conviction  = 1,
+            )
+            meta = CallMeta(
+                provider      = "error",
+                model         = "unknown",
+                latency_ms    = 0,
+                input_tokens  = 0,
+                output_tokens = 0,
+                cost_usd      = 0,
+            )
+            return skip, meta
+
+    async def _log_secondary(
+        self,
+        secondary_task: asyncio.Task,
+        primary_decision: TradeDecision,
+        primary_meta: CallMeta,
+        context: str,
+    ) -> None:
+        """Wait for secondary result and log any disagreement."""
+        try:
+            secondary_decision, secondary_meta = await secondary_task
+        except Exception as exc:
+            log.debug("Secondary provider task failed: %s", exc)
+            return
+
+        disagrees = (
+            primary_decision.action    != secondary_decision.action    or
+            primary_decision.direction != secondary_decision.direction or
+            abs(primary_decision.conviction - secondary_decision.conviction) >= 2
+        )
+
+        if disagrees:
+            record = {
+                "call_n":               self._call_count,
+                "timestamp":            datetime.utcnow().isoformat(),
+                "primary_action":       primary_decision.action,
+                "primary_direction":    primary_decision.direction,
+                "primary_conviction":   primary_decision.conviction,
+                "secondary_action":     secondary_decision.action,
+                "secondary_direction":  secondary_decision.direction,
+                "secondary_conviction": secondary_decision.conviction,
+            }
+            with open(self._log_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
 
 # ═══════════════════════════════════════════════════════════════
 #  CANARY ROUTER PROVIDER

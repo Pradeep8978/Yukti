@@ -124,65 +124,61 @@ class TestCalculateLevels:
 # ── Gate tests (async) ────────────────────────────────────────────────────────
 
 class TestGates:
-    @pytest.mark.asyncio
-    async def test_pass_all_gates(self):
-        from yukti.risk import GateResult, run_gates
+    """run_gates(trade_decision, portfolio, ...) interface tests."""
 
-        pos = PositionResult(
-            quantity=100, base_quantity=100, conviction_multiplier=1.0,
-            risk_amount=5000, stop_distance=30, max_loss=3000,
-            capital_deployed=150_000, capital_pct=30.0,
+    @staticmethod
+    def _td(symbol="RELIANCE", conviction=8, direction="LONG", rr=2.5,
+            entry=1500.0, stop=1470.0, t1=1560.0, t2=1590.0):
+        from yukti.agents.arjun import TradeDecision
+        return TradeDecision(
+            symbol=symbol, action="TRADE", direction=direction,
+            market_bias="BULLISH", setup_type="trend_pullback",
+            reasoning="test", entry_price=entry, entry_type="LIMIT",
+            stop_loss=stop, target_1=t1, target_2=t2,
+            conviction=conviction, risk_reward=rr,
+            holding_period="intraday", skip_reason=None,
         )
 
-        with (
-            patch("yukti.risk.get_daily_pnl_pct", new=AsyncMock(return_value=0.5)),
-            patch("yukti.risk.count_open_positions", new=AsyncMock(return_value=2)),
-            patch("yukti.risk.is_on_cooldown", new=AsyncMock(return_value=False)),
-        ):
-            result = await run_gates("RELIANCE", "LONG", 2.5, pos, 500_000)
+    @staticmethod
+    def _pf(daily_pnl_pct=0.5, open_positions=1, trades_today=0):
+        from yukti.risk import Portfolio
+        return Portfolio(
+            account_value=500_000, open_positions=open_positions,
+            daily_pnl_pct=daily_pnl_pct, total_exposure_pct=20.0,
+            trades_today=trades_today,
+        )
 
+    @pytest.mark.asyncio
+    async def test_pass_all_gates(self):
+        from yukti.risk import run_gates
+        with (
+            patch("yukti.risk.is_on_cooldown", new=AsyncMock(return_value=False)),
+            patch("yukti.risk.is_market_halted", new=AsyncMock(return_value=False)),
+        ):
+            result = await run_gates(self._td(), self._pf())
         assert result.passed is True
 
     @pytest.mark.asyncio
     async def test_blocked_by_daily_loss(self):
         from yukti.risk import run_gates
-
-        pos = PositionResult(100, 100, 1.0, 5000, 30, 3000, 150_000, 30.0)
-
-        with patch("yukti.risk.get_daily_pnl_pct", new=AsyncMock(return_value=-2.5)):
-            result = await run_gates("RELIANCE", "LONG", 2.5, pos, 500_000)
-
+        # daily_loss_limit_pct=0.05 → gate fires when daily_pnl_pct <= -5.0
+        result = await run_gates(self._td(), self._pf(daily_pnl_pct=-6.0))
         assert result.passed is False
         assert "daily_loss" in result.reason
 
     @pytest.mark.asyncio
     async def test_blocked_by_cooldown(self):
         from yukti.risk import run_gates
-
-        pos = PositionResult(100, 100, 1.0, 5000, 30, 3000, 150_000, 30.0)
-
-        with (
-            patch("yukti.risk.get_daily_pnl_pct", new=AsyncMock(return_value=0.5)),
-            patch("yukti.risk.count_open_positions", new=AsyncMock(return_value=1)),
-            patch("yukti.risk.is_on_cooldown", new=AsyncMock(return_value=True)),
-        ):
-            result = await run_gates("RELIANCE", "LONG", 2.5, pos, 500_000)
-
+        with patch("yukti.risk.is_on_cooldown", new=AsyncMock(return_value=True)):
+            result = await run_gates(self._td(), self._pf())
         assert result.passed is False
         assert "cooldown" in result.reason
 
     @pytest.mark.asyncio
     async def test_blocked_by_low_rr(self):
         from yukti.risk import run_gates
-
-        pos = PositionResult(100, 100, 1.0, 5000, 30, 3000, 150_000, 30.0)
-
-        with (
-            patch("yukti.risk.get_daily_pnl_pct", new=AsyncMock(return_value=0.0)),
-            patch("yukti.risk.count_open_positions", new=AsyncMock(return_value=0)),
-            patch("yukti.risk.is_on_cooldown", new=AsyncMock(return_value=False)),
-        ):
-            result = await run_gates("RELIANCE", "LONG", 1.2, pos, 500_000)
-
+        # entry=1500, stop=1470, t1=1536 → structural_rr = 36/30 = 1.2 < min_rr=2.0
+        td = self._td(rr=1.2, t1=1536.0)
+        result = await run_gates(td, self._pf())
         assert result.passed is False
         assert "rr_too_low" in result.reason

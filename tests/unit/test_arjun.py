@@ -24,6 +24,7 @@ from datetime import datetime
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 VALID_TRADE_JSON = json.dumps({
+    "symbol":         "INFY",
     "action":         "TRADE",
     "direction":      "LONG",
     "market_bias":    "BULLISH",
@@ -41,6 +42,7 @@ VALID_TRADE_JSON = json.dumps({
 })
 
 VALID_SKIP_JSON = json.dumps({
+    "symbol":         "INFY",
     "action":         "SKIP",
     "direction":      None,
     "market_bias":    "AVOID",

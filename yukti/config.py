@@ -146,6 +146,9 @@ class Settings(BaseSettings):
     max_loss_cap_pct: float = Field(default=0.015, gt=0)
     atr_multiplier: float = Field(default=1.5, gt=0)
     max_atr_multiplier: float = Field(default=2.5, gt=0)
+    # Liquidity gate: order notional must not exceed this fraction of the stock's
+    # daily traded volume to avoid meaningful market impact (NSE mid-caps ~1%).
+    max_adv_pct: float = Field(default=0.01, gt=0)
 
     # ── Cooldown ──────────────────────────────────────
     cooldown_cycles: int = Field(default=3, ge=1)

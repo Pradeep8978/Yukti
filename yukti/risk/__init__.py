@@ -240,10 +240,15 @@ async def run_gates(
     ignore_cooldown: bool = False,
     ignore_market_halt: bool = False,
     ignore_swing_short: bool = False,
+    trade_daily_volume: float | None = None,
 ) -> GateResult:
     """
-    Run up to 9 pre-trade risk checks in order. Return first failure.
+    Run up to 10 pre-trade risk checks in order. Return first failure.
     All checks are async because they may read Redis.
+
+    trade_daily_volume: today's total traded volume (shares) for the symbol.
+      Used for the liquidity gate — order must be < max_adv_pct of daily volume.
+      Pass snap_daily.volume from the scan. None = gate skipped (fail-open).
     """
     # 1. Daily loss limit not breached
     daily_loss_limit_pct = settings.daily_loss_limit_pct * 100
@@ -355,6 +360,21 @@ async def run_gates(
 
     if not ignore_swing_short and trade_decision.holding_period == "swing" and trade_decision.direction == "SHORT":
         return GateResult(False, "swing_short_blocked: NSE equity delivery cannot carry overnight shorts")
+
+    # 7b. Liquidity gate — order must not exceed max_adv_pct of the stock's daily volume.
+    # Prevents market-impact on illiquid mid/small-caps where a single order could
+    # move the price adversely before the fill completes (NSE 5% circuit risk).
+    if trade_daily_volume and trade_daily_volume > 0:
+        entry = trade_decision.entry_price or 0.0
+        if entry > 0:
+            order_notional = float(position.quantity) * entry
+            adv_pct = order_notional / (trade_daily_volume * entry)
+            if adv_pct > settings.max_adv_pct:
+                return GateResult(
+                    False,
+                    f"liquidity: order is {adv_pct * 100:.1f}% of daily vol "
+                    f"({position.quantity} shares, max {settings.max_adv_pct * 100:.0f}%)",
+                )
 
     # 8. Sector concentration cap — only enforced when caller passed sector info.
     if portfolio.trade_sector and portfolio.sector_exposure_pct is not None:

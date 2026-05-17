@@ -176,19 +176,50 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         if pattern.pattern_type == "breakout":
             return _skip("breakout_blocked_daily", conviction=2, bias=market_bias, symbol=symbol)
 
-    # ── Step 3: Hard gates (VIX + RSI) ────────────────────────────────
+    # ── Step 3: Hard gates (VIX regime + RSI) ─────────────────────────
     india_vix = getattr(macro, "india_vix", None)
     if india_vix is not None and india_vix >= 30:
-        # Extreme volatility — rules engine cannot price risk reliably at this level
         return _skip("vix_extreme", conviction=1, bias=market_bias, symbol=symbol)
+
+    # VIX regime bucketing: four zones with different strategy biases.
+    # Thresholds from config (default [12, 18, 25]).
+    # Guard against misconfigured bucket list (empty or too short).
+    vix_regime = "normal"
+    if india_vix is not None:
+        bkts = sorted(settings.vix_regime_buckets)
+        if len(bkts) >= 3:
+            if india_vix < bkts[0]:
+                vix_regime = "low"        # < 12: range-bound grind
+            elif india_vix < bkts[1]:
+                vix_regime = "normal"     # 12-18: full playbook
+            elif india_vix < bkts[2]:
+                vix_regime = "elevated"   # 18-25: cautious sizing
+            else:
+                vix_regime = "high"       # 25-30: high caution
+
+    # Low VIX (<12): market is in a slow grind — momentum and breakout patterns
+    # fail because there's no follow-through. Favour reversals and VWAP plays.
+    if vix_regime == "low" and pattern.pattern_type in {
+        "momentum", "momentum_short", "breakout", "breakdown",
+    }:
+        return _skip("vix_too_low_for_momentum_breakout", conviction=2, bias=market_bias, symbol=symbol)
+
+    # High VIX (25-30): aggressive longs are dangerous; require strong conviction
+    # and skip momentum longs / trend-following entries.
+    if vix_regime == "high":
+        min_conviction = max(min_conviction, 8)
+        if direction == "LONG" and pattern.pattern_type in {"momentum", "breakout", "trend_pullback"}:
+            return _skip("vix_high_blocks_aggressive_long", conviction=2, bias=market_bias, symbol=symbol)
+
+    # Elevated VIX (18-25): raise floor to 7 so only decent setups trade.
+    if vix_regime == "elevated":
+        min_conviction = max(min_conviction, 7)
 
     # RSI oversold (<30) blocks new shorts; RSI overbought (>70) blocks new longs.
     if direction == "SHORT" and snap.rsi_oversold():
         return _skip("rsi_oversold_blocks_short", conviction=2, bias=market_bias, symbol=symbol)
     if direction == "LONG" and snap.rsi_overbought():
         return _skip("rsi_overbought_blocks_long", conviction=2, bias=market_bias, symbol=symbol)
-    # Soft volume handling: rather than a hard skip at <1.0, treat low volume as
-    # a conviction penalty. Extremely low volume (<0.5×) remains a hard skip.
     if snap.volume_ratio < 0.5:
         return _skip("volume_ratio_below_0_5", conviction=2, bias=market_bias, symbol=symbol)
 
@@ -293,9 +324,89 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
     if not (macd_confirmed or ema_confirmed or vwap_confirmed):
         return _skip("no_momentum_or_structure_confirmation", conviction=score.clamp(), bias=market_bias, symbol=symbol)
 
+    # RSI divergence votes: price vs. momentum disagreement is a strong signal.
+    # Bullish div (price lower low, RSI higher low) = reversal up → helps LONG, hurts SHORT.
+    # Bearish div (price higher high, RSI lower high) = exhaustion → helps SHORT, hurts LONG.
+    bull_div = getattr(snap, "rsi_bullish_divergence", False)
+    bear_div = getattr(snap, "rsi_bearish_divergence", False)
+    if direction == "LONG":
+        if bull_div:
+            score.adjust(+1, "rsi_bullish_divergence")
+        elif bear_div:
+            score.adjust(-1, "rsi_bearish_div_against_long")
+    else:
+        if bear_div:
+            score.adjust(+1, "rsi_bearish_divergence")
+        elif bull_div:
+            score.adjust(-1, "rsi_bullish_div_against_short")
+
     # Elevated VIX — markets are nervous, reduce conviction (not a hard stop below 30)
     if india_vix is not None and india_vix >= 20:
         score.adjust(-1, f"vix_elevated_{india_vix:.0f}")
+
+    # Candle structure bonus: hammer = high-quality reversal bar for longs;
+    # shooting star = for shorts. Doji (body_ratio < 0.15) = indecision → penalty.
+    body_ratio = getattr(snap, "body_ratio", 1.0)
+    is_hammer  = getattr(snap, "is_hammer", False)
+    is_star    = getattr(snap, "is_shooting_star", False)
+    if direction == "LONG" and is_hammer:
+        score.adjust(+1, "hammer_candle")
+    elif direction == "SHORT" and is_star:
+        score.adjust(+1, "shooting_star_candle")
+    elif body_ratio < 0.15:
+        score.adjust(-1, "doji_indecision")
+
+    # ── Step 4c: News sentiment vote (direction-aware) ────────────────
+    # Sentiment is read from catalyst_items attached to the MacroContext by the
+    # scanner. The vote is asymmetric by trade direction:
+    #
+    # LONG trades:
+    #   strongly negative (≤-0.5) → hard skip  (never buy into bad news)
+    #   mildly negative   (≤-0.2) → -2          (headwind against long)
+    #   mildly positive   (≥+0.2) → +1          (tailwind)
+    #   strongly positive (≥+0.5) → +2          (confirmed catalyst)
+    #
+    # SHORT trades:
+    #   strongly negative (≤-0.5) → +1          (news confirms bearish thesis)
+    #   mildly negative   (≤-0.2) → +1          (aligned, minor boost)
+    #   mildly positive   (≥+0.2) → -1          (news fights short thesis)
+    #   strongly positive (≥+0.5) → -2          (strong headwind for shorts)
+    #
+    # Note: strongly negative shorts are still gated by NSE intraday-only rules
+    # (no overnight short delivery), circuit-breaker risk, and liquidity gates
+    # downstream — this vote only adjusts conviction, it doesn't override those.
+    symbol_sentiment: float | None = None
+    try:
+        catalyst_items = getattr(macro, "catalyst_items", None) or {}
+        items_for_sym  = catalyst_items.get(symbol, [])
+        if items_for_sym:
+            from yukti.services.catalyst_service import worst_sentiment
+            symbol_sentiment = worst_sentiment(items_for_sym)
+    except Exception:
+        pass
+
+    if symbol_sentiment is not None:
+        if direction == "LONG":
+            if symbol_sentiment <= -0.5:
+                return _skip(
+                    f"news_strongly_negative_{symbol_sentiment:.2f}",
+                    conviction=1, bias=market_bias, symbol=symbol,
+                )
+            elif symbol_sentiment <= -0.2:
+                score.adjust(-2, f"news_negative_{symbol_sentiment:.2f}")
+            elif symbol_sentiment >= 0.5:
+                score.adjust(+2, f"news_strongly_positive_{symbol_sentiment:.2f}")
+            elif symbol_sentiment >= 0.2:
+                score.adjust(+1, f"news_positive_{symbol_sentiment:.2f}")
+        else:  # SHORT
+            if symbol_sentiment <= -0.5:
+                score.adjust(+1, f"news_strongly_negative_confirms_short_{symbol_sentiment:.2f}")
+            elif symbol_sentiment <= -0.2:
+                score.adjust(+1, f"news_negative_confirms_short_{symbol_sentiment:.2f}")
+            elif symbol_sentiment >= 0.5:
+                score.adjust(-2, f"news_strongly_positive_fights_short_{symbol_sentiment:.2f}")
+            elif symbol_sentiment >= 0.2:
+                score.adjust(-1, f"news_positive_fights_short_{symbol_sentiment:.2f}")
 
     # ── Step 5: Daily timeframe (multi-timeframe alignment) ───────────
     if snap_daily is not None:
@@ -316,6 +427,24 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
         elif snap_daily.rsi < 25:
             score.adjust(-1, "daily_rsi_oversold")
 
+        # Daily EMA50 structural alignment: price above = long-term bull structure
+        if snap_daily.above_ema50():
+            if direction == "LONG":
+                score.adjust(+1, "daily_above_ema50")
+            elif direction == "SHORT":
+                score.adjust(-1, "daily_above_ema50_counter_short")
+        else:
+            if direction == "SHORT":
+                score.adjust(+1, "daily_below_ema50")
+            elif direction == "LONG":
+                score.adjust(-1, "daily_below_ema50_counter_long")
+
+        # Daily MACD alignment: if momentum is confirmed on the daily chart, add 1
+        if snap_daily.macd_bull and direction == "LONG":
+            score.adjust(+1, "daily_macd_bullish")
+        elif not snap_daily.macd_bull and direction == "SHORT":
+            score.adjust(+1, "daily_macd_bearish")
+
         # Don't short at daily support / don't long at daily resistance
         if direction == "SHORT" and snap_daily.daily_support:
             dist_pct = (snap.close - snap_daily.daily_support) / snap.close
@@ -326,6 +455,36 @@ def _decide_inner(symbol, snap, macro, perf, pattern, snap_daily) -> TradeDecisi
             dist_pct = (snap_daily.daily_resistance - snap.close) / snap.close
             if dist_pct < 0.005:
                 return _skip("price_at_daily_resistance", conviction=score.clamp(), bias=market_bias, symbol=symbol)
+
+    # ── Step 5b: Sector breadth filter ───────────────────────────────
+    # A stock going LONG while its entire sector is selling off hard is a
+    # low-probability fight-the-tape trade. Use the Nifty sector trend stored
+    # in macro (sector_trends dict: sector_name → "UP"/"DOWN"/"FLAT") when
+    # available, falling back to the broad Nifty trend as a proxy.
+    try:
+        from yukti.services.universe_scanner_service import SECTOR_STOCKS
+        symbol_to_sector = {
+            sym: sec
+            for sec, members in SECTOR_STOCKS.items()
+            for sym in members
+        }
+        stock_sector = symbol_to_sector.get(symbol)
+        if stock_sector:
+            sector_trends = getattr(macro, "sector_trends", {}) or {}
+            sector_trend  = sector_trends.get(stock_sector)
+            if sector_trend is None:
+                # Fall back: infer from Nifty if sector data missing
+                sector_trend = "UP" if nifty_trend == "UP" else ("DOWN" if nifty_trend == "DOWN" else "FLAT")
+            if direction == "LONG" and sector_trend == "DOWN":
+                score.adjust(-1, f"sector_{stock_sector}_headwind")
+            elif direction == "SHORT" and sector_trend == "UP":
+                score.adjust(-1, f"sector_{stock_sector}_tailwind_against_short")
+            elif direction == "LONG" and sector_trend == "UP":
+                score.adjust(+1, f"sector_{stock_sector}_tailwind")
+            elif direction == "SHORT" and sector_trend == "DOWN":
+                score.adjust(+1, f"sector_{stock_sector}_aligned")
+    except Exception:
+        pass   # SECTOR_STOCKS import or macro attribute missing — fail open
 
     conviction = score.clamp()
     log.debug("Rules conviction for %s (%s %s): %s", symbol, direction, pattern.pattern_type, score.summary())

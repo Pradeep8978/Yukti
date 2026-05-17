@@ -69,6 +69,20 @@ class IndicatorSnapshot:
     # start average on daily — meaningless as an independent vote).
     timeframe:        str = "5m"
 
+    # ── RSI divergence (computed from recent bars, not just current row) ─
+    # Bullish: price made new lower low but RSI made higher low → reversal up
+    # Bearish: price made new higher high but RSI made lower high → reversal down
+    rsi_bullish_divergence: bool = False
+    rsi_bearish_divergence: bool = False
+
+    # ── Candle structure of the latest bar ──────────────────────────────
+    # body_ratio: |close-open| / (high-low); 0 = pure doji, 1 = full engulf
+    # is_hammer: long lower wick + small body near top — bullish reversal
+    # is_shooting_star: long upper wick + small body near bottom — bearish reversal
+    body_ratio:       float = 1.0
+    is_hammer:        bool  = False
+    is_shooting_star: bool  = False
+
     def above_vwap(self)   -> bool: return self.close > self.vwap
     def above_ema20(self)  -> bool: return self.close > self.ema20
     def above_ema50(self)  -> bool: return self.close > self.ema50
@@ -83,6 +97,66 @@ class IndicatorSnapshot:
         independent confirmation vote.
         """
         return self.timeframe != "daily"
+
+
+def _candle_structure(r: "pd.Series") -> tuple[float, bool, bool]:
+    """Return (body_ratio, is_hammer, is_shooting_star) for one OHLC row."""
+    h, l, o, c = float(r["high"]), float(r["low"]), float(r["open"]), float(r["close"])
+    rng = h - l
+    if rng < 1e-9:
+        return 1.0, False, False
+    body        = abs(c - o)
+    body_ratio  = body / rng
+    upper_wick  = h - max(c, o)
+    lower_wick  = min(c, o) - l
+    # Hammer: tiny body sitting high in the range, long lower wick
+    is_hammer = (
+        body_ratio < 0.40
+        and lower_wick >= 2.0 * max(body, 1e-9)
+        and upper_wick  < 0.5 * max(body, 1e-9)
+        and (max(c, o) - l) / rng >= 0.60
+    )
+    # Shooting star: tiny body sitting low in the range, long upper wick
+    is_shooting_star = (
+        body_ratio < 0.40
+        and upper_wick >= 2.0 * max(body, 1e-9)
+        and lower_wick  < 0.5 * max(body, 1e-9)
+        and (h - min(c, o)) / rng >= 0.60
+    )
+    return round(body_ratio, 3), is_hammer, is_shooting_star
+
+
+def _rsi_divergence(df: pd.DataFrame, lookback: int = 10) -> tuple[bool, bool]:
+    """Detect RSI/price divergence over the last `lookback` bars.
+
+    Splits the window into two halves and compares the extreme price bar's
+    RSI in the first half vs. the second half:
+      Bullish: second half makes lower price low but higher RSI low  → reversal up
+      Bearish: second half makes higher price high but lower RSI high → reversal down
+    A 3-point RSI margin prevents noise signals.
+    """
+    if len(df) < lookback or "rsi" not in df.columns:
+        return False, False
+    recent = df.tail(lookback)
+    half   = lookback // 2
+    first  = recent.iloc[:half]
+    second = recent.iloc[half:]
+    try:
+        f_lo = first["low"].idxmin()
+        s_lo = second["low"].idxmin()
+        bullish = (
+            float(second.at[s_lo, "low"]) < float(first.at[f_lo, "low"])
+            and float(second.at[s_lo, "rsi"]) > float(first.at[f_lo, "rsi"]) + 3
+        )
+        f_hi = first["high"].idxmax()
+        s_hi = second["high"].idxmax()
+        bearish = (
+            float(second.at[s_hi, "high"]) > float(first.at[f_hi, "high"])
+            and float(second.at[s_hi, "rsi"]) < float(first.at[f_hi, "rsi"]) - 3
+        )
+        return bullish, bearish
+    except Exception:
+        return False, False
 
 
 def compute_full(df: pd.DataFrame, timeframe: str = "5m") -> pd.DataFrame:
@@ -207,6 +281,9 @@ def snapshot_at(
         daily_resistance_val = float(sr_window["high"].max())
         daily_support_val = float(sr_window["low"].min())
 
+    body_ratio, is_hammer, is_shooting_star = _candle_structure(r)
+    bullish_div, bearish_div = _rsi_divergence(df)
+
     return IndicatorSnapshot(
         close=float(r["close"]),
         high=float(r["high"]),
@@ -238,6 +315,11 @@ def snapshot_at(
         daily_support=daily_support_val,
         daily_resistance=daily_resistance_val,
         timeframe=timeframe,
+        rsi_bullish_divergence=bullish_div,
+        rsi_bearish_divergence=bearish_div,
+        body_ratio=body_ratio,
+        is_hammer=is_hammer,
+        is_shooting_star=is_shooting_star,
     )
 
 
@@ -374,6 +456,9 @@ def compute(df: pd.DataFrame, swing_lookback: int = 20, timeframe: str = "5m") -
 
     vol_sma = float(r["vol_sma20"]) or 1.0
 
+    body_ratio, is_hammer, is_shooting_star = _candle_structure(r)
+    bullish_div, bearish_div = _rsi_divergence(df)
+
     return IndicatorSnapshot(
         close    = float(r["close"]),
         high     = float(r["high"]),
@@ -405,4 +490,9 @@ def compute(df: pd.DataFrame, swing_lookback: int = 20, timeframe: str = "5m") -
         daily_support    = daily_support_val,
         daily_resistance = daily_resistance_val,
         timeframe        = timeframe,
+        rsi_bullish_divergence = bullish_div,
+        rsi_bearish_divergence = bearish_div,
+        body_ratio       = body_ratio,
+        is_hammer        = is_hammer,
+        is_shooting_star = is_shooting_star,
     )

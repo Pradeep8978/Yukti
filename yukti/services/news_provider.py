@@ -12,8 +12,9 @@ providers (Marketaux, NewsAPI) can be added later — gated by
 `settings.news_provider_api_key`. If a paid provider is selected but no key
 is configured, we degrade gracefully to NSE-only rather than erroring.
 
-This module deliberately performs no scoring — it returns raw `NewsItem`s.
-The catalyst service decides how to fold them into the scanner's scoreboard.
+Every `NewsItem` returned has its `sentiment` field populated using the
+finance-aware lexicon + VADER scorer in `yukti.signals.sentiment`. No AI,
+no external API — pure rule-based NLP that runs in <1 ms per headline.
 """
 from __future__ import annotations
 
@@ -23,6 +24,8 @@ from datetime import datetime, timezone
 from typing import Iterable, Literal, Protocol
 
 import httpx
+
+from yukti.signals.sentiment import score_headline
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +65,13 @@ def classify_headline(headline: str) -> Category:
         if any(k in h for k in kws):
             return cat
     return "OTHER"
+
+
+def enrich_item(item: NewsItem) -> NewsItem:
+    """Fill `item.sentiment` in-place using the rule-based scorer. Returns item."""
+    if item.sentiment is None:
+        item.sentiment = score_headline(item.headline)
+    return item
 
 
 # ── Provider interface ──────────────────────────────────────────────────────
@@ -124,13 +134,13 @@ class NSEAnnouncementsProvider:
                 ts = datetime.now(timezone.utc)
             if ts.timestamp() < cutoff:
                 continue
-            items.append(NewsItem(
+            items.append(enrich_item(NewsItem(
                 symbol=sym,
                 ts=ts.isoformat(),
                 category=classify_headline(headline),
                 headline=headline,
                 url=row.get("attchmntFile") or "",
-            ))
+            )))
         return items
 
 
