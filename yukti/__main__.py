@@ -19,10 +19,12 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from yukti.config import settings
@@ -36,14 +38,46 @@ _shutdown_event: "asyncio.Event | None" = None
 
 
 def _configure_logging() -> None:
-    logging.basicConfig(
-        level   = logging.INFO,
-        format  = "%(asctime)s %(name)-30s %(levelname)-8s %(message)s",
-        datefmt = "%H:%M:%S",
-        handlers = [logging.StreamHandler(sys.stdout)],
-    )
-    for noisy in ("httpx", "httpcore", "anthropic", "asyncio"):
+    level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    yukti_level = getattr(logging, level_name, logging.INFO)
+
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(logging.Formatter(
+        "%(asctime)s %(name)-30s %(levelname)-8s %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+
+    # Daily rotation, written to bind-mounted /app/logs/ so logs survive
+    # container recreates (token-renewal cron at 08:00 / 18:00 IST).
+    log_dir = Path(os.environ.get("LOG_DIR", "/app/logs"))
+    handlers: list[logging.Handler] = [stream]
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_h = TimedRotatingFileHandler(
+            log_dir / "yukti.log",
+            when="midnight",
+            backupCount=int(os.environ.get("LOG_BACKUP_DAYS", "14")),
+            utc=False,
+        )
+        file_h.suffix = "%Y-%m-%d"
+        file_h.setFormatter(logging.Formatter(
+            "%(asctime)s %(name)-30s %(levelname)-8s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        handlers.append(file_h)
+    except Exception as exc:
+        print(f"warn: file logging disabled ({exc})", file=sys.stderr)
+
+    # Root logger at INFO so external libs don't flood at DEBUG; yukti.* gets
+    # the configured level so our own modules can be DEBUG-verbose.
+    logging.basicConfig(level=logging.INFO, handlers=handlers, force=True)
+    logging.getLogger("yukti").setLevel(yukti_level)
+    for noisy in ("httpx", "httpcore", "anthropic", "asyncio",
+                  "sqlalchemy", "sqlalchemy.engine", "websockets",
+                  "apscheduler", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    log.info("Logging configured: yukti.*=%s root=INFO file=%s/yukti.log",
+             level_name, log_dir)
 
 
 async def _load_universe() -> dict[str, str]:

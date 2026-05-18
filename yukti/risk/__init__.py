@@ -409,14 +409,18 @@ async def run_gates(
 
 def _compute_structural_rr(td: TradeDecision) -> float | None:
     """
-    Compute reward:risk from the decision's entry / SL / first target.
-    Returns None if data is insufficient. Uses target_1 as the primary target.
+    Compute reward:risk from entry / SL / target. Prefers target_2 (the runner
+    target the rules engine uses to compute the claimed RR); falls back to
+    target_1 when target_2 is unset. Returns None if data is insufficient.
     """
-    if td.entry_price is None or td.stop_loss is None or td.target_1 is None:
+    if td.entry_price is None or td.stop_loss is None:
+        return None
+    tgt_value = td.target_2 if td.target_2 is not None else td.target_1
+    if tgt_value is None:
         return None
     entry = Decimal(str(td.entry_price))
     sl = Decimal(str(td.stop_loss))
-    tgt = Decimal(str(td.target_1))
+    tgt = Decimal(str(tgt_value))
     if td.direction == "LONG":
         risk = entry - sl
         reward = tgt - entry

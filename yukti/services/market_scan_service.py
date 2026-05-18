@@ -557,14 +557,26 @@ class MarketScanService:
                     win_rate_last_10=perf.get("win_rate_last_10"),
                     win_rate_last_10_count=int(perf.get("win_rate_last_10_count", 0) or 0),
                 )
+                log.info(
+                    "GATE INPUTS %s | conv=%d rr_claimed=%s entry=%.2f sl=%.2f t1=%s t2=%s "
+                    "acct=₹%.0f open_pos=%d trades_today=%d daily_pnl=%.2f%% min_conv=%d",
+                    symbol, decision.conviction,
+                    f"{decision.risk_reward:.2f}" if decision.risk_reward is not None else "None",
+                    decision.entry_price or 0.0, decision.stop_loss or 0.0,
+                    f"{decision.target_1:.2f}" if decision.target_1 is not None else "None",
+                    f"{decision.target_2:.2f}" if decision.target_2 is not None else "None",
+                    live_account_value, open_pos_count,
+                    int(perf.get("trades_today", 0) or 0), daily_pnl, regime_min_conviction,
+                )
                 gate = await run_gates(
                     decision, portfolio,
                     trade_daily_volume=float(snap_daily.volume) if snap_daily and snap_daily.volume else None,
                 )
                 if not gate.passed:
                     record_skip(gate.reason or "gate_blocked")
-                    log.info("MarketScanService: risk gate failed for %s: %s", symbol, gate.reason)
+                    log.warning("GATE BLOCK %s | %s", symbol, gate.reason)
                     return
+                log.info("GATE PASS %s | proceeding to sizing", symbol)
 
                 _leverage = settings.intraday_leverage if decision.holding_period == "intraday" else 1.0
                 position = calculate_position(
@@ -589,16 +601,25 @@ class MarketScanService:
                 async with self._open_lock:
                     if await count_open_positions() >= settings.max_open_positions:
                         record_skip("max_positions_race")
-                        log.info("MarketScanService: %s skipped — position slot taken by concurrent scan", symbol)
+                        log.warning("MAX POSITIONS RACE %s | slot taken by concurrent scan", symbol)
                         return
+                    log.info("OPEN TRADE %s | %s qty=%d entry=%.2f sl=%.2f t1=%.2f",
+                             symbol, decision.direction, position.quantity,
+                             decision.entry_price or 0.0, decision.stop_loss or 0.0,
+                             decision.target_1 or 0.0)
                     pos = await open_trade(symbol, security_id, decision, position)
                 if pos:
                     record_trade_opened(decision.direction or "LONG", decision.setup_type or "unknown")
+                    log.info("TRADE OPENED %s | intent=%s order=%s fill=%s",
+                             symbol, pos.get("intent_id"), pos.get("entry_order_id"),
+                             pos.get("fill_price"))
                     try:
                         from yukti.telegram.bot import alert_trade_opened
                         await alert_trade_opened(pos)
                     except Exception as tg_exc:
                         log.warning("Telegram trade alert failed: %s", tg_exc)
+                else:
+                    log.warning("TRADE NOT OPENED %s | open_trade returned None — see prior errors", symbol)
 
             except Exception as exc:
                 scan_failures.labels(symbol=symbol).inc()

@@ -31,6 +31,10 @@ services:
       REDIS_URL:      redis://redis:6379/0
       POSTGRES_URL:   postgresql+psycopg://yukti:${POSTGRES_PASSWORD}@postgres:5432/yukti
       MODE:           ${MODE:-live}   # live | paper | shadow | backtest
+      LOG_LEVEL:      ${LOG_LEVEL:-INFO}
+      LOG_DIR:        /app/logs
+    volumes:
+      - ./logs:/app/logs   # survive container recreate (token renewal cron)
     ports:
       - "8000:8000"     # FastAPI serves BOTH the API and the React webapp
     healthcheck:
