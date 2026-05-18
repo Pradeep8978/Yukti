@@ -368,8 +368,14 @@ async def job_universe_refresh() -> None:
 
 def build_scheduler() -> AsyncIOScheduler:
     sched = AsyncIOScheduler(timezone="Asia/Kolkata")
-    sched.add_job(job_catalyst_refresh,     "cron", hour=8,  minute=0,
-                  id="catalyst_refresh", replace_existing=True)
+    # Catalyst at 08:05 IST (not 08:00) to avoid colliding with the host's
+    # 08:00 IST renew_dhan_token.sh cron, which recreates the container and
+    # boots a fresh APScheduler ~30s after the cron fires — missing an 08:00
+    # job entirely. misfire_grace_time=600 lets the job still fire if startup
+    # runs even longer than expected.
+    sched.add_job(job_catalyst_refresh,     "cron", hour=8,  minute=5,
+                  id="catalyst_refresh", replace_existing=True,
+                  misfire_grace_time=600)
     sched.add_job(job_exclusions_refresh,   "cron", hour=8,  minute=15,
                   id="exclusions_refresh", replace_existing=True)
 

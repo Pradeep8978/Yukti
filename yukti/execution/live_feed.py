@@ -166,6 +166,15 @@ class LiveFeedManager:
                         for sid in self._subscriptions.values()
                     ]
 
+                # Don't burn retry attempts with an empty subscription list —
+                # MarketFeed.run_forever() returns instantly when there's
+                # nothing to subscribe to, which would exhaust the daily 10
+                # before market open. Idle-wait until a position subscribes.
+                if not pre_instruments:
+                    log.debug("LiveFeedManager: no subscriptions yet — idle wait 10s")
+                    time.sleep(10)
+                    continue
+
                 self._feed = self._create_feed(broker, client_id, access_token, pre_instruments)
                 if self._feed is None:
                     # Permanent failure (missing dhanhq package etc.) — don't loop
@@ -175,13 +184,21 @@ class LiveFeedManager:
                 retry_secs    = 5   # reset backoff on successful connect
                 retries_today += 1
                 log.info(
-                    "LiveFeedManager: WebSocket connected (LTP mode, attempt %d/%d today)",
-                    retries_today, MAX_RETRIES_PER_SESSION,
+                    "LiveFeedManager: starting run_forever (LTP mode, attempt %d/%d today, "
+                    "subs=%d)",
+                    retries_today, MAX_RETRIES_PER_SESSION, len(pre_instruments),
                 )
+                t_start = time.time()
                 self._feed.run_forever()   # blocks until WebSocket closes
+                duration = time.time() - t_start
+                log.warning(
+                    "LiveFeedManager: run_forever returned after %.1fs — connection "
+                    "closed (likely market closed or auth issue; see prior _on_error/_on_close)",
+                    duration,
+                )
 
             except Exception as exc:
-                log.warning("LiveFeedManager: feed thread error: %s", exc)
+                log.warning("LiveFeedManager: feed thread error: %s", exc, exc_info=True)
             finally:
                 self._connected = False
 
@@ -301,10 +318,16 @@ class LiveFeedManager:
 
     def _on_close(self, *args: Any) -> None:
         self._connected = False
-        log.warning("LiveFeedManager: WebSocket disconnected — monitor falls back to REST polling")
+        # Include any args the SDK passes (status code, reason) so we can see
+        # *why* the connection closed (e.g., 1006 abnormal, 1011 server error).
+        log.warning("LiveFeedManager: WebSocket disconnected args=%r — falling back to REST polling", args)
 
-    def _on_error(self, error: Any) -> None:
-        log.debug("LiveFeedManager: WebSocket error: %s", error)
+    def _on_error(self, *args: Any) -> None:
+        # WARNING (was DEBUG) — without this the reason for repeated reconnect
+        # cycles is invisible. Critical for diagnosing market-hours feed loss.
+        # *args because the SDK calls this as (ws, error) on some versions and
+        # (error,) on others; the previous fixed signature crashed run_forever.
+        log.warning("LiveFeedManager: WebSocket error: %r", args)
 
 
 # Module-level singleton
