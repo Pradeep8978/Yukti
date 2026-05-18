@@ -15,7 +15,7 @@ Yukti runs on a fixed schedule, gated so nothing fires on weekends, NSE holidays
 ```
 07:00  NSE holiday calendar refreshed from NSE API (every Monday)
        ─────────────────────────────────── Pre-market ───
-08:00  Catalyst refresh    — NSE announcements, earnings calendar
+08:05  Catalyst refresh    — NSE announcements, earnings calendar (sentiment-scored)
 08:15  Exclusions refresh  — F&O ban list, ASM/GSM stocks
 08:30  Candidate pool      — NIFTY 500 filtered by turnover + volatility
 08:45  Universe scan       — Score and rank the candidate pool
@@ -78,6 +78,43 @@ The AI operates as **Arjun** — a disciplined NSE trader persona baked into the
 - **Learn from history.** The 3 most similar past trades (by pattern + symbol type) are injected as context before every decision.
 
 The AI outputs structured JSON that is schema-validated before any order is considered.
+
+---
+
+## How Yukti reads the news
+
+Catalyst news (NSE announcements, earnings calendar) flows through a two-layer rule-based scorer — **no transformer model, no external API call**. Speed and stability matter more here than peak accuracy, since the LLM (Arjun) does the deeper reasoning downstream.
+
+```
+Headline
+   ↓
+Layer 1 — Finance lexicon  (signals/sentiment.py)
+   • Hundreds of NSE-tuned phrases: "beat estimate", "sebi notice",
+     "buyback", "default", "bonus share", "qip subscribed", …
+   • Each phrase has a hand-tuned score in [-1, +1]
+   ↓
+Layer 2 — VADER  (generic English sentiment via vaderSentiment)
+   • Handles negation ("not strong"), intensity, ALL-CAPS, punctuation
+   • Catches headlines the lexicon misses (e.g. "TCS wins $1B order")
+   ↓
+Blend: 65% lexicon + 35% VADER → score in [-1, +1]
+   ↓
+Catalyst score per symbol uses the *worst* (most-negative) sentiment
+across all items — negative news caps the catalyst score, so a stock
+with bad headlines won't get a "this is a hot catalyst" boost.
+   ↓
+Fed into:
+  • Universe scanner (pre-market ranking)
+  • Arjun's macro context (for the trade decision)
+```
+
+Score bands:
+- `> +0.3` → positive catalyst (beat estimates, order win, buyback)
+- `−0.3 … +0.3` → neutral / ambiguous
+- `< −0.3` → negative catalyst (fraud, SEBI notice, default)
+- `< −0.6` → strongly negative — hard-skip territory
+
+What this does **not** do: it is not a transformer (no FinBERT/LLM-grade nuance), it does not handle mid-session breaking-news ticks, and it does not score full-article bodies — headlines only.
 
 ---
 
@@ -272,7 +309,7 @@ doppler run -- uv run python -m yukti
 
 **Known failure modes:**
 - Overnight gaps > 5% — stop-loss fill is not guaranteed
-- Sudden news events — AI reacts to technicals, not breaking news
+- Sudden news events — pre-market catalysts are sentiment-scored, but mid-session breaking-news ticks are not yet wired in
 - Illiquid scrips with high impact cost — slippage eats the edge
 
 **Realistic expectations (paper, 5-min intraday, NIFTY 500):**

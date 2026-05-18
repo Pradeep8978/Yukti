@@ -3,7 +3,7 @@ name        = "yukti"
 version     = "0.1.0"
 description = "Autonomous NSE/BSE trading agent — DhanHQ + Claude"
 readme      = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 
 dependencies = [
     # ── Core runtime ──────────────────────────────────
@@ -23,6 +23,8 @@ dependencies = [
     "pandas>=2.2",
     "numpy>=1.26",
     "pandas-ta>=0.3.14b",
+    "vaderSentiment>=3.3.2",        # Layer 2 of headline sentiment scoring
+
     # ── Broker ───────────────────────────────────────
     "dhanhq>=2.0",
     # ── Data stores ──────────────────────────────────
