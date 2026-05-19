@@ -346,7 +346,7 @@ class MarketScanService:
                         (_now_ist - _last_ts).total_seconds(),
                     ]
                     _positive = [d for d in _deltas if d >= 0]
-                    if _positive and min(_positive) < 300:
+                    if _positive and min(_positive) < 305:
                         log.debug(
                             "%s: dropping in-progress bar (last=%s, delta=%.0fs)",
                             symbol, _last_ts, min(_positive),
