@@ -331,6 +331,28 @@ class MarketScanService:
                 df.set_index("time", inplace=True)
                 df.sort_index(inplace=True)
                 df = df.astype({c: float for c in ["open","high","low","close","volume"]})
+
+                # Drop the trailing in-progress 5-min bar. DhanHQ (UTC-naive)
+                # and the yfinance fallback (IST-naive) both include the
+                # currently-forming candle, whose partial volume corrupts
+                # volume_ratio downstream and silently fails every
+                # volume-gated pattern detector (momentum/breakout/orb/etc).
+                if len(df) > 1:
+                    _last_ts = df.index[-1].to_pydatetime()
+                    _now_utc = datetime.utcnow()
+                    _now_ist = now_ist.replace(tzinfo=None)
+                    _deltas = [
+                        (_now_utc - _last_ts).total_seconds(),
+                        (_now_ist - _last_ts).total_seconds(),
+                    ]
+                    _positive = [d for d in _deltas if d >= 0]
+                    if _positive and min(_positive) < 300:
+                        log.debug(
+                            "%s: dropping in-progress bar (last=%s, delta=%.0fs)",
+                            symbol, _last_ts, min(_positive),
+                        )
+                        df = df.iloc[:-1]
+
                 snap = compute(df, timeframe="5m")
                 log.info(
                     "SNAP %s | close=%.2f vwap=%.2f ema20=%.2f ema50=%.2f "
