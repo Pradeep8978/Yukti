@@ -114,6 +114,24 @@ def calculate_position(
                 )
                 final_qty = capital_qty
 
+    # Capital ceiling — risk-based sizing can produce a qty whose margin
+    # exceeds the per-stock cap, which on a small account means the broker's
+    # RMS rejects the order outright. Cap qty downward so the resulting
+    # margin fits within max_single_stock_pct of the account.
+    if final_qty > 0:
+        margin_per_share = entry_d / lev_d
+        if margin_per_share > 0:
+            capital_cap = acct * Decimal(str(settings.max_single_stock_pct))
+            max_qty_by_capital = int(capital_cap / margin_per_share)
+            if final_qty > max_qty_by_capital:
+                log.debug(
+                    "position sizing: risk-based qty=%d exceeds capital cap "
+                    "(margin/share=₹%.2f, cap=₹%.0f); capping qty to %d",
+                    final_qty, float(margin_per_share),
+                    float(capital_cap), max_qty_by_capital,
+                )
+                final_qty = max_qty_by_capital
+
     capital_dep = Decimal(final_qty) * entry_d
     margin  = (capital_dep / lev_d).quantize(quant, rounding=ROUND_HALF_UP)
     cap_pct = (margin / acct * Decimal("100")).quantize(quant, rounding=ROUND_HALF_UP)
@@ -354,9 +372,24 @@ async def run_gates(
 
     projected_total_exposure = Decimal(str(portfolio.total_exposure_pct)) + position.capital_pct
 
-    # 7. Single-stock concentration cap — disabled (account too small for % limits to be meaningful)
-    # total_exposure_cap — disabled alongside it
-    pass
+    # 7. Single-stock concentration cap — backstop the qty cap inside
+    # calculate_position(). On a small account, an unchecked qty produces
+    # margin that exceeds broker funds and DhanHQ's RMS rejects with
+    # "insufficient funds" — making every signal a no-op. Enforce here too.
+    single_stock_cap_pct = Decimal(str(settings.max_single_stock_pct)) * Decimal("100")
+    if position.capital_pct > single_stock_cap_pct:
+        return GateResult(
+            False,
+            f"single_stock_cap: margin {position.capital_pct:.2f}% > {single_stock_cap_pct:.2f}% "
+            f"(qty={position.quantity}, account=₹{portfolio.account_value:.0f})",
+        )
+
+    total_exposure_cap_pct = Decimal(str(settings.max_total_exposure_pct)) * Decimal("100")
+    if projected_total_exposure > total_exposure_cap_pct:
+        return GateResult(
+            False,
+            f"total_exposure_cap: {projected_total_exposure:.2f}% > {total_exposure_cap_pct:.2f}%",
+        )
 
     if not ignore_swing_short and trade_decision.holding_period == "swing" and trade_decision.direction == "SHORT":
         return GateResult(False, "swing_short_blocked: NSE equity delivery cannot carry overnight shorts")

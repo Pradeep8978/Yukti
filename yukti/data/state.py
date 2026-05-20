@@ -68,8 +68,11 @@ async def save_position(symbol: str, data: dict[str, Any]) -> None:
                 if hasattr(existing, k):
                     setattr(existing, k, v)
         else:
-            # Insert
-            pos = Position(symbol=symbol, **data)
+            # Insert — data may carry its own 'symbol' key from upstream; the
+            # function parameter is authoritative, so drop the dict copy to
+            # avoid a duplicate kwarg.
+            insert_data = {k: v for k, v in data.items() if k != "symbol"}
+            pos = Position(symbol=symbol, **insert_data)
             db.add(pos)
         await db.commit()
 

@@ -327,8 +327,12 @@ class DhanClient:
         return result
 
     async def cancel_gtt(self, gtt_id: str) -> dict[str, Any]:
+        # DhanHQ SDK v2 has no `cancel_gtt_order`; intraday SL/target are placed
+        # as regular STOP_LOSS / LIMIT orders by _arm_gtts(), so the IDs stored
+        # in sl_gtt_id / target_gtt_id are regular order IDs and `cancel_order`
+        # is the right call. Naming preserved for caller compatibility.
         self._assert_not_paper("cancel_gtt")
-        return await self._call(self._dhan.cancel_gtt_order, order_id=gtt_id)
+        return await self._call(self._dhan.cancel_order, order_id=gtt_id)
 
     # ── Positions ─────────────────────────────────────────────────────────────
 

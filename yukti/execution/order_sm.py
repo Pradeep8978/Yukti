@@ -203,6 +203,42 @@ async def open_trade(
         log.info("Slippage %s: %.4f%% (intended ₹%.2f → filled ₹%.2f)",
                  symbol, pos["slippage_pct"], intended, fill_price)
 
+    # Rebase SL/T1 to actual fill, preserving the *distance* the strategy
+    # planned. The bot computes stop_loss / target_1 from the planned entry
+    # price; if the limit fills better/worse, those absolute prices become
+    # tighter or looser relative to where we actually are. Anchor stops to
+    # reality so the planned R:R is what gets traded.
+    planned_entry = decision.entry_price or 0.0
+    rebased_sl    = decision.stop_loss
+    rebased_t1    = decision.target_1
+    rebased_t2    = decision.target_2
+    is_long       = (decision.direction or "LONG") == "LONG"
+    if planned_entry > 0 and fill_price > 0 and decision.stop_loss:
+        sl_dist = abs(planned_entry - decision.stop_loss)
+        t1_dist = abs(decision.target_1 - planned_entry) if decision.target_1 else None
+        t2_dist = abs(decision.target_2 - planned_entry) if decision.target_2 else None
+        if is_long:
+            rebased_sl = round(fill_price - sl_dist, 2)
+            rebased_t1 = round(fill_price + t1_dist, 2) if t1_dist is not None else None
+            rebased_t2 = round(fill_price + t2_dist, 2) if t2_dist is not None else None
+        else:
+            rebased_sl = round(fill_price + sl_dist, 2)
+            rebased_t1 = round(fill_price - t1_dist, 2) if t1_dist is not None else None
+            rebased_t2 = round(fill_price - t2_dist, 2) if t2_dist is not None else None
+
+        if rebased_sl != decision.stop_loss or rebased_t1 != decision.target_1:
+            log.info(
+                "REBASED %s | fill=₹%.2f planned_entry=₹%.2f | "
+                "SL ₹%.2f→₹%.2f (dist ₹%.2f) | T1 %s→%s",
+                symbol, fill_price, planned_entry,
+                decision.stop_loss, rebased_sl, sl_dist,
+                f"₹{decision.target_1:.2f}" if decision.target_1 else "-",
+                f"₹{rebased_t1:.2f}" if rebased_t1 else "-",
+            )
+            pos["stop_loss"] = rebased_sl
+            pos["target_1"]  = rebased_t1
+            pos["target_2"]  = rebased_t2
+
     await save_position(symbol, pos)
     # NOTE: increment_trades_today() moved to after ARMED — emergency-exited
     # trades should not consume the daily trade limit.
@@ -215,8 +251,8 @@ async def open_trade(
         security_id     = security_id,
         direction       = decision.direction or "LONG",
         quantity        = filled_qty,
-        stop_loss       = decision.stop_loss or 0.0,
-        target_1        = decision.target_1,
+        stop_loss       = rebased_sl or 0.0,
+        target_1        = rebased_t1,
         product_type    = product_type,
     )
 
@@ -249,7 +285,7 @@ async def open_trade(
     log.info(
         "Trade ARMED intent #%d: %s %s %d @ ₹%.2f | SL ₹%.2f | T1 ₹%.2f",
         intent_id, decision.direction, symbol, filled_qty,
-        fill_price, decision.stop_loss, decision.target_1 or 0,
+        fill_price, rebased_sl or 0.0, rebased_t1 or 0,
     )
     return pos
 
@@ -272,9 +308,13 @@ async def _wait_for_fill(
         try:
             status_resp = await get_broker().get_order_status(order_id)
             data        = status_resp.get("data", status_resp)
+            # DhanHQ v2 wraps the order in a 1-element list; older paths /
+            # other brokers may return the dict directly. Normalize either.
+            if isinstance(data, list):
+                data = data[0] if data else {}
             order_status = data.get("orderStatus", "")
             filled_qty   = int(data.get("filledQty", 0))
-            fill_price   = float(data.get("averagePrice", 0) or 0)
+            fill_price   = float(data.get("averageTradedPrice", data.get("averagePrice", 0)) or 0)
         except Exception as exc:
             log.warning("Order status poll error %s: %s", order_id, exc)
             continue
@@ -296,7 +336,12 @@ async def _wait_for_fill(
     try:
         status_resp = await get_broker().get_order_status(order_id)
         data         = status_resp.get("data", status_resp)
-        return float(data.get("averagePrice", 0) or 0), int(data.get("filledQty", 0))
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        return (
+            float(data.get("averageTradedPrice", data.get("averagePrice", 0)) or 0),
+            int(data.get("filledQty", 0)),
+        )
     except Exception:
         return 0.0, 0
 
@@ -304,6 +349,34 @@ async def _wait_for_fill(
 # ═══════════════════════════════════════════════════════════════
 #  GTT arming with retry
 # ═══════════════════════════════════════════════════════════════
+
+def _round_to_tick(price: float, tick: float = 0.10) -> float:
+    """Round price to nearest NSE tick.
+
+    Default 0.10: a superset of 0.05 (every 0.10 multiple is also a 0.05
+    multiple), so it's always exchange-valid and avoids the
+    async-rejection trap where DhanHQ accepts a 0.05-precise order at the
+    gateway but the exchange rejects it later for stocks like ASTRAL /
+    DEEPAKFERT that use 0.10 ticks. Trade-off: SL/T1 prices for 0.05-tick
+    stocks may sit up to ₹0.05 off the intended level — accepted as the
+    cost of universal validity until per-symbol tick lookup is added.
+    """
+    return round(round(price / tick) * tick, 2)
+
+
+
+
+def _extract_order_id(resp: Any) -> str | None:
+    """Pull the orderId out of DhanHQ's response envelope, tolerant to shape."""
+    if not isinstance(resp, dict):
+        return None
+    data = resp.get("data")
+    if isinstance(data, dict):
+        return data.get("orderId") or resp.get("orderId")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0].get("orderId")
+    return resp.get("orderId")
+
 
 async def _arm_gtts(
     security_id:   str,
@@ -314,58 +387,86 @@ async def _arm_gtts(
     product_type:  str,
 ) -> tuple[bool, str, str | None, str | None]:
     """
-    Arm SL GTT + target GTT. Returns (success, sl_id, target_id, error).
-    SL must succeed. Target is best-effort.
+    Arm SL + target exit orders. Returns (success, sl_id, target_id, error).
+
+    Implementation note: DhanHQ's "Forever" GTT endpoint is for delivery
+    (CNC) only — it rejects INTRADAY product. For intraday positions we
+    place two regular resting orders instead:
+      - SL  : STOP_LOSS (limit) — trigger at stop_loss, limit at trigger+buffer
+      - T1  : LIMIT             — at target price
+
+    The OCO link (cancel surviving leg when the other fills) is handled by
+    monitor.py / close_trade(), which already calls cancel_gtt(id).
+
+    SL must succeed. Target is best-effort. Prices are tick-rounded.
     """
     exit_side = "SELL" if direction == "LONG" else "BUY"
 
-    # SL GTT — MUST succeed. Retry internally via dhan_client tenacity.
+    # Tick-round to ₹0.10 (always exchange-valid; see _round_to_tick doc).
+    # For a BUY stop on a SHORT the limit must be ABOVE trigger; for a SELL
+    # stop on a LONG it must be BELOW. 0.5% buffer ensures fast fill on
+    # activation without inviting slippage panic.
+    sl_trigger = _round_to_tick(stop_loss)
+    if exit_side == "BUY":
+        sl_limit = _round_to_tick(sl_trigger * 1.005)
+    else:
+        sl_limit = _round_to_tick(sl_trigger * 0.995)
+
     try:
-        gtt_sl    = await get_broker().place_gtt(
+        sl_resp = await get_broker().place_order(
             security_id      = security_id,
             transaction_type = exit_side,
             quantity         = quantity,
-            trigger_price    = stop_loss,
-            order_type       = "SL-M",
+            order_type       = "STOP_LOSS",
             product_type     = product_type,
+            price            = sl_limit,
+            trigger_price    = sl_trigger,
+            tag              = "sl",
         )
-        if isinstance(gtt_sl, dict) and str(gtt_sl.get("status", "")).upper() == "ERROR":
-            return False, "", None, f"sl_gtt_api_error: {gtt_sl.get('message', gtt_sl)}"
-        sl_id = None
-        if isinstance(gtt_sl, dict):
-            sl_id = gtt_sl.get("gttOrderId") or (gtt_sl.get("data") or {}).get("gttOrderId")
-        if not sl_id:
-            # Log full response so a broker schema change shows up in postmortem
-            # logs instead of an opaque "sl_gtt_no_id_returned".
-            log.error("SL GTT response had no gttOrderId — payload: %r", gtt_sl)
-            return False, "", None, "sl_gtt_no_id_returned"
-        log.info("GTT SL  | %s %d @ trigger=₹%.2f → id=%s", exit_side, quantity, stop_loss, sl_id)
     except Exception as exc:
-        return False, "", None, f"sl_gtt_failed: {exc}"
+        return False, "", None, f"sl_failed: {exc}"
 
-    # Target GTT — best-effort (monitor will close on target hit if this fails)
+    if isinstance(sl_resp, dict) and str(sl_resp.get("status", "")).lower() == "failure":
+        return False, "", None, f"sl_api_error: {sl_resp.get('remarks', sl_resp)}"
+
+    sl_id = _extract_order_id(sl_resp)
+    if not sl_id:
+        log.error("SL response had no orderId — payload: %r", sl_resp)
+        return False, "", None, "sl_no_id_returned"
+    log.info(
+        "SL %s %d @ trigger=₹%.2f limit=₹%.2f → id=%s",
+        exit_side, quantity, sl_trigger, sl_limit, sl_id,
+    )
+
+    # Target — best-effort.
     t1_id: str | None = None
     if target_1:
+        t1_price = _round_to_tick(target_1)
         try:
-            gtt_t1 = await get_broker().place_gtt(
+            t1_resp = await get_broker().place_order(
                 security_id      = security_id,
                 transaction_type = exit_side,
                 quantity         = quantity,
-                trigger_price    = target_1,
                 order_type       = "LIMIT",
                 product_type     = product_type,
-                price            = target_1,
+                price            = t1_price,
+                trigger_price    = 0.0,
+                tag              = "t1",
             )
-            if isinstance(gtt_t1, dict) and str(gtt_t1.get("status", "")).upper() == "ERROR":
-                log.warning("Target GTT API error (non-fatal): %s", gtt_t1)
-            else:
-                t1_id = gtt_t1.get("gttOrderId") or (gtt_t1.get("data") or {}).get("gttOrderId")
-                if t1_id:
-                    log.info("GTT T1  | %s %d @ trigger=₹%.2f → id=%s", exit_side, quantity, target_1, t1_id)
-                else:
-                    log.warning("T1 GTT response had no gttOrderId — payload: %r", gtt_t1)
         except Exception as exc:
-            log.warning("Target GTT failed (non-fatal): %s", exc)
+            log.warning("Target failed (non-fatal): %s", exc)
+            t1_resp = None
+
+        if isinstance(t1_resp, dict) and str(t1_resp.get("status", "")).lower() == "failure":
+            log.warning("Target API error (non-fatal): %s", t1_resp)
+            t1_resp = None
+
+        if t1_resp:
+            t1_id = _extract_order_id(t1_resp)
+            if t1_id:
+                log.info("T1 %s %d @ ₹%.2f → id=%s", exit_side, quantity, t1_price, t1_id)
+            else:
+                log.warning("T1 response had no orderId — payload: %r", t1_resp)
 
     return True, sl_id, t1_id, None
 
