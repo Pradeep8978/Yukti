@@ -221,6 +221,52 @@ def calculate_levels(
 
 
 # ═══════════════════════════════════════════════════════════════
+#  TRANSACTION COST ESTIMATOR  — NSE intraday equity, DhanHQ retail tariff
+# ═══════════════════════════════════════════════════════════════
+
+# Conservative NSE intraday equity cost model. Per leg unless noted:
+#   brokerage     : ₹20 flat (or 0.03% — whichever is lower)
+#   STT           : 0.025% on sell side only
+#   exchange txn  : 0.00322% per leg (NSE Eq, May 2026 ish)
+#   SEBI         : ₹10 / crore = 0.0001% per leg (negligible but included)
+#   stamp duty   : 0.003% on buy side only
+#   GST          : 18% on (brokerage + txn + SEBI) per leg
+def estimate_round_trip_cost(notional_per_leg: float) -> float:
+    """
+    Return estimated INR friction to enter AND exit one intraday equity trade
+    of `notional_per_leg` notional. Conservative — meant to over-estimate
+    slightly so the cost gate fails closed on borderline setups.
+
+    Components:
+      - DhanHQ-style brokerage  (₹20 flat or 0.03% per leg, whichever lower)
+      - Exchange transaction charges (0.00322% per leg)
+      - SEBI fee (₹10/crore = 0.000001%)
+      - GST 18% on (brokerage + txn + SEBI) per leg
+      - STT 0.025% (sell side only)
+      - Stamp duty 0.003% (buy side only)
+      - Slippage assumption: 0.10% per leg = 0.20% round-trip. This is the
+        big one for small accounts. Entries use LIMIT (low slippage) but
+        EOD exits use MARKET (typical 0.05-0.15% on liquid mid-caps);
+        target-hit exits via LIMIT also pay half-spread. 0.10% per leg is
+        a realistic average across exit modes.
+    """
+    if notional_per_leg <= 0:
+        return 0.0
+    brokerage_per_leg = min(20.0, notional_per_leg * 0.0003)
+    txn_per_leg       = notional_per_leg * 0.0000322
+    sebi_per_leg      = notional_per_leg * 0.000001
+    gst_per_leg       = (brokerage_per_leg + txn_per_leg + sebi_per_leg) * 0.18
+
+    per_leg = brokerage_per_leg + txn_per_leg + sebi_per_leg + gst_per_leg
+    round_trip = per_leg * 2
+
+    round_trip += notional_per_leg * 0.00025   # STT (sell side)
+    round_trip += notional_per_leg * 0.00003   # stamp duty (buy side)
+    round_trip += notional_per_leg * 0.002     # slippage 0.10% × 2 legs
+    return round_trip
+
+
+# ═══════════════════════════════════════════════════════════════
 #  RISK GATES  — 9 deterministic checks run before every order hits DhanHQ
 # ═══════════════════════════════════════════════════════════════
 
@@ -371,6 +417,24 @@ async def run_gates(
         max_loss_pct = Decimal("0")
 
     projected_total_exposure = Decimal(str(portfolio.total_exposure_pct)) + position.capital_pct
+
+    # 6b. Cost-aware gate — reject signals where expected gross profit at T1
+    # doesn't comfortably clear the round-trip transaction cost. On small
+    # accounts (sub-₹10k), brokerage + STT + GST routinely eat 100% of the
+    # T1 reward on tiny positions, so every "winning" trade still nets a
+    # loss. Require gross profit ≥ 1.5× estimated costs.
+    t1_target = trade_decision.target_1
+    if t1_target is not None and trade_decision.entry_price is not None and position.quantity > 0:
+        gross_profit_at_t1 = abs(t1_target - trade_decision.entry_price) * position.quantity
+        notional = trade_decision.entry_price * position.quantity
+        est_cost = estimate_round_trip_cost(notional)
+        # Cost gate disabled when est_cost is zero (paper mode / weird input).
+        if est_cost > 0 and gross_profit_at_t1 < est_cost * 1.5:
+            return GateResult(
+                False,
+                f"cost_gate: T1 gross ₹{gross_profit_at_t1:.0f} < 1.5× est. round-trip cost ₹{est_cost:.0f} "
+                f"(qty={position.quantity} notional=₹{notional:.0f}) — fees would eat the edge",
+            )
 
     # 7. Single-stock concentration cap — backstop the qty cap inside
     # calculate_position(). On a small account, an unchecked qty produces

@@ -80,22 +80,46 @@ async def job_eod_squareoff() -> None:
                 if gtt:
                     await broker.cancel_gtt(gtt)
             exit_resp = await broker.market_exit(sec, dirn, qty, "INTRADAY")
-            exit_price = float(pos.get("entry_price", 0))
-            # Poll once for the actual fill price — market orders typically fill in <2s
-            order_id = None
-            if isinstance(exit_resp, dict):
-                order_id = exit_resp.get("orderId") or (exit_resp.get("data") or {}).get("orderId")
+            # Use the same shape-tolerant extractor order_sm uses for entry IDs.
+            from yukti.execution.order_sm import _extract_order_id
+            order_id = _extract_order_id(exit_resp)
+            exit_price = 0.0
             if order_id:
                 import asyncio as _asyncio
-                await _asyncio.sleep(3)
+                # Market exit usually fills in <1s but DhanHQ's order-book API
+                # is eventually consistent — poll a few times before giving up.
+                for attempt in range(5):
+                    await _asyncio.sleep(2)
+                    try:
+                        status = await broker.get_order_status(order_id)
+                        data = status.get("data", status) if isinstance(status, dict) else {}
+                        if isinstance(data, list):
+                            data = data[0] if data else {}
+                        fill = float(data.get("averagePrice") or data.get("avgPrice") or 0.0)
+                        if fill > 0:
+                            exit_price = fill
+                            break
+                    except Exception as poll_exc:
+                        log.warning("EOD: fill price poll attempt %d failed for %s: %s",
+                                    attempt + 1, symbol, poll_exc)
+            if exit_price <= 0:
+                # Final fallback: latest 1-min candle close. Better than
+                # entry_price because at least it's an actual market level
+                # near the squareoff time — avoids the entry≈exit P&L=0 bug.
                 try:
-                    status = await broker.get_order_status(order_id)
-                    data = status.get("data", status)
-                    fill = float(data.get("averagePrice", 0) or 0)
-                    if fill > 0:
-                        exit_price = fill
-                except Exception as poll_exc:
-                    log.warning("EOD: fill price poll failed for %s: %s", symbol, poll_exc)
+                    sec_id = pos.get("security_id", "")
+                    candles = await broker.get_candles(sec_id, interval="1") if sec_id else []
+                    if candles:
+                        exit_price = float(candles[-1].get("close", 0)) or 0.0
+                except Exception as cand_exc:
+                    log.warning("EOD: candle fallback failed for %s: %s", symbol, cand_exc)
+            if exit_price <= 0:
+                exit_price = float(pos.get("entry_price", 0))
+                log.error(
+                    "EOD %s: could not determine actual exit price — using entry ₹%.2f. "
+                    "Logged P&L will be 0; check broker statement for real cost.",
+                    symbol, exit_price,
+                )
             await close_trade(symbol, exit_price, "eod_squareoff")
             log.info("EOD closed %s @ ₹%.2f", symbol, exit_price)
         except Exception as exc:

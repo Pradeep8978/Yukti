@@ -317,6 +317,115 @@ async def _verify_position(symbol: str, direction: str, expected_qty: int) -> bo
     return False
 
 
+async def _close_stale_armed(symbol: str, pos: dict[str, Any]) -> None:
+    """
+    The broker no longer holds shares for `symbol` but our state still says
+    ARMED — the SL or T1 GTT order fired. Identify which leg filled, fetch
+    its fill price, route through close_trade() so P&L is recorded, then
+    cancel whichever leg is still open so it can't re-enter the trade.
+    """
+    from yukti.execution.order_sm import close_trade
+    sl_id   = pos.get("sl_gtt_id")
+    tgt_id  = pos.get("target_gtt_id")
+    entry   = float(pos.get("fill_price") or pos.get("entry_price") or 0.0)
+    is_long = (pos.get("direction") or "").upper() == "LONG"
+    target  = float(pos.get("target_1") or 0.0)
+    stop    = float(pos.get("stop_loss") or 0.0)
+
+    broker = get_broker()
+    exit_price: float | None = None
+    exit_reason = "broker_exit_reconciled"
+    filled_leg_id: str | None = None
+    other_leg_id: str | None = None
+
+    async def _try_status(oid: str) -> tuple[bool, float]:
+        """Return (filled, avg_price). Tolerant to errors."""
+        try:
+            st = await broker.get_order_status(oid)
+            data = st.get("data", st) if isinstance(st, dict) else {}
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            raw_status = str(data.get("orderStatus") or data.get("status") or "").upper()
+            avg = float(data.get("averagePrice") or data.get("avgPrice") or 0.0)
+            filled = raw_status in ("TRADED", "FILLED", "COMPLETE") or avg > 0
+            return filled, avg
+        except Exception as exc:
+            log.debug("Stale-ARMED: get_order_status(%s) failed: %s", oid, exc)
+            return False, 0.0
+
+    if sl_id:
+        sl_filled, sl_avg = await _try_status(sl_id)
+        if sl_filled:
+            exit_price = sl_avg or stop
+            exit_reason = "stop_loss_hit_reconciled"
+            filled_leg_id = sl_id
+            other_leg_id  = tgt_id
+    if exit_price is None and tgt_id:
+        tg_filled, tg_avg = await _try_status(tgt_id)
+        if tg_filled:
+            exit_price = tg_avg or target
+            exit_reason = "target_2_hit_reconciled"  # full close, not partial
+            filled_leg_id = tgt_id
+            other_leg_id  = sl_id
+
+    # Fallback: order-status lookups didn't tell us which leg fired.
+    # Infer from the latest LTP — if it's beyond SL, treat as SL hit; if
+    # beyond target, treat as target hit; otherwise mark as broker_exit.
+    if exit_price is None:
+        try:
+            sec = pos.get("security_id", "")
+            candles = await broker.get_candles(sec, interval="1") if sec else []
+            ltp = float(candles[-1].get("close", 0)) if candles else 0.0
+        except Exception:
+            ltp = 0.0
+        if ltp > 0 and stop > 0:
+            hit_sl = (ltp <= stop) if is_long else (ltp >= stop)
+            hit_tgt = (target > 0 and ((ltp >= target) if is_long else (ltp <= target)))
+            if hit_sl:
+                exit_price = stop
+                exit_reason = "stop_loss_hit_reconciled"
+            elif hit_tgt:
+                exit_price = target
+                exit_reason = "target_2_hit_reconciled"
+            else:
+                exit_price = ltp
+                exit_reason = "broker_exit_reconciled"
+        else:
+            # No price signal available — last resort: use entry so the
+            # position is at least closed and the intent is marked done.
+            # P&L=0 but logged loudly so it shows up in journal review.
+            exit_price = entry or stop or target
+            exit_reason = "broker_exit_reconciled_no_price"
+            log.error(
+                "Stale-ARMED %s: could not determine exit price (sl_id=%s tgt_id=%s) "
+                "— using ₹%.2f as best-effort fallback. P&L will be inaccurate.",
+                symbol, sl_id, tgt_id, exit_price,
+            )
+
+    # Cancel the leg that did NOT fire so it can't accidentally enter a new
+    # position later in the day (regular SL / LIMIT orders persist till EOD).
+    if other_leg_id:
+        try:
+            await broker.cancel_order(other_leg_id)
+            log.info("Stale-ARMED %s: cancelled dangling leg %s", symbol, other_leg_id)
+        except Exception as exc:
+            log.warning("Stale-ARMED %s: failed to cancel dangling leg %s: %s",
+                        symbol, other_leg_id, exc)
+
+    log.warning(
+        "Stale ARMED for %s — closing properly @ ₹%.2f (reason=%s, filled_leg=%s)",
+        symbol, exit_price, exit_reason, filled_leg_id,
+    )
+    try:
+        await close_trade(symbol, exit_price, exit_reason)
+    except Exception as exc:
+        # close_trade() failed — fall back to the old behaviour so we don't
+        # leave a stale position blocking reconciliation forever.
+        log.error("Stale-ARMED %s: close_trade failed (%s) — deleting position",
+                  symbol, exc)
+        await delete_position(symbol)
+
+
 # ═══════════════════════════════════════════════════════════════
 #  PHASE B — DAILY RECONCILIATION (unchanged)
 # ═══════════════════════════════════════════════════════════════
@@ -363,8 +472,11 @@ async def reconcile_positions() -> bool:
             continue
 
         if actual_qty == 0 and pos.get("status") == "ARMED":
-            log.warning("Stale ARMED for %s — cleaning", symbol)
-            await delete_position(symbol)
+            # Broker SL or T1 fired and closed the position; we still hold
+            # ARMED in Redis. Don't silently drop — figure out which leg
+            # filled, reconstruct the exit price, record the P&L, and cancel
+            # the leg that didn't fire so it can't accidentally re-enter.
+            await _close_stale_armed(symbol, pos)
             continue
 
         qty_diff_pct = abs(expected_qty - abs(actual_qty)) / max(expected_qty, 1)
