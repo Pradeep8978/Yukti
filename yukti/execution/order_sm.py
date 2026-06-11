@@ -472,8 +472,68 @@ async def _arm_gtts(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CLOSE TRADE — unchanged except now marks intent closed
+#  CLOSE TRADE — marks intent closed AND persists a durable Trade row
 # ═══════════════════════════════════════════════════════════════
+
+def _parse_dt(val: Any) -> datetime | None:
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    try:
+        return datetime.fromisoformat(str(val))
+    except (ValueError, TypeError):
+        return None
+
+
+async def _persist_closed_trade(pos: dict[str, Any]) -> None:
+    """Write a durable Trade row to Postgres at close.
+
+    Without this the `trades` table is never populated — close_trade only
+    computed rupee P&L into the in-memory position dict, logged it, then
+    deleted the position, so all realized P&L history was lost.
+    """
+    from yukti.data.database import get_db
+    from yukti.data.models import Trade
+
+    entry = float(pos.get("fill_price") or pos.get("entry_price") or 0.0)
+    qty   = int(pos.get("quantity", 0) or 0)
+    stop  = float(pos.get("stop_loss") or 0.0)
+
+    try:
+        async with get_db() as db:
+            db.add(Trade(
+                symbol         = pos.get("symbol"),
+                security_id    = str(pos.get("security_id") or ""),
+                direction      = pos.get("direction") or "LONG",
+                setup_type     = pos.get("setup_type") or "unknown",
+                holding_period = pos.get("holding_period") or "intraday",
+                market_bias    = pos.get("market_bias") or "NEUTRAL",
+                entry_price    = entry,
+                stop_loss      = stop,
+                target_1       = float(pos.get("target_1") or 0.0),
+                target_2       = pos.get("target_2"),
+                quantity       = qty,
+                conviction     = int(pos.get("conviction") or 0),
+                risk_reward    = float(pos.get("risk_reward") or 0.0),
+                max_loss       = round(abs(entry - stop) * qty, 2),
+                entry_order_id = pos.get("entry_order_id"),
+                sl_gtt_id      = pos.get("sl_gtt_id"),
+                target_gtt_id  = pos.get("target_gtt_id"),
+                status         = pos.get("status") or "CLOSED",
+                exit_price     = pos.get("exit_price"),
+                exit_reason    = pos.get("exit_reason"),
+                pnl            = pos.get("pnl"),
+                pnl_pct        = pos.get("pnl_pct"),
+                reasoning      = pos.get("reasoning") or "",
+                opened_at      = _parse_dt(pos.get("opened_at")),
+                filled_at      = _parse_dt(pos.get("filled_at")),
+                closed_at      = datetime.utcnow(),
+            ))
+            await db.commit()
+    except Exception as exc:
+        log.error("Failed to persist Trade row for %s: %s", pos.get("symbol"), exc)
+
 
 async def close_trade(
     symbol:      str,
@@ -522,6 +582,9 @@ async def close_trade(
             await get_broker().cancel_gtt(pos["sl_gtt_id"])
         except Exception:
             pass
+
+    # Durable ledger: persist the realized trade BEFORE the position is deleted.
+    await _persist_closed_trade(pos)
 
     await set_cooldown(symbol, conviction=pos.get("conviction"))
     await delete_position(symbol)

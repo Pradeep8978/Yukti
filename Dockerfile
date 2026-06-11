@@ -20,6 +20,8 @@ COPY uv.lock .
 COPY README.md .
 COPY yukti/ ./yukti/
 COPY scripts/ ./scripts/
+# Curated 50-symbol watchlist — static fallback if Redis is wiped on startup.
+COPY universe.json .
 RUN uv sync --frozen
 # Inject built webapp into FastAPI static directory
 COPY --from=webapp-build /webapp/dist ./yukti/api/static/

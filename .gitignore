@@ -52,7 +52,6 @@ logs/
 # Data
 *.csv
 *.db
-universe.json
 backtest_trades.csv
 
 # Node (webapp build artifacts)

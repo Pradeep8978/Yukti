@@ -107,8 +107,24 @@ async def _load_universe() -> dict[str, str]:
         return json.loads(fallback.read_text())
 
     if settings.mode in ("live", "shadow"):
+        # Self-heal: Redis was wiped AND the baked universe.json is missing.
+        # Rather than crash-loop (which never lets the scheduler rebuild the
+        # universe), run the scanner's fallback chain inline — it returns a
+        # Nifty-50 baseline and re-seeds yukti:universe in Redis.
+        log.warning(
+            "No universe in Redis or universe.json — self-healing via "
+            "UniverseScannerService.run_with_fallback() (mode=%s)", settings.mode
+        )
+        try:
+            from yukti.services.universe_scanner_service import UniverseScannerService
+            entries = await UniverseScannerService().run_with_fallback(is_refresh=False)
+            if entries:
+                log.info("Self-heal succeeded: %d symbols seeded", len(entries))
+                return {u["symbol"]: u["security_id"] for u in entries}
+        except Exception as exc:
+            log.error("Self-heal universe build failed: %s", exc)
         raise RuntimeError(
-            "No universe found in Redis or universe.json — refusing to start in "
+            "No universe found and self-heal failed — refusing to start in "
             f"mode={settings.mode} with the built-in 5-symbol fallback. Run "
             "scripts/universe_loader.py first."
         )
